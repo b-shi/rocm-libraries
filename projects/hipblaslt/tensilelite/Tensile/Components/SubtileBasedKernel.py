@@ -27,7 +27,7 @@ from rocisa.instruction import BufferLoadB128, BufferLoadB32, BufferLoadB64, \
   FlatLoadB64, FlatStoreB128, FlatStoreB32, FlatStoreB64, Instruction, MacroInstruction, \
   MFMAInstruction, SBarrier, SBranch, SCBranchSCC0, SCBranchSCC1, SCBranchVCCNZ, SCmpEQU32, SCmpLeU32, \
   SMFMAInstruction, SNop, SSetPrior, SSetRegIMM32B32, SSubU32, SWaitCnt, SWaitAlu, \
-  SLongBranchPositive, VFmaMixF32, VMadMixF32, VMovB32, VAndB32, VCmpEQU32, VCndMaskB32, VMovB64, VLShiftRightB32, VLShiftLeftB32, VMulLOU32, VAddU32, SMovB32
+  SLongBranchPositive, VFmaMixF32, VMadMixF32, VMovB32, VAndB32, VCmpEQU32, VCndMaskB32, VMovB64, VLShiftRightB32, VLShiftLeftB32, VMulLOU32, VAddU32, SMovB32, SMulI32
 from rocisa.register import RegisterPool
 from rocisa.enum import RegisterType, DataTypeEnum
 # Store various scheduling info
@@ -125,7 +125,7 @@ class TileInfo:
   localSubtileGrid: List[int]  = field(init=False)
 
   localSubtiles: List[SubtileInfo] = field(init=False)
-  localSubtileRegisters: List[RegisterList] = field(init=False)
+  # localSubtileRegisters: List[RegisterList] = field(init=False)
 
   loadRatioGR: int = 0
   numGRPerSubtile: int = 0 # may not be needed
@@ -437,6 +437,18 @@ def _grComputeOffset(module, writer, tileInfo, col_id, row_id, split_id):
   writer.vgprPool.checkIn(tmpVgpr)
 
 ##################################################
+# Compute subtile perpendicular offsets for a single matrix
+#
+def _grComputeSubtileOffsets(module, tileInfo, rowsPerWave):
+  tc = tileInfo.tc
+  strideRef = "StrideA0I" if tc == 'A' else "StrideB1J"
+  s_stride = rowsPerWave * tileInfo.bpe
+
+  for st in tileInfo.localSubtiles:
+    for reg in tileInfo.localSubtilesRegister[st.regListId]:
+      module.add(SMulI32(dst=sgpr(reg), src0=hex(s_stride * st.subtileId[0]), src1=sgpr(strideRef), comment="%s: %u rows offset"%(tc, rowsPerWave * st.subtileId[0])))
+
+##################################################
 # Subroutine to generate GR offset calculation code
 #
 def graTileAssignment(writer, kernel):
@@ -459,6 +471,7 @@ def graTileAssignment(writer, kernel):
 
   tileInfoA = writer.states.a.tileInfo
   tileInfoB = writer.states.b.tileInfo
+  print("TileInfoA:\n%s\n"%(tileInfoA))
 
   assert bpeA == 2 and bpeB == 2, "Only support fp16 for now"
 
@@ -488,6 +501,13 @@ def graTileAssignment(writer, kernel):
   _grComputeOffset(module, writer, tileInfoB, col_id, row_id, split_id)
 
   writer.vgprPool.checkIn(tmpVgpr)
+
+  rowsPerWave = wavesize // block_size // 2
+
+
+  # Compute subtile offsets for A and B
+  _grComputeSubtileOffsets(module, tileInfoA, rowsPerWave)
+  _grComputeSubtileOffsets(module, tileInfoB, rowsPerWave)
 
   return module
 

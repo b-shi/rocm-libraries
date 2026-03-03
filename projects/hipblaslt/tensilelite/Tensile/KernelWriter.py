@@ -3484,12 +3484,12 @@ class KernelWriter(metaclass=abc.ABCMeta):
     for v in self.states.b.tileInfo.sharedVgprLROffset:
       module.addComment("Allocating v[%u] for B LR"%(v))
 
-    for st in self.states.a.tileInfo.localSubtiles:
+    for st in atile.localSubtiles:
       for reg in atile.localSubtilesRegister[st.regListId]:
         regstr = 's' if st.useSgpr else 'v'
         module.addComment0("Using %s%u for A GR"%(regstr, reg))
 
-    for st in self.states.b.tileInfo.localSubtiles:
+    for st in btile.localSubtiles:
       for reg in btile.localSubtilesRegister[st.regListId]:
         regstr = 's' if st.useSgpr else 'v'
         module.addComment0("Using %s%u for B GR"%(regstr, reg))
