@@ -27,7 +27,7 @@ from rocisa.instruction import BufferLoadB128, BufferLoadB32, BufferLoadB64, \
   FlatLoadB64, FlatStoreB128, FlatStoreB32, FlatStoreB64, Instruction, MacroInstruction, \
   MFMAInstruction, SBarrier, SBranch, SCBranchSCC0, SCBranchSCC1, SCBranchVCCNZ, SCmpEQU32, SCmpLeU32, \
   SMFMAInstruction, SNop, SSetPrior, SSetRegIMM32B32, SSubU32, SWaitCnt, SWaitAlu, \
-  SLongBranchPositive, VFmaMixF32, VMadMixF32, VMovB32, VAndB32, VCmpEQU32, VCndMaskB32, VMovB64, VLShiftRightB32, VLShiftLeftB32, VMulLOU32
+  SLongBranchPositive, VFmaMixF32, VMadMixF32, VMovB32, VAndB32, VCmpEQU32, VCndMaskB32, VMovB64, VLShiftRightB32, VLShiftLeftB32, VMulLOU32, VAddU32, SMovB32
 from rocisa.register import RegisterPool
 from rocisa.enum import RegisterType, DataTypeEnum
 # Store various scheduling info
@@ -170,6 +170,7 @@ class TileInfo:
       # MMA Tile Shape is based on matrix instruction
       mmaTileShape0 = kernel["MatrixInstM"]
       mmaTileShape1 = kernel["MatrixInstK"]
+      self.mmaTileShape = [mmaTileShape0, mmaTileShape1]
       mmaTileGrid0 = macroTile // mmaTileShape0
       mmaTileGrid1 = depthU // mmaTileShape1
 
@@ -197,6 +198,7 @@ class TileInfo:
       # MMA Tile Shape is based on matrix instruction
       mmaTileShape0 = kernel["MatrixInstM"]
       mmaTileShape1 = kernel["MatrixInstM"]
+      self.mmaTileShape = [mmaTileShape0, mmaTileShape1]
       mmaTileGrid0 = macroTile // mmaTileShape0
       mmaTileGrid1 = depthU // mmaTileShape1
 
@@ -445,10 +447,10 @@ def graTileAssignment(writer, kernel):
   split_id = writer.vgprPool.checkOut(1)
   new_serial = writer.vgprPool.checkOut(1)
 
-  tmp = writer.vgprPool.checkOut(1)
-
   # TODO: compute newSerial
-  
+
+  # Common code for both A & B
+
   # Calculate col and row id within a wave for 128b loads
   module.add(VAndB32(dst=vgpr(col_id), src0=vgpr(new_serial), src1=(block_size-1), comment="get col_id in wave for %uB load"%loadWidth))
   module.add(VLShiftLeftB32(dst=vgpr(col_id), shiftHex=hex(loadWidth.bit_length()-1), src=vgpr(col_id), comment="scale by load_width"))
@@ -457,23 +459,33 @@ def graTileAssignment(writer, kernel):
   module.add(VLShiftRightB32(dst=vgpr(split_id), shiftHex=hex((wavesize//2).bit_length()-1), src=vgpr("Serial"), comment=""))
   module.add(VAndB32(dst=vgpr(split_id), src0=vgpr(split_id), src1=1, comment="wave split id [0-1]"))
 
+  # Row offset
+  MT0 = tileInfoA.globalMMATileGrid[0] * tileInfoA.mmaTileShape[0]
+  tmp = writer.vgprPool.checkOut(1)
+  tmp2 = writer.vgprPool.checkOut(1)
+
   module.add(VMulLOU32(dst=vgpr(tmp), src0=sgpr("StrideA0I"), src1=vgpr(row_id), comment="" ))
   # TODO : handle FP4 (sub byte type once available)
   module.add(VLShiftLeftB32(dst=vgpr(tmp), shiftHex=hex(bpeA.bit_length()-1), src=vgpr(col_id), comment="row_id*strideA*bpeA"))
-  # wave split id
-  module.add(VLShiftRightB32(dst=vgpr(split_id), shiftHex=hex((wavesize//2).bit_length()-1), src=vgpr("Serial"), comment=""))
+  module.add(VAddU32(dst=vgpr(tmp), src0=vgpr(col_id), src1=vgpr(tmp), comment="GR row_offset"))
 
-  
-  # module.add(VMovB32(dst=vgpr("Serial"), src=0, comment="zero init"))
-  # module.add(VMovB32(dst=vgpr(addrA), src=vgpr(lane_id), comment="zero init"))
-  # module.add(VLShiftRightB32(dst=vgpr(addrA), shiftHex=hex(1), src=vgpr("Serial"), comment=""))
+  sHalfOffset = writer.sgprPool.checkOut(1)
+  # apply top-half / bottom half offset according to wave split id
+  module.add(SMovB32(dst=sgpr(sHalfOffset), src=(MT0 * bpeA)// 2, comment="Half Tile row offset x bytes"))
+  module.add(VMulLOU32(dst=vgpr(tmp2), src0=sgpr(sHalfOffset), src1=vgpr(split_id), comment="Apply offset for 2nd half wave" ))
+  module.add(VMulLOU32(dst=vgpr(tmp2), src0=sgpr("StrideA0I"), src1=vgpr(tmp2), comment="Multiply by LSA" ))
+  module.add(VAddU32(dst=vgpr(addrA), src0=vgpr(tmp), src1=vgpr(tmp2), comment="GR offset : row_offset + split_wave_offset"))
+
+  writer.vgprPool.checkIn(tmp2)
+  writer.vgprPool.checkIn(tmp)
 
 
+
+  writer.sgprPool.checkIn(sHalfOffset)
   writer.vgprPool.checkIn(col_id)
   writer.vgprPool.checkIn(row_id)
   writer.vgprPool.checkIn(split_id)
   writer.vgprPool.checkIn(new_serial)
-  writer.vgprPool.checkIn(tmp)
   
   return module
 
