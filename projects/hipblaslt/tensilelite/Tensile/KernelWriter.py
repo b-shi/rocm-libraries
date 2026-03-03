@@ -3463,14 +3463,14 @@ class KernelWriter(metaclass=abc.ABCMeta):
     module.addComment0("Number of subtiles for B: %u"%(len(self.states.b.tileInfo.localSubtiles)))
 
 
+    # Allocate registers for GR/LR
+    self.states.a.tileInfo.allocOffsetRegisters(self, kernel)
+    self.states.b.tileInfo.allocOffsetRegisters(self, kernel)
+
     module.add(self.setupNewTile(kernel, tensorParametersA, tensorParametersB, isOptNLL=False))
     self.removeSgprVarFromPool("SrdD")
     self.removeSgprVarFromPool("SrdC")
 
-
-    # Allocate registers for GR/LR
-    self.states.a.tileInfo.allocOffsetRegisters(self, kernel)
-    self.states.b.tileInfo.allocOffsetRegisters(self, kernel)
 
     atile = self.states.a.tileInfo
     btile = self.states.b.tileInfo

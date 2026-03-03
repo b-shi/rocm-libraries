@@ -266,7 +266,7 @@ class TileInfo:
     # TODOBS: Check TLU instead of hardcoding False
     perpDimSize = (self.localSubtileGrid[1] if False else self.localSubtileGrid[0])
     for reg in range(perpDimSize):
-      tmpSgprBuffer = 10 # Hardcoded for now, the amount of sgprs to use for temps
+      tmpSgprBuffer = 30 # Hardcoded for now, the amount of sgprs to use for temps
       sgprLimit = writer.states.regCaps["MaxSgpr"] - tmpSgprBuffer
       regPool = writer.sgprPool if writer.sgprPool.size() < sgprLimit else writer.vgprPool
       self.localSubtilesRegister.append(TileInfo.RegisterList(regPool))
