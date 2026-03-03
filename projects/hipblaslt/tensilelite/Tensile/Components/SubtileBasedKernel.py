@@ -477,13 +477,19 @@ def graTileAssignment(writer, kernel):
 
   wavesize = kernel["WavefrontSize"]
 
-  tmpVgpr = writer.vgprPool.checkOut(4)
+  tmpVgpr = writer.vgprPool.checkOut(5)
   col_id     = tmpVgpr
   row_id     = tmpVgpr + 1
   split_id   = tmpVgpr + 2
   new_serial = tmpVgpr + 3
+  wave_id    = tmpVgpr + 4
 
-  # TODO: compute newSerial
+  
+  # Compute newSerial
+  module.add(VLShiftRightB32(dst=vgpr(wave_id), shiftHex=hex(wavesize.bit_length()-1), src=vgpr("Serial"), comment="Wave Id"))
+  module.add(VAndB32(dst=vgpr(new_serial), src0=vgpr("Serial"), src1=31, comment=""))
+  module.add(VLShiftLeftB32(dst=vgpr(wave_id), shiftHex=hex(5), src=vgpr(wave_id), comment=""))
+  module.add(VAddU32(dst=vgpr(new_serial), src0=vgpr(wave_id), src1=vgpr(new_serial), comment="New Serial"))
 
   # Common code for both A & B
   # Calculate col and row id within a wave for 128b loads
