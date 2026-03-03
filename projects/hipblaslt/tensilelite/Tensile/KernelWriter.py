@@ -4173,6 +4173,319 @@ class KernelWriter(metaclass=abc.ABCMeta):
 
     return module
 
+  def kernelBodySubtile(self, kernel, tensorParametersA, tensorParametersB):
+    #expand = kernel["ExpandPointerSwap"]
+    self.dontAppendCode = False
+
+    tPM = tensorParametersA["tpsMetadata"] if tensorParametersA["is_sparse"] else tensorParametersB["tpsMetadata"]
+
+    ####################################
+    # Begin String
+    moduleKernelBody = KernelBody("kernelBody")
+
+    ####################################
+    # Function Signature
+    ####################################
+    fs = self.functionSignature()
+    moduleKernelBody.addSignature(fs)
+
+    module = Module("body")
+    module.add(Label("ASM_Start", "Main body of the asm kernel"))
+    module.add(self.defineAndResources(kernel, tensorParametersA, tensorParametersB, tPM))
+
+    # Initialize stream-k loop
+    skComponent = Component.StreamK.find(self)
+    module.add(skComponent.preLoop(self, kernel))
+
+    # Open persistent loop
+    loopComponent = Component.PersistentLoop.find(self)
+
+    module.add(loopComponent.openPersistentLoop(self, kernel))
+
+    module.addComment0("Number of subtiles for A: %u"%(len(self.states.a.tileInfo.localSubtiles)))
+    module.addComment0("Number of subtiles for B: %u"%(len(self.states.b.tileInfo.localSubtiles)))
+
+
+    module.add(self.setupNewTile(kernel, tensorParametersA, tensorParametersB, isOptNLL=False))
+    self.removeSgprVarFromPool("SrdD")
+    self.removeSgprVarFromPool("SrdC")
+
+
+    # Allocate registers for GR/LR
+    self.states.a.tileInfo.allocOffsetRegisters(self, kernel)
+    self.states.b.tileInfo.allocOffsetRegisters(self, kernel)
+
+    atile = self.states.a.tileInfo
+    btile = self.states.b.tileInfo
+
+    for v in self.states.a.tileInfo.sharedVgprGROffset:
+      module.addComment("Allocating v[%u] for A GR"%(v))
+    for v in self.states.a.tileInfo.sharedVgprLROffset:
+      module.addComment("Allocating v[%u] for A LR"%(v))
+    for v in self.states.b.tileInfo.sharedVgprGROffset:
+      module.addComment("Allocating v[%u] for B GR"%(v))
+    for v in self.states.b.tileInfo.sharedVgprLROffset:
+      module.addComment("Allocating v[%u] for B LR"%(v))
+
+    for st in self.states.a.tileInfo.localSubtiles:
+      for reg in atile.localSubtilesRegister[st.regListId]:
+        regstr = 's' if st.useSgpr else 'v'
+        module.addComment0("Using %s%u for A GR"%(regstr, reg))
+
+    for st in self.states.b.tileInfo.localSubtiles:
+      for reg in btile.localSubtilesRegister[st.regListId]:
+        regstr = 's' if st.useSgpr else 'v'
+        module.addComment0("Using %s%u for B GR"%(regstr, reg))
+
+
+
+
+    for sId0 in range(atile.localSubtileGrid[0]):
+      for sId1 in range(atile.localSubtileGrid[1]):
+        for voff in atile.sharedVgprGROffset:
+          subtileInfo = atile.localSubtiles[atile.getLocalSubtileLinearId(sId0, sId1)]
+          if subtileInfo.regListId > 0:
+            regList = atile.localSubtilesRegister[subtileInfo.regListId]
+            for reg in regList:
+              module.addComment("Load for subtile [%u,%u]: buffer load reg%u, reg%u, A desc"%(sId0, sId1, voff, reg))
+          else:
+              module.addComment("Load for subtile [%u,%u]: buffer load reg%u, X, A desc"%(sId0, sId1, voff))
+
+    module.addComment0("Two versions of indexing subtiles")
+
+    module.addComment0("2D indexing")
+    for sId0 in range(btile.localSubtileGrid[0]):
+      for sId1 in range(btile.localSubtileGrid[1]):
+        for voff in btile.sharedVgprGROffset:
+          subtileInfo = btile.localSubtiles[btile.getLocalSubtileLinearId(sId0, sId1)]
+          if subtileInfo.regListId > 0:
+            regList = btile.localSubtilesRegister[subtileInfo.regListId]
+            for reg in regList:
+              module.addComment("Load for subtile [%u,%u]: buffer load reg%u, reg%u, B desc"%(sId0, sId1, voff, reg))
+          else:
+              module.addComment("Load for subtile [%u,%u]: buffer load reg%u, X, B desc"%(sId0, sId1, voff))
+
+    module.addComment0("Linear indexing")
+    for sId in range(btile.subtileLocalTotalCount):
+      for voff in btile.sharedVgprGROffset:
+        subtileInfo = btile.localSubtiles[sId]
+        sId0, sId1 = btile.getLocalSubtileIdFromLinearId(sId)
+        if subtileInfo.regListId > 0:
+          regList = btile.localSubtilesRegister[subtileInfo.regListId]
+          for reg in regList:
+            module.addComment("Load for subtile [%u,%u]: buffer load reg%u, reg%u, B desc"%(sId0, sId1, voff, reg))
+        else:
+          module.addComment("Load for subtile [%u,%u]: buffer load reg%u, X, B desc"%(sId0, sId1, voff))
+
+
+    # Allocate registers for VGPR tiles
+    self.states.a.tileInfo.allocVgprTileRegisters(self, kernel)
+    self.states.b.tileInfo.allocVgprTileRegisters(self, kernel)
+    self.states.d.tileInfo.allocVgprTileRegisters(self, kernel)
+
+    self.states.scheduleInfo = ScheduleInfo(self.states.a.tileInfo, self.states.b.tileInfo)
+
+    module.addComment("Num vgpr tiles: %u"%(len(self.states.a.tileInfo.vgprTiles)))
+    module.addComment("Num mma tiles: %u"%(self.states.a.tileInfo.mmaTileLocalTotalCount))
+
+
+    for vtiles in self.states.a.tileInfo.vgprTiles:
+      regStr = "Vgpr" if vtiles.regList.regPool == self.vgprPool else "Agpr"
+      module.addComment("%ss used for A mma tile %u: %s"%(regStr, self.states.a.tileInfo.vgprTiles.index(vtiles), str(vtiles)))
+
+    for vtiles in self.states.b.tileInfo.vgprTiles:
+      regStr = "Vgpr" if vtiles.regList.regPool == self.vgprPool else "Agpr"
+      module.addComment("%ss used for B mma tile %u: %s"%(regStr, self.states.b.tileInfo.vgprTiles.index(vtiles), str(vtiles)))
+
+    for vtiles in self.states.d.tileInfo.vgprTiles:
+      regStr = "Vgpr" if vtiles.regList.regPool == self.vgprPool else "Agpr"
+      module.addComment("%ss used for D mma tile %u: %s"%(regStr, self.states.d.tileInfo.vgprTiles.index(vtiles), str(vtiles)))
+
+
+    vtmp = self.vgprPool.checkOut(1)
+    module.addComment("Checking out %u"%vtmp)
+    self.vgprPool.checkIn(vtmp)
+
+    # Sample scheduleing example
+    if 1:
+      module.addComment0("Testing sample scheduling code")
+      mmaProduct = []
+
+      for k in range(self.states.a.tileInfo.localMMATileGrid[1]): # k dim
+        for i in range(self.states.a.tileInfo.localMMATileGrid[0]): # k dim
+          for j in range(self.states.b.tileInfo.localMMATileGrid[0]): # k dim
+            mmaProduct.append([[i,k], [j,k]])
+
+
+      mmaToSched = deque(mmaProduct)
+      availTilesA = self.states.scheduleInfo.availableVgprATiles
+      availTilesB = self.states.scheduleInfo.availableVgprBTiles
+      usedTilesA = self.states.scheduleInfo.usedVgprATiles
+      usedTilesB = self.states.scheduleInfo.usedVgprBTiles
+      c = 0
+      maxC = 2 * len(mmaToSched)
+      while len(mmaToSched) and c < maxC:
+        c += 1
+        mmaProduct = mmaToSched.popleft()
+        mmaTileA = mmaProduct[0]
+        mmaTileB = mmaProduct[1]
+
+        vgprTileA = -1
+        vgprTileB = -1
+        if mmaTileA not in usedTilesA.values():
+          if len(availTilesA):
+            vgprTileA = availTilesA.popleft()
+          usedTilesA[vgprTileA] = mmaTileA
+        else:
+          for k,v in usedTilesA.items():
+            if v == mmaTileA:
+              vgprTileA = k
+
+        if mmaTileB not in usedTilesB.values():
+          if len(availTilesB):
+            vgprTileB = availTilesB.popleft()
+          usedTilesB[vgprTileB] = mmaTileB
+        else:
+          for k,v in usedTilesB.items():
+            if v == mmaTileB:
+              vgprTileB = k
+
+        if vgprTileA > -1 and vgprTileB > -1:
+          print("Scheduled mma product: %s:VBA[%u] x %s:VBB[%u]"%(str(mmaTileA),vgprTileA, str(mmaTileB), vgprTileB))
+          module.addComment("Scheduled mma product: %s:VBA[%u] x %s:VBB[%u]"%(str(mmaTileA),vgprTileA, str(mmaTileB), vgprTileB))
+          remainingMMATileA = []
+          remainingMMATileB = []
+
+          for mma in mmaToSched:
+            if mma[0] not in remainingMMATileA:
+              remainingMMATileA.append(mma[0])
+            if mma[1] not in remainingMMATileB:
+              remainingMMATileB.append(mma[1])
+
+          if mmaTileA not in remainingMMATileA:
+            del usedTilesA[vgprTileA]
+            availTilesA.append(vgprTileA)
+
+          if mmaTileB not in remainingMMATileB:
+            del usedTilesB[vgprTileB]
+            availTilesB.append(vgprTileB)
+
+        else:
+          mmaToSched.append(mmaProduct)
+          print("Not scheduled mma product: %s:VBA[%u] x %s:VBB[%u]"%(str(mmaTileA),vgprTileA, str(mmaTileB), vgprTileB))
+      module.addComment("%u products not schedule"%len(mmaToSched))
+      module.addComment0("Done testing sample scheduling code")
+
+    #exit(1)
+
+
+    if self.do["executeToPrefetchEnd"]:
+      module.add(self.functionEnd(kernel, addLabel=False))
+
+    module.add(preLoop(self, kernel))
+    module.add(mainLoop(self, kernel))
+
+    atileInfo = self.states.a.tileInfo
+    btileInfo = self.states.b.tileInfo
+    dtileInfo = self.states.d.tileInfo
+
+    if 0:
+      module.addComment0("Example MFMA standard ordering")
+      for mmak in range(atileInfo.localMMATileGrid[1]):
+        for mma1 in range(btileInfo.localMMATileGrid[0]):
+          for mma0 in range(atileInfo.localMMATileGrid[0]):
+            atiles = atileInfo.vgprTiles
+            btiles = btileInfo.vgprTiles
+            dtiles = dtileInfo.vgprTiles
+            module.addComment("%s += %s * %s"%(dtiles[dtileInfo.getLocalMMATileLinearId(mma0, mma1)], \
+                                               atiles[atileInfo.getLocalMMATileLinearId(mma0, mmak)], \
+                                               btiles[btileInfo.getLocalMMATileLinearId(mma1, mmak)]))
+
+
+      module.addComment0("Example MFMA PLR0 ordering")
+
+      partitionFactor = 2
+      mma0Range = []
+      mma1Range = []
+
+      for i in range(partitionFactor):
+        mma0Range.append((i * (atileInfo.localMMATileGrid[0] // partitionFactor),\
+                          (i + 1) * (atileInfo.localMMATileGrid[0] // partitionFactor)))
+        mma1Range.append((i * (btileInfo.localMMATileGrid[0] // partitionFactor),\
+                          (i + 1) * (btileInfo.localMMATileGrid[0] // partitionFactor)))
+
+      for mmak in range(atileInfo.localMMATileGrid[1] // 2):
+        for mma0r, mma1r in itertools.product(mma0Range, mma1Range):
+          for mma1 in range(*mma1r):
+            for mma0 in range(*mma0r):
+              atiles = atileInfo.vgprTiles
+              btiles = btileInfo.vgprTiles
+              dtiles = dtileInfo.vgprTiles
+              module.addComment("%s += %s * %s [%u, %u, %u]"%(dtiles[dtileInfo.getLocalMMATileLinearId(mma0, mma1)], \
+                                                              atiles[atileInfo.getLocalMMATileLinearId(mma0, mmak)], \
+                                                              btiles[btileInfo.getLocalMMATileLinearId(mma1, mmak)], \
+                                                              mma0, mma1, mmak))
+
+    # Deallocate registers used for GR/LR offsets
+    self.states.a.tileInfo.deallocOffsetRegisters(self, kernel)
+    self.states.b.tileInfo.deallocOffsetRegisters(self, kernel)
+    # Deallocate registers used for VGPR A/Btiles
+    self.states.a.tileInfo.deallocVgprTileRegisters(self, kernel)
+    self.states.b.tileInfo.deallocVgprTileRegisters(self, kernel)
+
+    # For post loop code, we can either implement separate version and copy parts from global write batch
+    # Or modify global write batch directy.
+    module.addComment0("Placeholder for Post loop code..")
+
+
+    if 0:
+      ####################################
+      # NOT LocalSplitU
+      ####################################
+
+      # global write indices
+      module.addComment1("not-LocalSplitU: global write indices")
+      module.add(self.notLocalSplitUGlobalWriteIndices(kernel))
+
+      # global write
+      module.addComment1("not-LocalSplitU: global write")
+      #module.add(self.notLocalSplitUGlobalWrite(kernel, tensorParametersA, tensorParametersB))
+    
+    # Deallocate registers used for C/D tiles after store code instructions are emitted
+    self.states.d.tileInfo.deallocVgprTileRegisters(self, kernel)
+
+
+
+    module.add(self.functionEnd(kernel, addLabel=True))
+
+    # Add a label at the end of the asm for indexing.
+    module.add(Label("ASM_End", "The end of the kernel"))
+
+    moduleKernelBody.addBody(module)
+    self.checkResources(kernel, moduleKernelBody) # check resource available or not
+
+
+    # TODO: Check what does this do and enable this if needed
+    # Tensile instruction pass, temporarily disable due to build time.
+    # Kernels with epilog especially with activation is too long (50000~ lines).
+    # Need to refactor global write elements.
+    #ripo = rocIsaPassOption()
+    #ripo.removeDupFunc = bool(kernel["ActivationFuncCall"])
+    #ripo.numWaves = kernel["NumThreads"] // kernel["WavefrontSize"]
+    #if kernel["ProblemType"]["ActivationType"] == "all":
+    #  ripo.removeDupAssign = False
+    #if self.states.archCaps["HasSchedMode"]:
+    #  ripo.insertDelayAlu = True
+    #passResult = rocIsaPass(moduleKernelBody, ripo)
+    #kernel["MathClocksUnrolledLoop"] = passResult.cycles
+
+
+    error = self.states.overflowedResources
+    print2(f"  found error code {error} with overflowed resources set to {self.states.overflowedResources}")
+
+    return (error, str(moduleKernelBody))
+
+
   ##############################################################################
   # Kernel Body
   ##############################################################################
@@ -5484,6 +5797,47 @@ class KernelWriter(metaclass=abc.ABCMeta):
     self.states.regCaps  = ti.getRegCaps()
 
     self.asmAssert = Assert(self.states.laneSGPRCount, kernel["WavefrontSize"], self.db["EnableAsserts"])
+
+
+
+    print("================= Macro Tile config: %u x %u x %u ========================"%(kernel["MacroTile0"], kernel["MacroTile1"], kernel["DepthU"]))
+
+    def initSubTileInfo(tc):
+
+      if tc == 'A':
+        self.states.a.tileInfo = TileInfo(tc, kernel)
+        tileInfo = self.states.a.tileInfo
+      elif tc == 'B':
+        self.states.b.tileInfo = TileInfo(tc, kernel)
+        tileInfo = self.states.b.tileInfo
+      elif tc == 'D':
+        self.states.d.tileInfo = TileInfo(tc, kernel)
+        tileInfo = self.states.d.tileInfo
+
+      print(tc, "Global mma tile dim ", tileInfo.globalMMATileGrid)
+      print(tc, "Global subtile dim  ", tileInfo.globalSubtileGrid)
+      print(tc, "Local mma tile dim ", tileInfo.localMMATileGrid)
+      print(tc, "Local subtile dim  ", tileInfo.localSubtileGrid)
+      print(tc, "Load Ratio GR", tileInfo.loadRatioGR)
+      print(tc, "Num GR per subtile", tileInfo.numGRPerSubtile)
+      print(tc, "num GR total", tileInfo.numGRTotal)
+
+      print(tc, "Load Ratio LR", tileInfo.loadRatioLR)
+      print(tc, "Num LR per subtile", tileInfo.numLRPerSubtile)
+      print(tc, "num LR total", tileInfo.numLRTotal)
+
+      print(tc, "Num vgpr per mma tile", tileInfo.mmaTileRegCount)
+      print(tc, "Num mma tile", tileInfo.mmaTileLocalTotalCount)
+
+
+    if kernel["UseSubtileImpl"]:
+      initSubTileInfo('A')
+      initSubTileInfo('B')
+      initSubTileInfo('D')
+
+    #print(self.states.a.tileInfo.getLocalSubtileId(1,0))
+
+    #exit(1)
 
     self.states.tailloopInNll = kernel["TailloopInNll"]
     # remove staggerU code for the following cases

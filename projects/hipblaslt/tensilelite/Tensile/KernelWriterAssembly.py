@@ -1377,6 +1377,21 @@ class KernelWriterAssembly(KernelWriter):
     module.add(self.moduleVgprMacroG2LA)
     module.add(self.moduleVgprMacroG2LB)
 
+
+
+    def macroAndSetVgprImplSubtile():
+      module.add(RegSet("v", "vgprSerial", self.states.startVgprSerial))
+      print(self.vgprPool.size())
+      #self.vgprPool.remove(self.states.startVgprSerial, 1)
+      #module.addComment0("Need %u vgprs for GR A"%(self.states.a.tileInfo.numGRPerSubtile))
+      return
+
+    if not kernel["UseSubtileImpl"]:
+      macroAndSetImplClassic()
+    else:
+      macroAndSetVgprImplSubtile()
+
+
     ########################################
     # SGPR Macros
     ########################################
@@ -2289,26 +2304,27 @@ class KernelWriterAssembly(KernelWriter):
 
       # C regs are not used during initialization so mark them as available -
       # we will claim then just before the start of the unroll loop:
-      if self.states.lastValuMXSAB:
-        self.vgprPool.add(0 , \
-            self.states.lastValuMXSAB, "ValuMXSAB") # Add as available
+      if not kernel["UseSubtileImpl"]:
+        if self.states.lastValuMXSAB:
+          self.vgprPool.add(0 , \
+              self.states.lastValuMXSAB, "ValuMXSAB") # Add as available
+          moduleWg.addComment0("init: add vgpr [%u...%u) to pool" % \
+                              (self.states.mxsa.startVgprValu, self.states.lastValuMXSAB+self.states.mxsa.startVgprValu))
+
+        self.vgprPool.add(self.states.a.startVgprValu , \
+            self.states.lastValuAB - self.states.a.startVgprValu , "ValuAB") # Add as available
         moduleWg.addComment0("init: add vgpr [%u...%u) to pool" % \
-                            (self.states.mxsa.startVgprValu, self.states.lastValuMXSAB+self.states.mxsa.startVgprValu))
+                            (self.states.a.startVgprValu, self.states.lastValuAB+self.states.a.startVgprValu))
 
-      self.vgprPool.add(self.states.a.startVgprValu , \
-          self.states.lastValuAB - self.states.a.startVgprValu , "ValuAB") # Add as available
-      moduleWg.addComment0("init: add vgpr [%u...%u) to pool" % \
-                          (self.states.a.startVgprValu, self.states.lastValuAB+self.states.a.startVgprValu))
+        self.vgprPool.add(self.states.c.startVgprValu, \
+          self.states.c.numVgprValu, "ValuC-Block") # Add as available
+        moduleWg.addComment0("init: add vgpr [%u...%u) to pool" % \
+                            (self.states.c.startVgprValu, self.states.c.startVgprValu+self.states.c.numVgprValu))
 
-      self.vgprPool.add(self.states.c.startVgprValu, \
-        self.states.c.numVgprValu, "ValuC-Block") # Add as available
-      moduleWg.addComment0("init: add vgpr [%u...%u) to pool" % \
-                          (self.states.c.startVgprValu, self.states.c.startVgprValu+self.states.c.numVgprValu))
-
-      numAccvgprs = self.states.totalAgprs
-      self.agprPool.add(0, numAccvgprs, "ValuC-Block")
-      moduleWg.addComment0("init: add agpr [%u...%u) to pool" % \
-                          (0, numAccvgprs))
+        numAccvgprs = self.states.totalAgprs
+        self.agprPool.add(0, numAccvgprs, "ValuC-Block")
+        moduleWg.addComment0("init: add agpr [%u...%u) to pool" % \
+                            (0, numAccvgprs))
 
       if kernel["StreamK"] == 0:
         moduleWg.add(self.localReadAddresses(kernel, tPA, tPB, tPM))
@@ -12766,6 +12782,7 @@ class KernelWriterAssembly(KernelWriter):
     module = Module("notLocalSplitUGlobalWriteIndices")
 
     if kernel["EnableMatrixInstruction"]:
+      #pass
       module.add(self.computeStoreVgprs(kernel))
     else:
       module.add(self.computeStoreVgprs(kernel,
