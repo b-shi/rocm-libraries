@@ -27,7 +27,7 @@ from rocisa.instruction import BufferLoadB128, BufferLoadB32, BufferLoadB64, \
   FlatLoadB64, FlatStoreB128, FlatStoreB32, FlatStoreB64, Instruction, MacroInstruction, \
   MFMAInstruction, SBarrier, SBranch, SCBranchSCC0, SCBranchSCC1, SCBranchVCCNZ, SCmpEQU32, SCmpLeU32, \
   SMFMAInstruction, SNop, SSetPrior, SSetRegIMM32B32, SSubU32, SWaitCnt, SWaitAlu, \
-  SLongBranchPositive, VFmaMixF32, VMadMixF32, VMovB32, VAndB32, VCmpEQU32, VCndMaskB32, VMovB64, VLShiftRightB32, VLShiftLeftB32, VMulLOU32, VAddU32, SMovB32, SMulI32
+  SLongBranchPositive, VFmaMixF32, VMadMixF32, VMovB32, VAndB32, VCmpEQU32, VCndMaskB32, VMovB64, VLShiftRightB32, VLShiftLeftB32, VMulLOU32, VAddU32, VAddCOU32, VAddCCOU32, SMovB32, SMulI32, FlatStoreB32, SWaitCnt
 from rocisa.register import RegisterPool
 from rocisa.enum import RegisterType, DataTypeEnum
 # Store various scheduling info
@@ -437,6 +437,37 @@ def _grComputeOffset(module, writer, tileInfo, col_id, row_id, split_id):
   writer.vgprPool.checkIn(tmpVgpr)
 
 ##################################################
+# Debug: Write a VGPR value to D[threadId] for inspection
+#
+# Writes the content of the specified VGPR as a u32 to D[Serial],
+# using flat_store. Uses 2 temp VGPRs from the pool for the address.
+#
+# Usage:
+#   debugExportVgprToD(module, writer, tileInfoA.sharedVgprGROffset[0])
+#
+def debugExportVgprToD(module, writer, vgprIdx, cvtToFloat=True):
+  module.addComment0("DEBUG: Export v%u to D[threadId]" % vgprIdx)
+
+  if cvtToFloat:
+    tmpVgpr = writer.vgprPool.checkOut(2)
+    tmpData = tmpVgpr
+    tmpOffset = tmpVgpr + 1
+    module.add(TextBlock("v_cvt_f32_u32 v%u, v%u // DEBUG: int -> float\n" % (tmpData, vgprIdx)))
+  else:
+    tmpVgpr = writer.vgprPool.checkOut(1)
+    tmpData = vgprIdx
+    tmpOffset = tmpVgpr
+
+  # byte offset = Serial * 4
+  module.add(VLShiftLeftB32(dst=vgpr(tmpOffset), shiftHex=hex(2), src=vgpr("Serial"), comment="DEBUG: byte offset = threadId * 4"))
+  # global_store_dword voffset, vdata, s[base:base+1]
+  module.add(TextBlock("global_store_dword v%u, v%u, s[sgprAddressC:sgprAddressC+1] // DEBUG: store v%u to D[threadId]\n" % (tmpOffset, tmpData, vgprIdx)))
+  module.add(SWaitCnt(vlcnt=0, comment="DEBUG: wait for store"))
+
+  writer.vgprPool.checkIn(tmpVgpr)
+  module.addComment0("DEBUG: End export")
+
+##################################################
 # Compute subtile perpendicular offsets for a single matrix
 #
 def _grComputeSubtileOffsets(module, tileInfo, rowsPerWave):
@@ -510,11 +541,11 @@ def graTileAssignment(writer, kernel):
 
   rowsPerWave = wavesize // block_size // 2
 
-
   # Compute subtile offsets for A and B
   _grComputeSubtileOffsets(module, tileInfoA, rowsPerWave)
   _grComputeSubtileOffsets(module, tileInfoB, rowsPerWave)
 
+  debugExportVgprToD(module, writer, tileInfoA.sharedVgprGROffset[0])
   return module
 
 
