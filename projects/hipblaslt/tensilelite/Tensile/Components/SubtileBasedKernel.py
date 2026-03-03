@@ -13,7 +13,23 @@ from dataclasses import dataclass, field
 from typing import Dict, List, NamedTuple, Optional,Tuple, Type
 from contextlib import contextmanager
 from collections import deque
-
+from rocisa import rocIsa, countInstruction, countGlobalRead, \
+            countLocalRead, countLocalWrite, countDSStoreB256, getMFMAs
+from rocisa.code import Module, TextBlock, StructuredModule, KernelBody
+from rocisa.container import RegisterContainer, replaceHolder, HWRegContainer, VCC, vgpr, sgpr
+from rocisa.label import LabelManager
+from rocisa.asmpass import rocIsaPass, rocIsaPassOption
+from rocisa.instruction import BufferLoadB128, BufferLoadB32, BufferLoadB64, \
+  BufferLoadD16B16, BufferLoadD16U8, DSLoad2B32, DSLoad2B64, DSLoadB128, \
+  DSLoadB32, DSLoadB64, DSLoadB64TrB16, DSLoadInstruction, DSLoadU16, \
+  DSLoadU8, DSStore2B32, DSStore2B64, DSStoreB128, DSStoreB16, DSStoreB256, \
+  DSStoreB32, DSStoreB64, DSStoreB8, DSStoreInstruction, FlatLoadB128, FlatLoadB32, \
+  FlatLoadB64, FlatStoreB128, FlatStoreB32, FlatStoreB64, Instruction, MacroInstruction, \
+  MFMAInstruction, SBarrier, SBranch, SCBranchSCC0, SCBranchSCC1, SCBranchVCCNZ, SCmpEQU32, SCmpLeU32, \
+  SMFMAInstruction, SNop, SSetPrior, SSetRegIMM32B32, SSubU32, SWaitCnt, SWaitAlu, \
+  SLongBranchPositive, VFmaMixF32, VMadMixF32, VMovB32, VAndB32, VCmpEQU32, VCndMaskB32, VMovB64, VLShiftRightB32, VLShiftLeftB32, VMulLOU32
+from rocisa.register import RegisterPool
+from rocisa.enum import RegisterType, DataTypeEnum
 # Store various scheduling info
 class ScheduleInfo:
 
@@ -237,6 +253,33 @@ class TileInfo:
 
   ####################################
   # Given 2d local mma tile Id, return 2d id for local subtile containing that tile
+  def __str__(self):
+    lines = [
+      f"TileInfo(tc={self.tc})",
+      f"  mmaTileShape:           {self.mmaTileShape if isinstance(getattr(self, 'mmaTileShape', None), list) else 'not set'}",
+      f"  mmaTileSize:            {self.mmaTileSize} bytes",
+      f"  mmaTileRegCount:        {self.mmaTileRegCount}",
+      f"  mmaTileLocalTotalCount: {self.mmaTileLocalTotalCount}",
+      f"  subtileShape:           {self.subtileShape}",
+      f"  subtileSize:            {self.subtileSize} bytes",
+      f"  subtileLocalTotalCount: {self.subtileLocalTotalCount}",
+      f"  globalMMATileGrid:      {self.globalMMATileGrid}",
+      f"  globalSubtileGrid:      {self.globalSubtileGrid}",
+      f"  localMMATileGrid:       {self.localMMATileGrid}",
+      f"  localSubtileGrid:       {self.localSubtileGrid}",
+      f"  loadRatioGR:            {self.loadRatioGR}",
+      f"  numGRPerSubtile:        {self.numGRPerSubtile}",
+      f"  numGRTotal:             {self.numGRTotal}",
+      f"  loadRatioLR:            {self.loadRatioLR}",
+      f"  numLRPerSubtile:        {self.numLRPerSubtile}",
+      f"  numLRTotal:             {self.numLRTotal}",
+      f"  vgprTileFactor:         {self.vgprTileFactor}",
+      f"  vgprTiles:              {[str(t) for t in self.vgprTiles] if isinstance(getattr(self, 'vgprTiles', None), list) else 'not allocated'}",
+      f"  sharedVgprGROffset:     {self.sharedVgprGROffset if isinstance(getattr(self, 'sharedVgprGROffset', None), list) else 'not allocated'}",
+      f"  sharedVgprLROffset:     {self.sharedVgprLROffset if isinstance(getattr(self, 'sharedVgprLROffset', None), list) else 'not allocated'}",
+    ]
+    return "\n".join(lines)
+
   def getLocalSubtileIdFromMMATile(self, mmaId0, mmaId1):
     return [mmaId0 // self.subtileShape[0], mmaId1 // self.subtileShape[1]]
 
@@ -371,6 +414,67 @@ def graTileAssignment(writer, kernel):
   for i in range(8):
     module.addComment("")
 
+  # Input Parameters.
+  depthU = kernel["DepthU"]
+  bpeA = kernel["ProblemType"]["DataTypeA"].numBytes()
+  bpeB = kernel["ProblemType"]["DataTypeB"].numBytes()
+  depthUBytes = depthU * bpeA
+
+  assert depthUBytes % 128 == 0, "Only support depthUBytes multiple of 128 for now"
+
+  # Ignore scales for now.
+  loadWidth = 16 # dwordx4 loads only
+  block_size =  depthUBytes // loadWidth
+
+  
+  tileInfoA = writer.states.a.tileInfo 
+
+  print("depthU", depthU)
+  print("bpeA", bpeA)
+  print("bpeB", bpeB)
+
+  assert bpeA == 2 and bpeB == 2, "Only support fp16 for now"
+  
+  print("tileInfoA",tileInfoA)
+  wavesize = kernel["WavefrontSize"]
+
+  # tileInfoA.sharedVgprGROffset 
+  addrA = tileInfoA.sharedVgprGROffset[0]
+  col_id = writer.vgprPool.checkOut(1)
+  row_id = writer.vgprPool.checkOut(1)
+  split_id = writer.vgprPool.checkOut(1)
+  new_serial = writer.vgprPool.checkOut(1)
+
+  tmp = writer.vgprPool.checkOut(1)
+
+  # TODO: compute newSerial
+  
+  # Calculate col and row id within a wave for 128b loads
+  module.add(VAndB32(dst=vgpr(col_id), src0=vgpr(new_serial), src1=(block_size-1), comment="get col_id in wave for %uB load"%loadWidth))
+  module.add(VLShiftLeftB32(dst=vgpr(col_id), shiftHex=hex(loadWidth.bit_length()-1), src=vgpr(col_id), comment="scale by load_width"))
+  module.add(VLShiftRightB32(dst=vgpr(row_id), shiftHex=hex(block_size.bit_length()-1), src=vgpr(new_serial), comment="row id wihtin wave"))
+  # Get split Wave Id
+  module.add(VLShiftRightB32(dst=vgpr(split_id), shiftHex=hex((wavesize//2).bit_length()-1), src=vgpr("Serial"), comment=""))
+  module.add(VAndB32(dst=vgpr(split_id), src0=vgpr(split_id), src1=1, comment="wave split id [0-1]"))
+
+  module.add(VMulLOU32(dst=vgpr(tmp), src0=sgpr("StrideA0I"), src1=vgpr(row_id), comment="" ))
+  # TODO : handle FP4 (sub byte type once available)
+  module.add(VLShiftLeftB32(dst=vgpr(tmp), shiftHex=hex(bpeA.bit_length()-1), src=vgpr(col_id), comment="row_id*strideA*bpeA"))
+  # wave split id
+  module.add(VLShiftRightB32(dst=vgpr(split_id), shiftHex=hex((wavesize//2).bit_length()-1), src=vgpr("Serial"), comment=""))
+
+  
+  # module.add(VMovB32(dst=vgpr("Serial"), src=0, comment="zero init"))
+  # module.add(VMovB32(dst=vgpr(addrA), src=vgpr(lane_id), comment="zero init"))
+  # module.add(VLShiftRightB32(dst=vgpr(addrA), shiftHex=hex(1), src=vgpr("Serial"), comment=""))
+
+
+  writer.vgprPool.checkIn(col_id)
+  writer.vgprPool.checkIn(row_id)
+  writer.vgprPool.checkIn(split_id)
+  writer.vgprPool.checkIn(new_serial)
+  writer.vgprPool.checkIn(tmp)
+  
   return module
 
 
