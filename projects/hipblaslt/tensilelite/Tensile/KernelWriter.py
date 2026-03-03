@@ -2406,8 +2406,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
       # since that would initC inside the other summation loops
 
       if self.states.doShadowInit != 2:
-        # TODOBS: Uncomment
-        #module.add(self.initC(kernel))
+        module.add(self.initC(kernel))
         if kernel["ProblemType"]["Gradient"] and kernel["ProblemType"]["UseBias"] and (kernel["ProblemType"]["BiasSrc"] == "A" or kernel["ProblemType"]["BiasSrc"] == "B"):
           module.add(self.initSumUnroll(kernel))
 
@@ -3696,6 +3695,19 @@ class KernelWriter(metaclass=abc.ABCMeta):
     module.addComment0("Placeholder for Post loop code..")
 
 
+    if 0:
+      ####################################
+      # NOT LocalSplitU
+      ####################################
+
+      # global write indices
+      module.addComment1("not-LocalSplitU: global write indices")
+      module.add(self.notLocalSplitUGlobalWriteIndices(kernel))
+
+      # global write
+      module.addComment1("not-LocalSplitU: global write")
+      #module.add(self.notLocalSplitUGlobalWrite(kernel, tensorParametersA, tensorParametersB))
+    
     # Deallocate registers used for C/D tiles after store code instructions are emitted
     self.states.d.tileInfo.deallocVgprTileRegisters(self, kernel)
 
@@ -4718,9 +4730,10 @@ class KernelWriter(metaclass=abc.ABCMeta):
       print(tc, "Num mma tile", tileInfo.mmaTileLocalTotalCount)
 
 
-    initSubTileInfo('A')
-    initSubTileInfo('B')
-    initSubTileInfo('D')
+    if kernel["UseSubtileImpl"]:
+      initSubTileInfo('A')
+      initSubTileInfo('B')
+      initSubTileInfo('D')
 
     #print(self.states.a.tileInfo.getLocalSubtileId(1,0))
 
