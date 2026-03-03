@@ -157,6 +157,7 @@ class TileInfo:
       macroTile = kernel["MacroTile%s"%tc]
       depthU = kernel["DepthU"]
       bpe = kernel["ProblemType"]["DataType%s"%tc].numBytes()
+      self.bpe = bpe
 
       numWaves = kernel["MIWaveGroup"][0] * kernel["MIWaveGroup"][1]
 
@@ -185,6 +186,7 @@ class TileInfo:
       macroTile = kernel["MacroTile0"]
       depthU = kernel["MacroTile1"]
       bpe = kernel["ProblemType"]["ComputeDataType"].numBytes()
+      self.bpe = bpe
 
       numWaves = kernel["MIWaveGroup"][0] * kernel["MIWaveGroup"][1]
 
@@ -408,6 +410,33 @@ def localReadResetOffsetsSubtile(writer, kernel):
   return module
 
 ##################################################
+# Compute GR offset for a single matrix (A or B)
+#
+def _grComputeOffset(module, writer, tileInfo, col_id, row_id, split_id):
+  tc = tileInfo.tc
+  bpe = tileInfo.bpe
+  addrVgpr = tileInfo.sharedVgprGROffset[0]
+  MT0 = tileInfo.globalMMATileGrid[0] * tileInfo.mmaTileShape[0]
+  strideRef = "StrideA0I" if tc == 'A' else "StrideB1J"
+
+  tmpVgpr = writer.vgprPool.checkOut(2)
+  sHalfOffset = writer.sgprPool.checkOut(1)
+
+  module.add(VMulLOU32(dst=vgpr(tmpVgpr), src0=sgpr(strideRef), src1=vgpr(row_id), comment="%s: row_id * stride"%tc))
+  # TODO : handle FP4 (sub byte type once available)
+  module.add(VLShiftLeftB32(dst=vgpr(tmpVgpr), shiftHex=hex(bpe.bit_length()-1), src=vgpr(col_id), comment="%s: row_id*stride*bpe"%tc))
+  module.add(VAddU32(dst=vgpr(tmpVgpr), src0=vgpr(col_id), src1=vgpr(tmpVgpr), comment="%s: GR row_offset"%tc))
+
+  # apply top-half / bottom half offset according to wave split id
+  module.add(SMovB32(dst=sgpr(sHalfOffset), src=(MT0 * bpe) // 2, comment="%s: Half Tile row offset x bytes"%tc))
+  module.add(VMulLOU32(dst=vgpr(tmpVgpr+1), src0=sgpr(sHalfOffset), src1=vgpr(split_id), comment="%s: Apply offset for 2nd half wave"%tc))
+  module.add(VMulLOU32(dst=vgpr(tmpVgpr+1), src0=sgpr(strideRef), src1=vgpr(tmpVgpr+1), comment="%s: Multiply by stride"%tc))
+  module.add(VAddU32(dst=vgpr(addrVgpr), src0=vgpr(tmpVgpr), src1=vgpr(tmpVgpr+1), comment="%s: GR offset = row_offset + split_wave_offset"%tc))
+
+  writer.sgprPool.checkIn(sHalfOffset)
+  writer.vgprPool.checkIn(tmpVgpr)
+
+##################################################
 # Subroutine to generate GR offset calculation code
 #
 def graTileAssignment(writer, kernel):
@@ -426,67 +455,40 @@ def graTileAssignment(writer, kernel):
 
   # Ignore scales for now.
   loadWidth = 16 # dwordx4 loads only
-  block_size =  depthUBytes // loadWidth
+  block_size = depthUBytes // loadWidth
 
-  
-  tileInfoA = writer.states.a.tileInfo 
-
-  print("depthU", depthU)
-  print("bpeA", bpeA)
-  print("bpeB", bpeB)
+  tileInfoA = writer.states.a.tileInfo
+  tileInfoB = writer.states.b.tileInfo
 
   assert bpeA == 2 and bpeB == 2, "Only support fp16 for now"
-  
-  print("tileInfoA",tileInfoA)
+
   wavesize = kernel["WavefrontSize"]
 
-  # tileInfoA.sharedVgprGROffset 
-  addrA = tileInfoA.sharedVgprGROffset[0]
-  col_id = writer.vgprPool.checkOut(1)
-  row_id = writer.vgprPool.checkOut(1)
-  split_id = writer.vgprPool.checkOut(1)
-  new_serial = writer.vgprPool.checkOut(1)
+  tmpVgpr = writer.vgprPool.checkOut(4)
+  col_id     = tmpVgpr
+  row_id     = tmpVgpr + 1
+  split_id   = tmpVgpr + 2
+  new_serial = tmpVgpr + 3
 
   # TODO: compute newSerial
 
   # Common code for both A & B
-
   # Calculate col and row id within a wave for 128b loads
   module.add(VAndB32(dst=vgpr(col_id), src0=vgpr(new_serial), src1=(block_size-1), comment="get col_id in wave for %uB load"%loadWidth))
   module.add(VLShiftLeftB32(dst=vgpr(col_id), shiftHex=hex(loadWidth.bit_length()-1), src=vgpr(col_id), comment="scale by load_width"))
-  module.add(VLShiftRightB32(dst=vgpr(row_id), shiftHex=hex(block_size.bit_length()-1), src=vgpr(new_serial), comment="row id wihtin wave"))
+  module.add(VLShiftRightB32(dst=vgpr(row_id), shiftHex=hex(block_size.bit_length()-1), src=vgpr(new_serial), comment="row id within wave"))
   # Get split Wave Id
   module.add(VLShiftRightB32(dst=vgpr(split_id), shiftHex=hex((wavesize//2).bit_length()-1), src=vgpr("Serial"), comment=""))
   module.add(VAndB32(dst=vgpr(split_id), src0=vgpr(split_id), src1=1, comment="wave split id [0-1]"))
 
-  # Row offset
-  MT0 = tileInfoA.globalMMATileGrid[0] * tileInfoA.mmaTileShape[0]
-  tmp = writer.vgprPool.checkOut(1)
-  tmp2 = writer.vgprPool.checkOut(1)
+  # Compute GR offset for A
+  _grComputeOffset(module, writer, tileInfoA, col_id, row_id, split_id)
 
-  module.add(VMulLOU32(dst=vgpr(tmp), src0=sgpr("StrideA0I"), src1=vgpr(row_id), comment="" ))
-  # TODO : handle FP4 (sub byte type once available)
-  module.add(VLShiftLeftB32(dst=vgpr(tmp), shiftHex=hex(bpeA.bit_length()-1), src=vgpr(col_id), comment="row_id*strideA*bpeA"))
-  module.add(VAddU32(dst=vgpr(tmp), src0=vgpr(col_id), src1=vgpr(tmp), comment="GR row_offset"))
+  # Compute GR offset for B
+  _grComputeOffset(module, writer, tileInfoB, col_id, row_id, split_id)
 
-  sHalfOffset = writer.sgprPool.checkOut(1)
-  # apply top-half / bottom half offset according to wave split id
-  module.add(SMovB32(dst=sgpr(sHalfOffset), src=(MT0 * bpeA)// 2, comment="Half Tile row offset x bytes"))
-  module.add(VMulLOU32(dst=vgpr(tmp2), src0=sgpr(sHalfOffset), src1=vgpr(split_id), comment="Apply offset for 2nd half wave" ))
-  module.add(VMulLOU32(dst=vgpr(tmp2), src0=sgpr("StrideA0I"), src1=vgpr(tmp2), comment="Multiply by LSA" ))
-  module.add(VAddU32(dst=vgpr(addrA), src0=vgpr(tmp), src1=vgpr(tmp2), comment="GR offset : row_offset + split_wave_offset"))
+  writer.vgprPool.checkIn(tmpVgpr)
 
-  writer.vgprPool.checkIn(tmp2)
-  writer.vgprPool.checkIn(tmp)
-
-
-
-  writer.sgprPool.checkIn(sHalfOffset)
-  writer.vgprPool.checkIn(col_id)
-  writer.vgprPool.checkIn(row_id)
-  writer.vgprPool.checkIn(split_id)
-  writer.vgprPool.checkIn(new_serial)
-  
   return module
 
 
