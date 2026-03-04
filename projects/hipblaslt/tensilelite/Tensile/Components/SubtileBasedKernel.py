@@ -545,7 +545,8 @@ def graTileAssignment(writer, kernel):
   _grComputeSubtileOffsets(module, tileInfoA, rowsPerWave)
   _grComputeSubtileOffsets(module, tileInfoB, rowsPerWave)
 
-  debugExportVgprToD(module, writer, tileInfoA.sharedVgprGROffset[0])
+  if False:
+    debugExportVgprToD(module, writer, tileInfoA.sharedVgprGROffset[0])
   return module
 
 
