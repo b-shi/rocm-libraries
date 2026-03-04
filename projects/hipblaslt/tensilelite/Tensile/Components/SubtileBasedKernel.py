@@ -16,7 +16,7 @@ from collections import deque
 from rocisa import rocIsa, countInstruction, countGlobalRead, \
             countLocalRead, countLocalWrite, countDSStoreB256, getMFMAs
 from rocisa.code import Module, TextBlock, StructuredModule, KernelBody
-from rocisa.container import RegisterContainer, replaceHolder, HWRegContainer, VCC, vgpr, sgpr
+from rocisa.container import RegisterContainer, replaceHolder, HWRegContainer, VCC, vgpr, sgpr, DPPModifiers, EXEC
 from rocisa.label import LabelManager
 from rocisa.asmpass import rocIsaPass, rocIsaPassOption
 from rocisa.instruction import BufferLoadB128, BufferLoadB32, BufferLoadB64, \
@@ -27,7 +27,7 @@ from rocisa.instruction import BufferLoadB128, BufferLoadB32, BufferLoadB64, \
   FlatLoadB64, FlatStoreB128, FlatStoreB32, FlatStoreB64, Instruction, MacroInstruction, \
   MFMAInstruction, SBarrier, SBranch, SCBranchSCC0, SCBranchSCC1, SCBranchVCCNZ, SCmpEQU32, SCmpLeU32, \
   SMFMAInstruction, SNop, SSetPrior, SSetRegIMM32B32, SSubU32, SWaitCnt, SWaitAlu, \
-  SLongBranchPositive, VFmaMixF32, VMadMixF32, VMovB32, VAndB32, VCmpEQU32, VCndMaskB32, VMovB64, VLShiftRightB32, VLShiftLeftB32, VMulLOU32, VAddU32, VAddCOU32, VAddCCOU32, SMovB32, SMulI32, FlatStoreB32, SWaitCnt
+  SLongBranchPositive, VFmaMixF32, VMadMixF32, VMovB32, VAndB32, VCmpEQU32, VCndMaskB32, VMovB64, VLShiftRightB32, VLShiftLeftB32, VMulLOU32, VAddU32, VAddCOU32, VAddCCOU32, SMovB32, SMulI32, FlatStoreB32, SWaitCnt, SMovB64
 from rocisa.register import RegisterPool
 from rocisa.enum import RegisterType, DataTypeEnum
 # Store various scheduling info
@@ -482,23 +482,25 @@ def _grComputeSubtileOffsets(module, tileInfo, rowsPerWave):
 ##################################################
 # Subroutine to generate GR offset calculation code
 #
-def graTileAssignment(writer, kernel):
+def graTileAssignment(writer, kernel, useSwizzling=True):
   module = Module()
-  module.addComment0("REMOVE WHEN IMPLEMNTED: Placeholder for subtile based GR Offset computation")
-  for i in range(8):
-    module.addComment("")
+  module.addComment0("GR Offset Calculation for Subtile Based Tiling")
 
   # Input Parameters.
   depthU = kernel["DepthU"]
   bpeA = kernel["ProblemType"]["DataTypeA"].numBytes()
   bpeB = kernel["ProblemType"]["DataTypeB"].numBytes()
   depthUBytes = depthU * bpeA
+  wavesize = kernel["WavefrontSize"]
+  ldsRowBankSize = 64 * 4 # 64 banks, 4 bytes per bank.
 
   assert depthUBytes % 128 == 0, "Only support depthUBytes multiple of 128 for now"
+  assert depthUBytes <= ldsRowBankSize, "Only support depthUBytes smaller than %u (lds row bank size) for now"%ldsRowBankSize
 
   # Ignore scales for now.
   loadWidth = 16 # dwordx4 loads only
   block_size = depthUBytes // loadWidth
+  numRowsPerLDSBanks = ldsRowBankSize // depthUBytes
 
   tileInfoA = writer.states.a.tileInfo
   tileInfoB = writer.states.b.tileInfo
@@ -506,15 +508,14 @@ def graTileAssignment(writer, kernel):
 
   assert bpeA == 2 and bpeB == 2, "Only support fp16 for now"
 
-  wavesize = kernel["WavefrontSize"]
 
-  tmpVgpr = writer.vgprPool.checkOut(5)
+  tmpVgpr = writer.vgprPool.checkOut(6)
   col_id     = tmpVgpr
   row_id     = tmpVgpr + 1
-  split_id   = tmpVgpr + 2
-  new_serial = tmpVgpr + 3
-  wave_id    = tmpVgpr + 4
-
+  lds_row_id = tmpVgpr + 2
+  split_id   = tmpVgpr + 3
+  new_serial = tmpVgpr + 4
+  wave_id    = tmpVgpr + 5
   
   # Compute newSerial
   module.add(VLShiftRightB32(dst=vgpr(wave_id), shiftHex=hex(wavesize.bit_length()-1), src=vgpr("Serial"), comment="Wave Id"))
@@ -522,11 +523,23 @@ def graTileAssignment(writer, kernel):
   module.add(VLShiftLeftB32(dst=vgpr(wave_id), shiftHex=hex(5), src=vgpr(wave_id), comment=""))
   module.add(VAddU32(dst=vgpr(new_serial), src0=vgpr(wave_id), src1=vgpr(new_serial), comment="New Serial"))
 
+
   # Common code for both A & B
   # Calculate col and row id within a wave for 128b loads
   module.add(VAndB32(dst=vgpr(col_id), src0=vgpr(new_serial), src1=(block_size-1), comment="get col_id in wave for %uB load"%loadWidth))
   module.add(VLShiftLeftB32(dst=vgpr(col_id), shiftHex=hex(loadWidth.bit_length()-1), src=vgpr(col_id), comment="scale by load_width"))
   module.add(VLShiftRightB32(dst=vgpr(row_id), shiftHex=hex(block_size.bit_length()-1), src=vgpr(new_serial), comment="row id within wave"))
+
+  if useSwizzling:
+    module.addComment0("Swizzling")
+    module.add(VLShiftRightB32(dst=vgpr(lds_row_id), shiftHex=hex(numRowsPerLDSBanks.bit_length()-1), src=vgpr(row_id), comment="lds row id"))
+    module.add(VAndB32(dst=vgpr(lds_row_id), src0=vgpr(lds_row_id), src1=hex(1), comment="lds row id % 2"))
+    module.add(VCmpEQU32(dst=VCC(), src0=0, src1=vgpr(lds_row_id), comment="lds row id % 2 == 0 ?"))
+    module.add(VMovB32(dst=vgpr(col_id), src=vgpr(col_id), dpp=DPPModifiers(quad_perm=[1,0,3,2]), comment="swap col_id pairs for swizzling"))
+    module.add(SMovB64(dst=EXEC(), src=-1))
+    # module.add(VMovB32(dst=vgpr(tileInfoA.sharedVgprGROffset[0]), src=vgpr(col_id), comment=""))
+    # return module
+
   # Get split Wave Id
   module.add(VLShiftRightB32(dst=vgpr(split_id), shiftHex=hex((wavesize//2).bit_length()-1), src=vgpr("Serial"), comment=""))
   module.add(VAndB32(dst=vgpr(split_id), src0=vgpr(split_id), src1=1, comment="wave split id [0-1]"))
