@@ -27,7 +27,7 @@ from rocisa.instruction import BufferLoadB128, BufferLoadB32, BufferLoadB64, \
   FlatLoadB64, FlatStoreB128, FlatStoreB32, FlatStoreB64, Instruction, MacroInstruction, \
   MFMAInstruction, SBarrier, SBranch, SCBranchSCC0, SCBranchSCC1, SCBranchVCCNZ, SCmpEQU32, SCmpLeU32, \
   SMFMAInstruction, SNop, SSetPrior, SSetRegIMM32B32, SSubU32, SWaitCnt, SWaitAlu, \
-  SLongBranchPositive, VFmaMixF32, VMadMixF32, VMovB32, VAndB32, VCmpEQU32, VCndMaskB32, VMovB64, VLShiftRightB32, VLShiftLeftB32, VMulLOU32, VAddU32, VAddCOU32, VAddCCOU32, SMovB32, SMulI32, FlatStoreB32, SWaitCnt, SMovB64
+  SLongBranchPositive, VFmaMixF32, VMadMixF32, VMovB32, VAndB32, VCmpEQU32, VCndMaskB32, VMovB64, VLShiftRightB32, VLShiftLeftB32, VMulLOU32, VAddU32, VAddCOU32, VAddCCOU32, SMovB32, SMulI32, FlatStoreB32, SWaitCnt, SMovB64, VSubU32
 from rocisa.register import RegisterPool
 from rocisa.enum import RegisterType, DataTypeEnum
 # Store various scheduling info
@@ -508,14 +508,14 @@ def graTileAssignment(writer, kernel, useSwizzling=True):
 
   assert bpeA == 2 and bpeB == 2, "Only support fp16 for now"
 
-
-  tmpVgpr = writer.vgprPool.checkOut(6)
+  tmpVgpr = writer.vgprPool.checkOut(7)
   col_id     = tmpVgpr
   row_id     = tmpVgpr + 1
   lds_row_id = tmpVgpr + 2
   split_id   = tmpVgpr + 3
   new_serial = tmpVgpr + 4
   wave_id    = tmpVgpr + 5
+  tmp = tmpVgpr + 6
   
   # Compute newSerial
   module.add(VLShiftRightB32(dst=vgpr(wave_id), shiftHex=hex(wavesize.bit_length()-1), src=vgpr("Serial"), comment="Wave Id"))
@@ -523,22 +523,30 @@ def graTileAssignment(writer, kernel, useSwizzling=True):
   module.add(VLShiftLeftB32(dst=vgpr(wave_id), shiftHex=hex(5), src=vgpr(wave_id), comment=""))
   module.add(VAddU32(dst=vgpr(new_serial), src0=vgpr(wave_id), src1=vgpr(new_serial), comment="New Serial"))
 
-
   # Common code for both A & B
   # Calculate col and row id within a wave for 128b loads
   module.add(VAndB32(dst=vgpr(col_id), src0=vgpr(new_serial), src1=(block_size-1), comment="get col_id in wave for %uB load"%loadWidth))
-  module.add(VLShiftLeftB32(dst=vgpr(col_id), shiftHex=hex(loadWidth.bit_length()-1), src=vgpr(col_id), comment="scale by load_width"))
   module.add(VLShiftRightB32(dst=vgpr(row_id), shiftHex=hex(block_size.bit_length()-1), src=vgpr(new_serial), comment="row id within wave"))
 
   if useSwizzling:
     module.addComment0("Swizzling")
     module.add(VLShiftRightB32(dst=vgpr(lds_row_id), shiftHex=hex(numRowsPerLDSBanks.bit_length()-1), src=vgpr(row_id), comment="lds row id"))
-    module.add(VAndB32(dst=vgpr(lds_row_id), src0=vgpr(lds_row_id), src1=hex(1), comment="lds row id % 2"))
-    module.add(VCmpEQU32(dst=VCC(), src0=0, src1=vgpr(lds_row_id), comment="lds row id % 2 == 0 ?"))
+    module.add(VAndB32(dst=vgpr(tmp), src0=vgpr(lds_row_id), src1=hex(1), comment="lds row id % 2"))
+    module.add(VCmpEQU32(dst=VCC(), src0=0, src1=vgpr(tmp), comment="lds row id % 2 == 0 ?"))
     module.add(VMovB32(dst=vgpr(col_id), src=vgpr(col_id), dpp=DPPModifiers(quad_perm=[1,0,3,2]), comment="swap col_id pairs for swizzling"))
     module.add(SMovB64(dst=EXEC(), src=-1))
-    # module.add(VMovB32(dst=vgpr(tileInfoA.sharedVgprGROffset[0]), src=vgpr(col_id), comment=""))
+    module.addComment0("Rotation")
+    module.add(VLShiftRightB32(dst=vgpr(tmp), shiftHex=hex(1), src=vgpr(lds_row_id), comment=""))
+    module.add(VLShiftLeftB32(dst=vgpr(tmp), shiftHex=hex(1), src=vgpr(tmp), comment="(lds_row_id //2) * 2"))
+    module.add(VSubU32(dst=vgpr(tmp), src0=hex(block_size), src1=vgpr(tmp), comment="rotation offset : block_size - (lds_row_id//2)*2"))
+    module.add(VAddU32(dst=vgpr(col_id), src0=vgpr(tmp), src1=vgpr(col_id), comment=""))
+    module.add(VAndB32(dst=vgpr(col_id), src0=vgpr(col_id), src1=hex(block_size-1), comment="(col + offset) % block_size"))
+
+    
+    # module.add(VMovB32(dst=vgpr(tileInfoA.sharedVgprGROffset[0]), src=vgpr(new_serial), comment=""))
     # return module
+
+  module.add(VLShiftLeftB32(dst=vgpr(col_id), shiftHex=hex(loadWidth.bit_length()-1), src=vgpr(col_id), comment="scale col_id by load_width"))
 
   # Get split Wave Id
   module.add(VLShiftRightB32(dst=vgpr(split_id), shiftHex=hex((wavesize//2).bit_length()-1), src=vgpr("Serial"), comment=""))

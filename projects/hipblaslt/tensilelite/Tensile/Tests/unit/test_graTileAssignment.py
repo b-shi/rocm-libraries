@@ -60,15 +60,18 @@ class TileConfig:
     depth_u: int    # DepthU
     stride_a: int   # StrideA0I (in elements)
     stride_b: int   # StrideB1J (in elements)
+    use_swizzling: bool = False  # Whether to enable swizzling
 
     @property
     def label(self):
-        return f"{self.mt_a}x{self.mt_b}x{self.depth_u}"
+        swz = "_swz" if self.use_swizzling else ""
+        return f"{self.mt_a}x{self.mt_b}x{self.depth_u}{swz}"
 
 
 # Tile configs to test
 TILE_CONFIGS = [
-    TileConfig(mt_a=256, mt_b=256, depth_u=64, stride_a=64, stride_b=64),
+    TileConfig(mt_a=256, mt_b=256, depth_u=64, stride_a=64, stride_b=64, use_swizzling=False),
+    TileConfig(mt_a=256, mt_b=256, depth_u=64, stride_a=64, stride_b=64, use_swizzling=True),
 ]
 
 
@@ -176,7 +179,7 @@ def generate_test_kernel(cfg):
         ri.init((9, 5, 0), asmpath)
     ri.setKernel((9, 5, 0), WAVESIZE)
 
-    module = graTileAssignment(writer, kernel)
+    module = graTileAssignment(writer, kernel, useSwizzling=cfg.use_swizzling)
     gra_asm = str(module)
 
     # Scan generated asm for highest register indices used
@@ -295,27 +298,32 @@ amdhsa.kernels:
     return asm, offsetA_vgpr, offsetB_vgpr
 
 
-def compute_expected_offset(thread_id, stride, mt0, depth_u, bpe, load_width, wavesize):
+def compute_expected_offset(thread_id, stride, mt0, depth_u, bpe, load_width, wavesize,
+                            use_swizzling=False):
     """Python reference implementation matching _grComputeOffset logic.
 
+    When use_swizzling=True, applies the LDS bank-conflict avoidance
+    swizzle (quad_perm + rotation) before computing the final byte offset.
     """
     block_size = (depth_u * bpe) // load_width
-    new_serial = thread_id & 31
-    wave_split_id = (thread_id // 32) % 2
-    wave_id = thread_id // wavesize
+    new_serial = (thread_id & (wavesize//2 - 1)) | ((thread_id // wavesize) * (wavesize//2))
+    wave_split_id = (thread_id // (wavesize//2)) % 2
 
     # local col/row in wave
     col = new_serial % block_size
     row = new_serial // block_size
+
+    if use_swizzling:
+        col = col + 1  if col % 2 ==0 else col - 1  # swap even/odd cols for initial swizzle
+        rowLds = row // 2
+        col = (col + (block_size - (rowLds // 2) * 2))%block_size  # rotation to avoid bank conflicts: block_size - (lds_row_id//4)*2
+
     # number of rows per wave (half-wave because of wave_split_id)
-    numRows = (wavesize//2)*load_width // (depth_u * bpe)
+    numRows = (wavesize // 2) * load_width // (depth_u * bpe)
 
-    row_g = row + wave_split_id*(mt0//2) + wave_id*numRows
+    row_g = row + wave_split_id * (mt0 // 2)
     col_g = col * load_width
-    return row_g*stride*bpe + col_g
-
-    
-    return offset
+    return row_g * stride * bpe + col_g
 
 
 def assemble_kernel(asm_source, output_path):
@@ -443,7 +451,7 @@ class TestGraTileAssignmentGPU:
         results_a, _ = run_on_gpu(tile_env.co_path, cfg.stride_a, cfg.stride_b, NUM_THREADS)
 
         for tid in range(NUM_THREADS):
-            expected = compute_expected_offset(tid, cfg.stride_a, cfg.mt_a, cfg.depth_u, BPE, LOAD_WIDTH, WAVESIZE)
+            expected = compute_expected_offset(tid, cfg.stride_a, cfg.mt_a, cfg.depth_u, BPE, LOAD_WIDTH, WAVESIZE, cfg.use_swizzling)
             actual = results_a[tid]
             assert actual == expected, \
                 f"[{cfg.label}] A offset mismatch at tid={tid}: got {actual}, expected {expected}"
@@ -454,7 +462,7 @@ class TestGraTileAssignmentGPU:
         _, results_b = run_on_gpu(tile_env.co_path, cfg.stride_a, cfg.stride_b, NUM_THREADS)
 
         for tid in range(NUM_THREADS):
-            expected = compute_expected_offset(tid, cfg.stride_b, cfg.mt_b, cfg.depth_u, BPE, LOAD_WIDTH, WAVESIZE)
+            expected = compute_expected_offset(tid, cfg.stride_b, cfg.mt_b, cfg.depth_u, BPE, LOAD_WIDTH, WAVESIZE, cfg.use_swizzling)
             actual = results_b[tid]
             assert actual == expected, \
                 f"[{cfg.label}] B offset mismatch at tid={tid}: got {actual}, expected {expected}"
@@ -537,8 +545,8 @@ if __name__ == "__main__":
 
                 errors = 0
                 for tid in range(NUM_THREADS):
-                    exp_a = compute_expected_offset(tid, cfg.stride_a, cfg.mt_a, cfg.depth_u, BPE, LOAD_WIDTH, WAVESIZE)
-                    exp_b = compute_expected_offset(tid, cfg.stride_b, cfg.mt_b, cfg.depth_u, BPE, LOAD_WIDTH, WAVESIZE)
+                    exp_a = compute_expected_offset(tid, cfg.stride_a, cfg.mt_a, cfg.depth_u, BPE, LOAD_WIDTH, WAVESIZE, cfg.use_swizzling)
+                    exp_b = compute_expected_offset(tid, cfg.stride_b, cfg.mt_b, cfg.depth_u, BPE, LOAD_WIDTH, WAVESIZE, cfg.use_swizzling)
                     ok = "OK" if (results_a[tid] == exp_a and results_b[tid] == exp_b) else "FAIL"
                     if ok == "FAIL":
                         errors += 1
