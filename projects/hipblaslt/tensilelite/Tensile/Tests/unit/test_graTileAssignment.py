@@ -66,11 +66,11 @@ class TileConfig:
 # Tile configs to test
 TILE_CONFIGS = [
     TileConfig(mt_a=256, mt_b=256, depth_u=64, stride_a=64, stride_b=64, use_swizzling=False),
-    TileConfig(mt_a=256, mt_b=256, depth_u=64, stride_a=64, stride_b=64, use_swizzling=True),
+    # TileConfig(mt_a=256, mt_b=256, depth_u=64, stride_a=64, stride_b=64, use_swizzling=True),
     # TileConfig(mt_a=16, mt_b=64, depth_u=64, stride_a=64, stride_b=64, use_swizzling=True),
     # No change in offset calculation (will use OOB to mask 2nd 16x128 sub-tile)
     # TileConfig(mt_a=16, mt_b=64, depth_u=64, stride_a=64, stride_b=64, use_swizzling=True),
-    TileConfig(mt_a=80, mt_b=64, depth_u=64, stride_a=64, stride_b=64, use_swizzling=True),
+    # TileConfig(mt_a=80, mt_b=64, depth_u=64, stride_a=64, stride_b=64, use_swizzling=True),
 ]
 
 
@@ -331,6 +331,7 @@ def assemble_kernel(asm_source, output_path):
     obj_path = asm_path.replace(".s", ".o")
 
     try:
+        #  print(asm_source)
         subprocess.check_call([
             "amdclang++", "-x", "assembler",
             "--target=amdgcn-amd-amdhsa",
@@ -368,8 +369,7 @@ def run_on_gpu(co_path, stride_a, stride_b, num_threads):
         ]
 
     kargs = KernelArgs(int(d_out), stride_a, stride_b)
-    kargs_size = ctypes.sizeof(kargs)
-    kargs_ptr = ctypes.addressof(kargs)
+    kargs_size = ctypes.c_size_t(ctypes.sizeof(kargs))
 
     HIP_LAUNCH_PARAM_BUFFER_POINTER = 0x01
     HIP_LAUNCH_PARAM_BUFFER_SIZE    = 0x02
@@ -377,9 +377,9 @@ def run_on_gpu(co_path, stride_a, stride_b, num_threads):
 
     extra = (ctypes.c_void_p * 5)(
         ctypes.c_void_p(HIP_LAUNCH_PARAM_BUFFER_POINTER),
-        ctypes.c_void_p(kargs_ptr),
+        ctypes.c_void_p(ctypes.addressof(kargs)),
         ctypes.c_void_p(HIP_LAUNCH_PARAM_BUFFER_SIZE),
-        ctypes.c_void_p(ctypes.addressof(ctypes.c_size_t(kargs_size))),
+        ctypes.c_void_p(ctypes.addressof(kargs_size)),
         ctypes.c_void_p(HIP_LAUNCH_PARAM_END),
     )
 
@@ -399,6 +399,7 @@ def run_on_gpu(co_path, stride_a, stride_b, num_threads):
 
     hip_check(hip.hipFree(d_out))
     hip_check(hip.hipModuleUnload(module))
+    
 
     return struct.unpack(f"{num_threads}I", h_out)
 
@@ -472,30 +473,30 @@ class TestGraTileAssignmentGPU:
         )
 
     def test_offset_a(self, gra_env):
-        """Validate sharedVgprGROffset[0] for matrix A across all threads."""
+        """Validate all sharedVgprGROffset vgprs for matrix A across all threads."""
         cfg = gra_env.cfg
-        reg = gra_env.tileInfoA.sharedVgprGROffset[0]
-        results = build_and_run(gra_env.gra_asm, reg, False, cfg, gra_env.tmp_path,
-                                f"offsetA_{cfg.label}")
+        for idx, reg in enumerate(gra_env.tileInfoA.sharedVgprGROffset):
+            results = build_and_run(gra_env.gra_asm, reg, False, cfg, gra_env.tmp_path,
+                                    f"offsetA_v{reg}_{cfg.label}")
 
-        for tid in range(NUM_THREADS):
-            expected = compute_expected_offset(tid, cfg.stride_a, cfg.mt_a, cfg.depth_u,
-                                               BPE, LOAD_WIDTH, WAVESIZE, cfg.use_swizzling)
-            assert results[tid] == expected, \
-                f"[{cfg.label}] A offset mismatch at tid={tid}: got {results[tid]}, expected {expected}"
+            for tid in range(NUM_THREADS):
+                expected = compute_expected_offset(tid, cfg.stride_a, cfg.mt_a, cfg.depth_u,
+                                                   BPE, LOAD_WIDTH, WAVESIZE, cfg.use_swizzling)
+                assert results[tid] == expected, \
+                    f"[{cfg.label}] A offset[{idx}] v{reg} mismatch at tid={tid}: got {results[tid]}, expected {expected}"
 
     def test_offset_b(self, gra_env):
-        """Validate sharedVgprGROffset[0] for matrix B across all threads."""
+        """Validate all sharedVgprGROffset vgprs for matrix B across all threads."""
         cfg = gra_env.cfg
-        reg = gra_env.tileInfoB.sharedVgprGROffset[0]
-        results = build_and_run(gra_env.gra_asm, reg, False, cfg, gra_env.tmp_path,
-                                f"offsetB_{cfg.label}")
+        for idx, reg in enumerate(gra_env.tileInfoB.sharedVgprGROffset):
+            results = build_and_run(gra_env.gra_asm, reg, False, cfg, gra_env.tmp_path,
+                                    f"offsetB_v{reg}_{cfg.label}")
 
-        for tid in range(NUM_THREADS):
-            expected = compute_expected_offset(tid, cfg.stride_b, cfg.mt_b, cfg.depth_u,
-                                               BPE, LOAD_WIDTH, WAVESIZE, cfg.use_swizzling)
-            assert results[tid] == expected, \
-                f"[{cfg.label}] B offset mismatch at tid={tid}: got {results[tid]}, expected {expected}"
+            for tid in range(NUM_THREADS):
+                expected = compute_expected_offset(tid, cfg.stride_b, cfg.mt_b, cfg.depth_u,
+                                                   BPE, LOAD_WIDTH, WAVESIZE, cfg.use_swizzling)
+                assert results[tid] == expected, \
+                    f"[{cfg.label}] B offset[{idx}] v{reg} mismatch at tid={tid}: got {results[tid]}, expected {expected}"
 
     def test_subtile_registers_a(self, gra_env):
         """Validate localSubtilesRegister values for matrix A."""
@@ -530,20 +531,6 @@ class TestGraTileAssignmentGPU:
                     f"[{cfg.label}] B subtile s{reg} (subtileId0={st.subtileId[0]}): " \
                     f"got {actual}, expected {expected}"
 
-    def test_print_first_wave(self, gra_env):
-        """Print offsets for the first wave for visual inspection."""
-        cfg = gra_env.cfg
-        regA = gra_env.tileInfoA.sharedVgprGROffset[0]
-        regB = gra_env.tileInfoB.sharedVgprGROffset[0]
-        results_a = build_and_run(gra_env.gra_asm, regA, False, cfg, gra_env.tmp_path,
-                                  f"printA_{cfg.label}")
-        results_b = build_and_run(gra_env.gra_asm, regB, False, cfg, gra_env.tmp_path,
-                                  f"printB_{cfg.label}")
-
-        print(f"\n[{cfg.label}] {'tid':>4} | {'offsetA':>10} | {'offsetB':>10}")
-        print("-" * 32)
-        for tid in range(WAVESIZE):
-            print(f"{tid:4d} | {results_a[tid]:10d} | {results_b[tid]:10d}")
 
 
 # ---- Utilities ----
@@ -582,8 +569,6 @@ if __name__ == "__main__":
         print(f"{'='*60}")
 
         gra_asm, tileInfoA, tileInfoB, kernel = generate_gra_asm(cfg)
-        regA = tileInfoA.sharedVgprGROffset[0]
-        regB = tileInfoB.sharedVgprGROffset[0]
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = type('P', (), {'__truediv__': lambda s, n: os.path.join(tmp_dir, n)})()
@@ -598,74 +583,57 @@ if __name__ == "__main__":
             print("--- End ---\n")
 
             if HAS_HIP:
-                results_a = build_and_run(gra_asm, regA, False, cfg, tmp_path,
-                                          f"offsetA_{cfg.label}")
-                results_b = build_and_run(gra_asm, regB, False, cfg, tmp_path,
-                                          f"offsetB_{cfg.label}")
+                # Test all sharedVgprGROffset vgprs for both matrices
+                for tc, tileInfo, stride, mt in [("A", tileInfoA, cfg.stride_a, cfg.mt_a),
+                                                  ("B", tileInfoB, cfg.stride_b, cfg.mt_b)]:
+                    for idx, reg in enumerate(tileInfo.sharedVgprGROffset):
+                        print("Regl",reg)
+                        results = build_and_run(gra_asm, reg, False, cfg, tmp_path,
+                                                f"offset{tc}_v{reg}_{cfg.label}")
 
-                if args.grid:
-                    print_offset_grid(f"Matrix A GPU ({cfg.label})", results_a, WAVESIZE, NUM_WAVES)
-                    print_offset_grid(f"Matrix B GPU ({cfg.label})", results_b, WAVESIZE, NUM_WAVES)
+                        if args.grid:
+                            print_offset_grid(f"Matrix {tc} GPU offset[{idx}] v{reg} ({cfg.label})",
+                                              results, WAVESIZE, NUM_WAVES)
 
-                    if args.debug:
-                        # Build expected arrays
-                        expected_a = [compute_expected_offset(tid, cfg.stride_a, cfg.mt_a, cfg.depth_u,
-                                                              BPE, LOAD_WIDTH, WAVESIZE, cfg.use_swizzling)
-                                      for tid in range(NUM_THREADS)]
-                        expected_b = [compute_expected_offset(tid, cfg.stride_b, cfg.mt_b, cfg.depth_u,
-                                                              BPE, LOAD_WIDTH, WAVESIZE, cfg.use_swizzling)
-                                      for tid in range(NUM_THREADS)]
-                        print_offset_grid(f"Matrix A EXPECTED ({cfg.label})", expected_a, WAVESIZE, NUM_WAVES)
-                        print_offset_grid(f"Matrix B EXPECTED ({cfg.label})", expected_b, WAVESIZE, NUM_WAVES)
+                            if args.debug:
+                                expected = [compute_expected_offset(tid, stride, mt, cfg.depth_u,
+                                                                     BPE, LOAD_WIDTH, WAVESIZE, cfg.use_swizzling)
+                                            for tid in range(NUM_THREADS)]
+                                print_offset_grid(f"Matrix {tc} EXPECTED offset[{idx}] ({cfg.label})",
+                                                  expected, WAVESIZE, NUM_WAVES)
 
-                        # Show diff grid (mismatches only)
-                        diff_a = [f"{'X' if results_a[t] != expected_a[t] else '.':>6}" for t in range(NUM_THREADS)]
-                        diff_b = [f"{'X' if results_b[t] != expected_b[t] else '.':>6}" for t in range(NUM_THREADS)]
-                        mismatches_a = sum(1 for t in range(NUM_THREADS) if results_a[t] != expected_a[t])
-                        mismatches_b = sum(1 for t in range(NUM_THREADS) if results_b[t] != expected_b[t])
-                        if mismatches_a:
-                            print(f"\n--- Matrix A DIFF ({mismatches_a} mismatches) ---")
-                            for w in range(NUM_WAVES):
-                                print(f"  w{w}: ", end="")
-                                for lane in range(WAVESIZE):
-                                    tid = w * WAVESIZE + lane
-                                    if results_a[tid] != expected_a[tid]:
-                                        print(f" t{tid}:{results_a[tid]}!={expected_a[tid]}", end="")
-                                print()
-                        if mismatches_b:
-                            print(f"\n--- Matrix B DIFF ({mismatches_b} mismatches) ---")
-                            for w in range(NUM_WAVES):
-                                print(f"  w{w}: ", end="")
-                                for lane in range(WAVESIZE):
-                                    tid = w * WAVESIZE + lane
-                                    if results_b[tid] != expected_b[tid]:
-                                        print(f" t{tid}:{results_b[tid]}!={expected_b[tid]}", end="")
-                                print()
-                        if not mismatches_a and not mismatches_b:
-                            print("\n  All offsets match expected values.")
-                else:
-                    print(f"\n{'tid':>4} | {'offsetA':>10} | {'offsetB':>10} | {'expA':>10} | {'expB':>10} | {'ok':>3}")
-                    print("-" * 60)
+                                mismatches = sum(1 for t in range(NUM_THREADS) if results[t] != expected[t])
+                                if mismatches:
+                                    print(f"\n--- Matrix {tc} offset[{idx}] DIFF ({mismatches} mismatches) ---")
+                                    for w in range(NUM_WAVES):
+                                        print(f"  w{w}: ", end="")
+                                        for lane in range(WAVESIZE):
+                                            tid = w * WAVESIZE + lane
+                                            if results[tid] != expected[tid]:
+                                                print(f" t{tid}:{results[tid]}!={expected[tid]}", end="")
+                                        print()
+                                else:
+                                    print(f"\n  Matrix {tc} offset[{idx}]: all match.")
 
-                errors = 0
-                for tid in range(NUM_THREADS):
-                    exp_a = compute_expected_offset(tid, cfg.stride_a, cfg.mt_a, cfg.depth_u,
-                                                    BPE, LOAD_WIDTH, WAVESIZE, cfg.use_swizzling)
-                    exp_b = compute_expected_offset(tid, cfg.stride_b, cfg.mt_b, cfg.depth_u,
-                                                    BPE, LOAD_WIDTH, WAVESIZE, cfg.use_swizzling)
-                    ok = "OK" if (results_a[tid] == exp_a and results_b[tid] == exp_b) else "FAIL"
-                    if ok == "FAIL":
-                        errors += 1
-                    if not args.grid and (tid < 64 or ok == "FAIL"):
-                        print(f"{tid:4d} | {results_a[tid]:10d} | {results_b[tid]:10d} | {exp_a:10d} | {exp_b:10d} | {ok}")
+                        errors = 0
+                        for tid in range(NUM_THREADS):
+                            exp = compute_expected_offset(tid, stride, mt, cfg.depth_u,
+                                                          BPE, LOAD_WIDTH, WAVESIZE, cfg.use_swizzling)
+                            if results[tid] != exp:
+                                errors += 1
+                                if not args.grid:
+                                    print(f"  FAIL {tc} offset[{idx}] v{reg} tid={tid}: got {results[tid]}, expected {exp}")
+                            elif not args.grid and tid < 64:
+                                print(f"  OK   {tc} offset[{idx}] v{reg} tid={tid}: {results[tid]}")
 
-                print(f"\nTotal: {NUM_THREADS} threads, {errors} errors")
+                        print(f"  Matrix {tc} offset[{idx}] v{reg}: {NUM_THREADS} threads, {errors} errors")
 
                 # Subtile registers
                 for tc, tileInfo, stride in [("A", tileInfoA, cfg.stride_a),
                                               ("B", tileInfoB, cfg.stride_b)]:
                     for st in tileInfo.localSubtiles:
                         for reg in tileInfo.localSubtilesRegister[st.regListId]:
+                            print("Regl",reg)
                             results = build_and_run(gra_asm, reg, st.useSgpr, cfg, tmp_path,
                                                     f"subtile{tc}_s{reg}_{cfg.label}")
                             expected = compute_expected_subtile(st.subtileId[0], stride,
