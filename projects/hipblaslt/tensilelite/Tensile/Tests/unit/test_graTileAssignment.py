@@ -2,17 +2,12 @@
 ################################################################################
 # GPU functional test for graTileAssignment with parameterized tile configs
 #
-# Uses the actual graTileAssignment function to generate the offset computation
-# assembly, then wraps it with a minimal kernel prologue/epilogue for GPU
-# execution and validation.
-#
-# Tests that sharedVgprGROffset[0] for both A and B contain the correct
-# global-read byte offsets for each thread.
+# Generic test framework: each test kernel exports a single register (vgpr or
+# sgpr) to one output buffer.  Different kernel variants are generated for each
+# register under test.
 #
 # Usage:
-#   python3 test_graTileAssignment_gpu.py
-#   # or via pytest:
-#   pytest test_graTileAssignment_gpu.py -v -s
+#   pytest test_graTileAssignment.py -v -s
 ################################################################################
 
 import ctypes
@@ -75,6 +70,8 @@ TILE_CONFIGS = [
 ]
 
 
+# ---- HIP helpers ----
+
 def hip_check(result):
     """Check HIP call result."""
     if isinstance(result, tuple):
@@ -85,6 +82,8 @@ def hip_check(result):
     if result != 0:
         raise RuntimeError(f"HIP error {result}")
 
+
+# ---- Mock / setup helpers ----
 
 def _mock_dtype(num_bytes=2):
     """Create a mock DataType that returns numBytes()."""
@@ -118,14 +117,14 @@ def _create_writer_for_gpu(cfg):
     """Create a mock writer with register pools laid out for GPU execution.
 
     Register layout (must match the kernel prologue/epilogue):
-      v0           = Serial 
+      v0           = Serial
       v1+          = allocated by allocOffsetRegisters and graTileAssignment
 
-      s0:s1        = kernarg_segment_ptr 
-      s2           = workgroup_id_x 
-      s3           = padding 
-      s[4:5]       = output_ptr_A (loaded from kernargs in prologue)
-      s[6:7]       = output_ptr_B (loaded from kernargs in prologue)
+      s0:s1        = kernarg_segment_ptr
+      s2           = workgroup_id_x
+      s3           = padding
+      s[4:5]       = output_ptr (loaded from kernargs in prologue)
+      s[6:7]       = free
       s8           = StrideA0I (loaded from kernargs, mapped via .set)
       s9           = StrideB1J (loaded from kernargs, mapped via .set)
       s10+         = sgprPool for temps (sHalfOffset, subtile offsets, etc.)
@@ -163,14 +162,8 @@ def _create_writer_for_gpu(cfg):
     return writer, kernel, tileInfoA, tileInfoB
 
 
-def generate_test_kernel(cfg):
-    """Generate a test kernel using graTileAssignment's actual output for a given tile config."""
-    writer, kernel, tileInfoA, tileInfoB = _create_writer_for_gpu(cfg)
-
-    offsetA_vgpr = tileInfoA.sharedVgprGROffset[0]
-    offsetB_vgpr = tileInfoB.sharedVgprGROffset[0]
-
-    # Initialize rocIsa for correct instruction encoding
+def _init_rocisa():
+    """Initialize rocIsa singleton if needed."""
     from rocisa import rocIsa
     ri = rocIsa.getInstance()
     if not ri.isInit():
@@ -179,19 +172,53 @@ def generate_test_kernel(cfg):
         ri.init((9, 5, 0), asmpath)
     ri.setKernel((9, 5, 0), WAVESIZE)
 
+
+def generate_gra_asm(cfg):
+    """Run graTileAssignment and return (gra_asm, tileInfoA, tileInfoB, kernel)."""
+    writer, kernel, tileInfoA, tileInfoB = _create_writer_for_gpu(cfg)
+    _init_rocisa()
+
     module = graTileAssignment(writer, kernel, useSwizzling=cfg.use_swizzling)
     gra_asm = str(module)
+    return gra_asm, tileInfoA, tileInfoB, kernel
 
-    # Scan generated asm for highest register indices used
+
+# ---- Generic kernel generator ----
+
+def generate_export_kernel(gra_asm, export_reg, is_sgpr=False):
+    """Generate a kernel that runs gra_asm and exports a single register.
+
+    Args:
+        gra_asm:    Assembly string from graTileAssignment.
+        export_reg: Register index to export (e.g. 3 for v3 or s3).
+        is_sgpr:    True to export an sgpr (uniform value, broadcast to all
+                    threads), False to export a vgpr (per-thread value).
+
+    Kernarg layout (20 bytes, padded to 24):
+        offset  0: output_ptr  (8B, global_buffer)
+        offset  8: strideA     (4B, by_value)
+        offset 12: strideB     (4B, by_value)
+
+    Returns:
+        Assembly source string.
+    """
+    # Find highest register indices used by gra_asm
     vgpr_indices = set(int(m) for m in re.findall(r'\bv(\d+)\b', gra_asm))
     sgpr_indices = set(int(m) for m in re.findall(r'\bs(\d+)\b', gra_asm))
 
-    epilogue_vgpr = max(vgpr_indices | {0}) + 1
-    max_vgpr = epilogue_vgpr + 1
-    max_vgpr = max(((max_vgpr + 3) // 4) * 4, 4) # align-4 for amdhsa_accum_offset
+    tmp_vgpr = max(vgpr_indices | {0}) + 1      # byte-offset register
+    data_vgpr = tmp_vgpr + 1 if is_sgpr else export_reg
+    max_vgpr = max(tmp_vgpr, data_vgpr) + 1
+    max_vgpr = max(((max_vgpr + 3) // 4) * 4, 4)  # align-4 for accum_offset
     max_sgpr = max(sgpr_indices | {9}) + 1
 
-    asm = f"""\
+    # Build epilogue
+    epilogue = f"  v_lshlrev_b32 v{tmp_vgpr}, 2, v0\n"
+    if is_sgpr:
+        epilogue += f"  v_mov_b32 v{data_vgpr}, s{export_reg}\n"
+    epilogue += f"  global_store_dword v{tmp_vgpr}, v{data_vgpr}, s[4:5]\n"
+
+    return f"""\
 .amdgcn_target "amdgcn-amd-amdhsa--{GFX_TARGET}"
 
 // Register name mappings for graTileAssignment symbolic references
@@ -225,27 +252,15 @@ def generate_test_kernel(cfg):
 .text
 test_gra_offset:
   // ---- Prologue: Load kernel arguments ----
-  // s[0:1] = kernarg ptr (hardware)
-  // Layout: output_ptr_A(8B), output_ptr_B(8B), strideA(4B), strideB(4B)
-  s_load_dwordx2 s[4:5], s[0:1], 0x00     // output_ptr_A
-  s_load_dwordx2 s[6:7], s[0:1], 0x08     // output_ptr_B
-  s_load_dword s[sgprStrideA0I], s[0:1], 0x10   // strideA -> s8
-  s_load_dword s[sgprStrideB1J], s[0:1], 0x14   // strideB -> s9
+  s_load_dwordx2 s[4:5], s[0:1], 0x00     // output_ptr
+  s_load_dword s[sgprStrideA0I], s[0:1], 0x08   // strideA -> s8
+  s_load_dword s[sgprStrideB1J], s[0:1], 0x0c   // strideB -> s9
   s_waitcnt lgkmcnt(0)
-
-  // v0 = Serial (hardware workitem_id) - already set by hardware
 
   // ---- Generated graTileAssignment code ----
 {gra_asm}
-  // ---- Epilogue: Write results to global memory ----
-  // byte offset = threadIdx * 4
-  v_lshlrev_b32 v{epilogue_vgpr}, 2, v0
-
-  // global_store offsetA -> output_ptr_A[threadIdx]
-  global_store_dword v{epilogue_vgpr}, v{offsetA_vgpr}, s[4:5]
-  // global_store offsetB -> output_ptr_B[threadIdx]
-  global_store_dword v{epilogue_vgpr}, v{offsetB_vgpr}, s[6:7]
-
+  // ---- Epilogue: Export register ----
+{epilogue}
   s_waitcnt vmcnt(0)
   s_endpgm
 
@@ -262,29 +277,23 @@ amdhsa.kernels:
       - 2
       - 0
     .args:
-      - .name:            output_ptr_A
+      - .name:            output_ptr
         .size:            8
         .offset:          0
         .value_kind:      global_buffer
         .value_type:      u32
         .address_space:   global
-      - .name:            output_ptr_B
-        .size:            8
-        .offset:          8
-        .value_kind:      global_buffer
-        .value_type:      u32
-        .address_space:   global
       - .name:            strideA
         .size:            4
-        .offset:          16
+        .offset:          8
         .value_kind:      by_value
         .value_type:      u32
       - .name:            strideB
         .size:            4
-        .offset:          20
+        .offset:          12
         .value_kind:      by_value
         .value_type:      u32
-    .kernarg_segment_size: 24
+    .kernarg_segment_size: 16
     .kernarg_segment_align: 8
     .group_segment_fixed_size: 0
     .private_segment_fixed_size: 0
@@ -295,8 +304,103 @@ amdhsa.kernels:
 ...
 .end_amdgpu_metadata
 """
-    return asm, offsetA_vgpr, offsetB_vgpr
 
+
+# ---- Assemble / run ----
+
+def assemble_kernel(asm_source, output_path):
+    """Assemble .s source to .co code object."""
+    with tempfile.NamedTemporaryFile(suffix=".s", mode="w", delete=False) as f:
+        f.write(asm_source)
+        asm_path = f.name
+
+    obj_path = asm_path.replace(".s", ".o")
+
+    try:
+        subprocess.check_call([
+            "amdclang++", "-x", "assembler",
+            "--target=amdgcn-amd-amdhsa",
+            f"-mcpu={GFX_TARGET}",
+            "-mwavefrontsize64",
+            "-mcode-object-version=5",
+            "-o", obj_path,
+            asm_path
+        ])
+        os.rename(obj_path, output_path)
+    finally:
+        if os.path.exists(asm_path):
+            os.unlink(asm_path)
+        if os.path.exists(obj_path) and obj_path != output_path:
+            os.unlink(obj_path)
+
+
+def run_on_gpu(co_path, stride_a, stride_b, num_threads):
+    """Load code object, launch kernel, read single output buffer."""
+    hip_check(hip.hipInit(0))
+    device = hip_check(hip.hipGetDevice())
+
+    module = hip_check(hip.hipModuleLoad(co_path.encode() if isinstance(co_path, str) else co_path))
+    kernel = hip_check(hip.hipModuleGetFunction(module, b"test_gra_offset"))
+
+    buf_size = num_threads * 4  # 4 bytes per u32
+    d_out = hip_check(hip.hipMalloc(buf_size))
+    hip_check(hip.hipMemset(d_out, 0, buf_size))
+
+    class KernelArgs(ctypes.Structure):
+        _fields_ = [
+            ("ptr_out", ctypes.c_uint64),
+            ("stride_a", ctypes.c_uint32),
+            ("stride_b", ctypes.c_uint32),
+        ]
+
+    kargs = KernelArgs(int(d_out), stride_a, stride_b)
+    kargs_size = ctypes.sizeof(kargs)
+    kargs_ptr = ctypes.addressof(kargs)
+
+    HIP_LAUNCH_PARAM_BUFFER_POINTER = 0x01
+    HIP_LAUNCH_PARAM_BUFFER_SIZE    = 0x02
+    HIP_LAUNCH_PARAM_END            = 0x03
+
+    extra = (ctypes.c_void_p * 5)(
+        ctypes.c_void_p(HIP_LAUNCH_PARAM_BUFFER_POINTER),
+        ctypes.c_void_p(kargs_ptr),
+        ctypes.c_void_p(HIP_LAUNCH_PARAM_BUFFER_SIZE),
+        ctypes.c_void_p(ctypes.addressof(ctypes.c_size_t(kargs_size))),
+        ctypes.c_void_p(HIP_LAUNCH_PARAM_END),
+    )
+
+    hip_check(hip.hipModuleLaunchKernel(
+        kernel,
+        1, 1, 1,                 # grid
+        num_threads, 1, 1,       # block
+        0,                       # shared mem
+        None,                    # stream
+        None,                    # kernel params (unused with extra)
+        extra                    # extra params
+    ))
+    hip_check(hip.hipDeviceSynchronize())
+
+    h_out = bytearray(buf_size)
+    hip_check(hip.hipMemcpyDtoH(h_out, d_out, buf_size))
+
+    hip_check(hip.hipFree(d_out))
+    hip_check(hip.hipModuleUnload(module))
+
+    return struct.unpack(f"{num_threads}I", h_out)
+
+
+def build_and_run(gra_asm, export_reg, is_sgpr, cfg, tmp_path, label):
+    """Generate, assemble, run a single-register export kernel. Returns results tuple."""
+    asm = generate_export_kernel(gra_asm, export_reg, is_sgpr=is_sgpr)
+    co_path = str(tmp_path / f"test_{label}.co")
+    asm_path = str(tmp_path / f"test_{label}.s")
+    with open(asm_path, "w") as f:
+        f.write(asm)
+    assemble_kernel(asm, co_path)
+    return run_on_gpu(co_path, cfg.stride_a, cfg.stride_b, NUM_THREADS)
+
+
+# ---- Reference implementations ----
 
 def compute_expected_offset(thread_id, stride, mt0, depth_u, bpe, load_width, wavesize,
                             use_swizzling=False):
@@ -326,151 +430,100 @@ def compute_expected_offset(thread_id, stride, mt0, depth_u, bpe, load_width, wa
     return row_g * stride * bpe + col_g
 
 
-def assemble_kernel(asm_source, output_path):
-    """Assemble .s source to .co code object."""
-    with tempfile.NamedTemporaryFile(suffix=".s", mode="w", delete=False) as f:
-        f.write(asm_source)
-        asm_path = f.name
-
-    obj_path = asm_path.replace(".s", ".o")
-
-    try:
-        subprocess.check_call([
-            "amdclang++", "-x", "assembler",
-            "--target=amdgcn-amd-amdhsa",
-            f"-mcpu={GFX_TARGET}",
-            "-mwavefrontsize64",
-            "-mcode-object-version=5",
-            "-o", obj_path,
-            asm_path
-        ])
-        os.rename(obj_path, output_path)
-    finally:
-        if os.path.exists(asm_path):
-            os.unlink(asm_path)
-        if os.path.exists(obj_path) and obj_path != output_path:
-            os.unlink(obj_path)
+def compute_expected_subtile(subtile_id0, stride, depth_u, bpe, load_width, wavesize):
+    """Compute expected subtile register value: rowsPerWave * bpe * subtileId0 * stride."""
+    block_size = (depth_u * bpe) // load_width
+    rows_per_wave = wavesize // block_size // 2
+    return rows_per_wave * bpe * subtile_id0 * stride
 
 
-def run_on_gpu(co_path, stride_a, stride_b, num_threads):
-    """Load code object, launch kernel, read results."""
-    hip_check(hip.hipInit(0))
-    device = hip_check(hip.hipGetDevice())
-
-    module = hip_check(hip.hipModuleLoad(co_path.encode() if isinstance(co_path, str) else co_path))
-    kernel = hip_check(hip.hipModuleGetFunction(module, b"test_gra_offset"))
-
-    buf_size = num_threads * 4  # 4 bytes per u32
-    d_out_a = hip_check(hip.hipMalloc(buf_size))
-    d_out_b = hip_check(hip.hipMalloc(buf_size))
-
-    hip_check(hip.hipMemset(d_out_a, 0, buf_size))
-    hip_check(hip.hipMemset(d_out_b, 0, buf_size))
-
-    ptr_a_int = int(d_out_a)
-    ptr_b_int = int(d_out_b)
-
-    class KernelArgs(ctypes.Structure):
-        _fields_ = [
-            ("ptr_a", ctypes.c_uint64),
-            ("ptr_b", ctypes.c_uint64),
-            ("stride_a", ctypes.c_uint32),
-            ("stride_b", ctypes.c_uint32),
-        ]
-
-    kargs = KernelArgs(ptr_a_int, ptr_b_int, stride_a, stride_b)
-    kargs_size = ctypes.sizeof(kargs)
-    kargs_ptr = ctypes.addressof(kargs)
-
-    HIP_LAUNCH_PARAM_BUFFER_POINTER = 0x01
-    HIP_LAUNCH_PARAM_BUFFER_SIZE    = 0x02
-    HIP_LAUNCH_PARAM_END            = 0x03
-
-    extra = (ctypes.c_void_p * 5)(
-        ctypes.c_void_p(HIP_LAUNCH_PARAM_BUFFER_POINTER),
-        ctypes.c_void_p(kargs_ptr),
-        ctypes.c_void_p(HIP_LAUNCH_PARAM_BUFFER_SIZE),
-        ctypes.c_void_p(ctypes.addressof(ctypes.c_size_t(kargs_size))),
-        ctypes.c_void_p(HIP_LAUNCH_PARAM_END),
-    )
-
-    hip_check(hip.hipModuleLaunchKernel(
-        kernel,
-        1, 1, 1,                 # grid
-        num_threads, 1, 1,       # block
-        0,                       # shared mem
-        None,                    # stream
-        None,                    # kernel params (unused with extra)
-        extra                    # extra params
-    ))
-    hip_check(hip.hipDeviceSynchronize())
-
-    h_out_a = bytearray(buf_size)
-    h_out_b = bytearray(buf_size)
-    hip_check(hip.hipMemcpyDtoH(h_out_a, d_out_a, buf_size))
-    hip_check(hip.hipMemcpyDtoH(h_out_b, d_out_b, buf_size))
-
-    hip_check(hip.hipFree(d_out_a))
-    hip_check(hip.hipFree(d_out_b))
-    hip_check(hip.hipModuleUnload(module))
-
-    results_a = struct.unpack(f"{num_threads}I", h_out_a)
-    results_b = struct.unpack(f"{num_threads}I", h_out_b)
-    return results_a, results_b
-
+# ---- Pytest tests ----
 
 @pytest.mark.skipif(not HAS_HIP, reason="HIP Python bindings not available")
 class TestGraTileAssignmentGPU:
 
     @pytest.fixture(params=TILE_CONFIGS, ids=lambda c: c.label)
-    def tile_env(self, request, tmp_path):
-        """Generate and compile the test kernel for a given tile config."""
+    def gra_env(self, request, tmp_path):
+        """Generate graTileAssignment asm once per tile config."""
         cfg = request.param
-        co_path = str(tmp_path / f"test_gra_offset_{cfg.label}.co")
-        asm, offsetA_vgpr, offsetB_vgpr = generate_test_kernel(cfg)
-
-        asm_path = str(tmp_path / f"test_gra_offset_{cfg.label}.s")
-        with open(asm_path, "w") as f:
-            f.write(asm)
-        print(f"\n[{cfg.label}] Assembly written to: {asm_path}")
-        print(f"[{cfg.label}] Offset A in v{offsetA_vgpr}, Offset B in v{offsetB_vgpr}")
-
-        assemble_kernel(asm, co_path)
-        print(f"[{cfg.label}] Code object: {co_path}")
-
+        gra_asm, tileInfoA, tileInfoB, kernel = generate_gra_asm(cfg)
         return SimpleNamespace(
             cfg=cfg,
-            co_path=co_path,
-            offsetA_vgpr=offsetA_vgpr,
-            offsetB_vgpr=offsetB_vgpr,
+            gra_asm=gra_asm,
+            tileInfoA=tileInfoA,
+            tileInfoB=tileInfoB,
+            kernel=kernel,
+            tmp_path=tmp_path,
         )
 
-    def test_offset_a(self, tile_env):
+    def test_offset_a(self, gra_env):
         """Validate sharedVgprGROffset[0] for matrix A across all threads."""
-        cfg = tile_env.cfg
-        results_a, _ = run_on_gpu(tile_env.co_path, cfg.stride_a, cfg.stride_b, NUM_THREADS)
+        cfg = gra_env.cfg
+        reg = gra_env.tileInfoA.sharedVgprGROffset[0]
+        results = build_and_run(gra_env.gra_asm, reg, False, cfg, gra_env.tmp_path,
+                                f"offsetA_{cfg.label}")
 
         for tid in range(NUM_THREADS):
-            expected = compute_expected_offset(tid, cfg.stride_a, cfg.mt_a, cfg.depth_u, BPE, LOAD_WIDTH, WAVESIZE, cfg.use_swizzling)
-            actual = results_a[tid]
-            assert actual == expected, \
-                f"[{cfg.label}] A offset mismatch at tid={tid}: got {actual}, expected {expected}"
+            expected = compute_expected_offset(tid, cfg.stride_a, cfg.mt_a, cfg.depth_u,
+                                               BPE, LOAD_WIDTH, WAVESIZE, cfg.use_swizzling)
+            assert results[tid] == expected, \
+                f"[{cfg.label}] A offset mismatch at tid={tid}: got {results[tid]}, expected {expected}"
 
-    def test_offset_b(self, tile_env):
+    def test_offset_b(self, gra_env):
         """Validate sharedVgprGROffset[0] for matrix B across all threads."""
-        cfg = tile_env.cfg
-        _, results_b = run_on_gpu(tile_env.co_path, cfg.stride_a, cfg.stride_b, NUM_THREADS)
+        cfg = gra_env.cfg
+        reg = gra_env.tileInfoB.sharedVgprGROffset[0]
+        results = build_and_run(gra_env.gra_asm, reg, False, cfg, gra_env.tmp_path,
+                                f"offsetB_{cfg.label}")
 
         for tid in range(NUM_THREADS):
-            expected = compute_expected_offset(tid, cfg.stride_b, cfg.mt_b, cfg.depth_u, BPE, LOAD_WIDTH, WAVESIZE, cfg.use_swizzling)
-            actual = results_b[tid]
-            assert actual == expected, \
-                f"[{cfg.label}] B offset mismatch at tid={tid}: got {actual}, expected {expected}"
+            expected = compute_expected_offset(tid, cfg.stride_b, cfg.mt_b, cfg.depth_u,
+                                               BPE, LOAD_WIDTH, WAVESIZE, cfg.use_swizzling)
+            assert results[tid] == expected, \
+                f"[{cfg.label}] B offset mismatch at tid={tid}: got {results[tid]}, expected {expected}"
 
-    def test_print_first_wave(self, tile_env):
+    def test_subtile_registers_a(self, gra_env):
+        """Validate localSubtilesRegister values for matrix A."""
+        cfg = gra_env.cfg
+        tileInfo = gra_env.tileInfoA
+        for st in tileInfo.localSubtiles:
+            for reg in tileInfo.localSubtilesRegister[st.regListId]:
+                results = build_and_run(gra_env.gra_asm, reg, st.useSgpr, cfg,
+                                        gra_env.tmp_path,
+                                        f"subtileA_s{reg}_{cfg.label}")
+                expected = compute_expected_subtile(st.subtileId[0], cfg.stride_a,
+                                                    cfg.depth_u, BPE, LOAD_WIDTH, WAVESIZE)
+                # sgpr is uniform: check thread 0
+                actual = results[0]
+                assert actual == expected, \
+                    f"[{cfg.label}] A subtile s{reg} (subtileId0={st.subtileId[0]}): " \
+                    f"got {actual}, expected {expected}"
+
+    def test_subtile_registers_b(self, gra_env):
+        """Validate localSubtilesRegister values for matrix B."""
+        cfg = gra_env.cfg
+        tileInfo = gra_env.tileInfoB
+        for st in tileInfo.localSubtiles:
+            for reg in tileInfo.localSubtilesRegister[st.regListId]:
+                results = build_and_run(gra_env.gra_asm, reg, st.useSgpr, cfg,
+                                        gra_env.tmp_path,
+                                        f"subtileB_s{reg}_{cfg.label}")
+                expected = compute_expected_subtile(st.subtileId[0], cfg.stride_b,
+                                                    cfg.depth_u, BPE, LOAD_WIDTH, WAVESIZE)
+                actual = results[0]
+                assert actual == expected, \
+                    f"[{cfg.label}] B subtile s{reg} (subtileId0={st.subtileId[0]}): " \
+                    f"got {actual}, expected {expected}"
+
+    def test_print_first_wave(self, gra_env):
         """Print offsets for the first wave for visual inspection."""
-        cfg = tile_env.cfg
-        results_a, results_b = run_on_gpu(tile_env.co_path, cfg.stride_a, cfg.stride_b, NUM_THREADS)
+        cfg = gra_env.cfg
+        regA = gra_env.tileInfoA.sharedVgprGROffset[0]
+        regB = gra_env.tileInfoB.sharedVgprGROffset[0]
+        results_a = build_and_run(gra_env.gra_asm, regA, False, cfg, gra_env.tmp_path,
+                                  f"printA_{cfg.label}")
+        results_b = build_and_run(gra_env.gra_asm, regB, False, cfg, gra_env.tmp_path,
+                                  f"printB_{cfg.label}")
 
         print(f"\n[{cfg.label}] {'tid':>4} | {'offsetA':>10} | {'offsetB':>10}")
         print("-" * 32)
@@ -478,10 +531,11 @@ class TestGraTileAssignmentGPU:
             print(f"{tid:4d} | {results_a[tid]:10d} | {results_b[tid]:10d}")
 
 
+# ---- Utilities ----
+
 def print_offset_grid(label, results, wavesize, num_waves):
     """Print offsets as a 2D grid: rows = waves, columns = lanes."""
     print(f"\n--- {label} offsets (rows=waves, cols=lanes) ---")
-    # Header: lane indices
     print(f"{'wave':>6}", end="")
     for lane in range(wavesize):
         print(f" {lane:>6}", end="")
@@ -508,33 +562,27 @@ if __name__ == "__main__":
         print(f"  Tile Config: {cfg.label}")
         print(f"{'='*60}")
 
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            co_path = os.path.join(tmp_dir, f"test_gra_offset_{cfg.label}.co")
-            asm, offsetA_vgpr, offsetB_vgpr = generate_test_kernel(cfg)
+        gra_asm, tileInfoA, tileInfoB, kernel = generate_gra_asm(cfg)
+        regA = tileInfoA.sharedVgprGROffset[0]
+        regB = tileInfoB.sharedVgprGROffset[0]
 
-            asm_path = os.path.join(tmp_dir, f"test_gra_offset_{cfg.label}.s")
-            with open(asm_path, "w") as f:
-                f.write(asm)
-            print(f"Assembly: {asm_path}")
-            print(f"Offset A in v{offsetA_vgpr}, Offset B in v{offsetB_vgpr}")
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = type('P', (), {'__truediv__': lambda s, n: os.path.join(tmp_dir, n)})()
 
             # Print the generated assembly for inspection
             print("\n--- Generated Assembly (graTileAssignment section) ---")
             in_gra = False
-            for line in asm.split('\n'):
-                if 'Generated graTileAssignment' in line:
+            for line in gra_asm.split('\n'):
+                if 'GR Offset' in line or in_gra:
                     in_gra = True
-                if in_gra:
                     print(line)
-                if 'Epilogue' in line and in_gra:
-                    break
             print("--- End ---\n")
 
-            assemble_kernel(asm, co_path)
-            print(f"Code object: {co_path}")
-
             if HAS_HIP:
-                results_a, results_b = run_on_gpu(co_path, cfg.stride_a, cfg.stride_b, NUM_THREADS)
+                results_a = build_and_run(gra_asm, regA, False, cfg, tmp_path,
+                                          f"offsetA_{cfg.label}")
+                results_b = build_and_run(gra_asm, regB, False, cfg, tmp_path,
+                                          f"offsetB_{cfg.label}")
 
                 if args.grid:
                     print_offset_grid(f"Matrix A ({cfg.label})", results_a, WAVESIZE, NUM_WAVES)
@@ -545,8 +593,10 @@ if __name__ == "__main__":
 
                 errors = 0
                 for tid in range(NUM_THREADS):
-                    exp_a = compute_expected_offset(tid, cfg.stride_a, cfg.mt_a, cfg.depth_u, BPE, LOAD_WIDTH, WAVESIZE, cfg.use_swizzling)
-                    exp_b = compute_expected_offset(tid, cfg.stride_b, cfg.mt_b, cfg.depth_u, BPE, LOAD_WIDTH, WAVESIZE, cfg.use_swizzling)
+                    exp_a = compute_expected_offset(tid, cfg.stride_a, cfg.mt_a, cfg.depth_u,
+                                                    BPE, LOAD_WIDTH, WAVESIZE, cfg.use_swizzling)
+                    exp_b = compute_expected_offset(tid, cfg.stride_b, cfg.mt_b, cfg.depth_u,
+                                                    BPE, LOAD_WIDTH, WAVESIZE, cfg.use_swizzling)
                     ok = "OK" if (results_a[tid] == exp_a and results_b[tid] == exp_b) else "FAIL"
                     if ok == "FAIL":
                         errors += 1
@@ -554,6 +604,18 @@ if __name__ == "__main__":
                         print(f"{tid:4d} | {results_a[tid]:10d} | {results_b[tid]:10d} | {exp_a:10d} | {exp_b:10d} | {ok}")
 
                 print(f"\nTotal: {NUM_THREADS} threads, {errors} errors")
+
+                # Subtile registers
+                for tc, tileInfo, stride in [("A", tileInfoA, cfg.stride_a),
+                                              ("B", tileInfoB, cfg.stride_b)]:
+                    for st in tileInfo.localSubtiles:
+                        for reg in tileInfo.localSubtilesRegister[st.regListId]:
+                            results = build_and_run(gra_asm, reg, st.useSgpr, cfg, tmp_path,
+                                                    f"subtile{tc}_s{reg}_{cfg.label}")
+                            expected = compute_expected_subtile(st.subtileId[0], stride,
+                                                                cfg.depth_u, BPE, LOAD_WIDTH, WAVESIZE)
+                            actual = results[0]
+                            status = "OK" if actual == expected else "FAIL"
+                            print(f"  Subtile {tc} s{reg} (id0={st.subtileId[0]}): {actual} (expected {expected}) {status}")
             else:
                 print("HIP not available - assembly generated but not executed")
-                print(f"Manual test: compile and run {asm_path}")
