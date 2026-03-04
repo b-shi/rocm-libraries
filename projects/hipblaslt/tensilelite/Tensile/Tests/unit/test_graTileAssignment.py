@@ -298,44 +298,23 @@ amdhsa.kernels:
 def compute_expected_offset(thread_id, stride, mt0, depth_u, bpe, load_width, wavesize):
     """Python reference implementation matching _grComputeOffset logic.
 
-    Traces through the exact instruction sequence in _grComputeOffset:
-      1. tmp  = stride * row_id           (VMulLOU32 -> tmpVgpr)
-      2. tmp  = col_id << (bpe.bit_len-1) (VLShiftLeftB32 -> tmpVgpr, OVERWRITES #1)
-      3. tmp  = col_id + tmp              (VAddU32 -> tmpVgpr)
-      4. half = (MT0 * bpe) // 2
-      5. tmp2 = split_id * half           (VMulLOU32 -> tmpVgpr+1)
-      6. tmp2 = stride * tmp2             (VMulLOU32 -> tmpVgpr+1)
-      7. offset = tmp + tmp2              (VAddU32 -> addrVgpr)
     """
     block_size = (depth_u * bpe) // load_width
-
-    # graTileAssignment: new_serial computation
-    wave_id = thread_id >> (wavesize.bit_length() - 1)
     new_serial = thread_id & 31
-    wave_id = wave_id << 5
-    new_serial = (wave_id + new_serial) & 0xFFFFFFFF
+    wave_split_id = (thread_id // 32) % 2
+    wave_id = thread_id // wavesize
 
-    # col_id and row_id from new_serial
-    col_id = (new_serial & (block_size - 1)) << (load_width.bit_length() - 1)
-    row_id = new_serial >> (block_size.bit_length() - 1)
+    # local col/row in wave
+    col = new_serial % block_size
+    row = new_serial // block_size
+    # number of rows per wave (half-wave because of wave_split_id)
+    numRows = (wavesize//2)*load_width // (depth_u * bpe)
 
-    # split_id from original Serial
-    split_id = (thread_id >> ((wavesize // 2).bit_length() - 1)) & 1
+    row_g = row + wave_split_id*(mt0//2) + wave_id*numRows
+    col_g = col * load_width
+    return row_g*stride*bpe + col_g
 
-    # _grComputeOffset: exact instruction sequence
-    # Step 1: tmp = stride * row_id  (immediately overwritten)
-    # Step 2: tmp = col_id << (bpe.bit_length()-1)
-    tmp = (col_id << (bpe.bit_length() - 1)) & 0xFFFFFFFF
-    # Step 3: tmp = col_id + tmp
-    tmp = (col_id + tmp) & 0xFFFFFFFF
-
-    # Step 4-6: split_wave_offset
-    half_offset = (mt0 * bpe) // 2
-    tmp2 = (split_id * half_offset) & 0xFFFFFFFF
-    tmp2 = (stride * tmp2) & 0xFFFFFFFF
-
-    # Step 7: final offset
-    offset = (tmp + tmp2) & 0xFFFFFFFF
+    
     return offset
 
 

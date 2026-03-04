@@ -424,10 +424,10 @@ def _grComputeOffset(module, writer, tileInfo, col_id, row_id, split_id):
 
   module.add(VMulLOU32(dst=vgpr(tmpVgpr), src0=sgpr(strideRef), src1=vgpr(row_id), comment="%s: row_id * stride"%tc))
   # TODO : handle FP4 (sub byte type once available)
-  module.add(VLShiftLeftB32(dst=vgpr(tmpVgpr), shiftHex=hex(bpe.bit_length()-1), src=vgpr(col_id), comment="%s: row_id*stride*bpe"%tc))
+  module.add(VLShiftLeftB32(dst=vgpr(tmpVgpr), shiftHex=hex(bpe.bit_length()-1), src=vgpr(tmpVgpr), comment="%s: row_id*stride*bpe"%tc))
   module.add(VAddU32(dst=vgpr(tmpVgpr), src0=vgpr(col_id), src1=vgpr(tmpVgpr), comment="%s: GR row_offset"%tc))
 
-  # apply top-half / bottom half offset according to wave split id
+  # # apply top-half / bottom half offset according to wave split id
   module.add(SMovB32(dst=sgpr(sHalfOffset), src=(MT0 * bpe) // 2, comment="%s: Half Tile row offset x bytes"%tc))
   module.add(VMulLOU32(dst=vgpr(tmpVgpr+1), src0=sgpr(sHalfOffset), src1=vgpr(split_id), comment="%s: Apply offset for 2nd half wave"%tc))
   module.add(VMulLOU32(dst=vgpr(tmpVgpr+1), src0=sgpr(strideRef), src1=vgpr(tmpVgpr+1), comment="%s: Multiply by stride"%tc))
@@ -545,8 +545,6 @@ def graTileAssignment(writer, kernel):
   _grComputeSubtileOffsets(module, tileInfoA, rowsPerWave)
   _grComputeSubtileOffsets(module, tileInfoB, rowsPerWave)
 
-  if False:
-    debugExportVgprToD(module, writer, tileInfoA.sharedVgprGROffset[0])
   return module
 
 
