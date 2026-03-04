@@ -67,6 +67,10 @@ class TileConfig:
 TILE_CONFIGS = [
     TileConfig(mt_a=256, mt_b=256, depth_u=64, stride_a=64, stride_b=64, use_swizzling=False),
     TileConfig(mt_a=256, mt_b=256, depth_u=64, stride_a=64, stride_b=64, use_swizzling=True),
+    # TileConfig(mt_a=16, mt_b=64, depth_u=64, stride_a=64, stride_b=64, use_swizzling=True),
+    # No change in offset calculation (will use OOB to mask 2nd 16x128 sub-tile)
+    # TileConfig(mt_a=16, mt_b=64, depth_u=64, stride_a=64, stride_b=64, use_swizzling=True),
+    TileConfig(mt_a=80, mt_b=64, depth_u=64, stride_a=64, stride_b=64, use_swizzling=True),
 ]
 
 
@@ -95,6 +99,15 @@ def _mock_dtype(num_bytes=2):
 def _create_kernel(cfg):
     """Create a minimal kernel dict matching the given tile config."""
     dtype = _mock_dtype(BPE)
+    if ((cfg.mt_a//16) % 2 == 0) and ((cfg.mt_b//16) % 2 == 0):
+        MIWaveGroup = [2,2]
+    elif ((cfg.mt_a//16) % 2 != 0) and ((cfg.mt_b//16) % 4 == 0):
+        MIWaveGroup = [1,4]
+    elif ((cfg.mt_a//16) % 4 == 0) and ((cfg.mt_b//16) % 2 != 0):
+        MIWaveGroup = [4,1]
+    else:
+        raise ValueError(f"Unsupported tile config for wave grouping: mt_a={cfg.mt_a}, mt_b={cfg.mt_b}")
+
     return {
         "DepthU": cfg.depth_u,
         "MacroTileA": cfg.mt_a,
@@ -103,7 +116,7 @@ def _create_kernel(cfg):
         "MacroTile1": cfg.mt_b,
         "MatrixInstM": 16,
         "MatrixInstK": 32,
-        "MIWaveGroup": [2, 2],
+        "MIWaveGroup": MIWaveGroup,
         "WavefrontSize": WAVESIZE,
         "ProblemType": {
             "DataTypeA": dtype,
@@ -144,6 +157,7 @@ def _create_writer_for_gpu(cfg):
 
     # Build kernel and TileInfo
     kernel = _create_kernel(cfg)
+    print("Kernel config:", kernel)
     tileInfoA = TileInfo('A', kernel)
     tileInfoB = TileInfo('B', kernel)
 
@@ -391,6 +405,7 @@ def run_on_gpu(co_path, stride_a, stride_b, num_threads):
 
 def build_and_run(gra_asm, export_reg, is_sgpr, cfg, tmp_path, label):
     """Generate, assemble, run a single-register export kernel. Returns results tuple."""
+    sys.stdout.flush()  # flush before GPU calls to avoid buffering issues with HIP runtime
     asm = generate_export_kernel(gra_asm, export_reg, is_sgpr=is_sgpr)
     co_path = str(tmp_path / f"test_{label}.co")
     asm_path = str(tmp_path / f"test_{label}.s")
@@ -555,7 +570,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="GPU test for graTileAssignment")
     parser.add_argument("--grid", action="store_true",
                         help="Display offsets as 2D grid (waves x lanes) for A and B")
+    parser.add_argument("--debug", action="store_true",
+                        help="Display expected matrix in grid mode (implies --grid)")
     args = parser.parse_args()
+    if args.debug:
+        args.grid = True
 
     for cfg in TILE_CONFIGS:
         print(f"\n{'='*60}")
@@ -585,8 +604,45 @@ if __name__ == "__main__":
                                           f"offsetB_{cfg.label}")
 
                 if args.grid:
-                    print_offset_grid(f"Matrix A ({cfg.label})", results_a, WAVESIZE, NUM_WAVES)
-                    print_offset_grid(f"Matrix B ({cfg.label})", results_b, WAVESIZE, NUM_WAVES)
+                    print_offset_grid(f"Matrix A GPU ({cfg.label})", results_a, WAVESIZE, NUM_WAVES)
+                    print_offset_grid(f"Matrix B GPU ({cfg.label})", results_b, WAVESIZE, NUM_WAVES)
+
+                    if args.debug:
+                        # Build expected arrays
+                        expected_a = [compute_expected_offset(tid, cfg.stride_a, cfg.mt_a, cfg.depth_u,
+                                                              BPE, LOAD_WIDTH, WAVESIZE, cfg.use_swizzling)
+                                      for tid in range(NUM_THREADS)]
+                        expected_b = [compute_expected_offset(tid, cfg.stride_b, cfg.mt_b, cfg.depth_u,
+                                                              BPE, LOAD_WIDTH, WAVESIZE, cfg.use_swizzling)
+                                      for tid in range(NUM_THREADS)]
+                        print_offset_grid(f"Matrix A EXPECTED ({cfg.label})", expected_a, WAVESIZE, NUM_WAVES)
+                        print_offset_grid(f"Matrix B EXPECTED ({cfg.label})", expected_b, WAVESIZE, NUM_WAVES)
+
+                        # Show diff grid (mismatches only)
+                        diff_a = [f"{'X' if results_a[t] != expected_a[t] else '.':>6}" for t in range(NUM_THREADS)]
+                        diff_b = [f"{'X' if results_b[t] != expected_b[t] else '.':>6}" for t in range(NUM_THREADS)]
+                        mismatches_a = sum(1 for t in range(NUM_THREADS) if results_a[t] != expected_a[t])
+                        mismatches_b = sum(1 for t in range(NUM_THREADS) if results_b[t] != expected_b[t])
+                        if mismatches_a:
+                            print(f"\n--- Matrix A DIFF ({mismatches_a} mismatches) ---")
+                            for w in range(NUM_WAVES):
+                                print(f"  w{w}: ", end="")
+                                for lane in range(WAVESIZE):
+                                    tid = w * WAVESIZE + lane
+                                    if results_a[tid] != expected_a[tid]:
+                                        print(f" t{tid}:{results_a[tid]}!={expected_a[tid]}", end="")
+                                print()
+                        if mismatches_b:
+                            print(f"\n--- Matrix B DIFF ({mismatches_b} mismatches) ---")
+                            for w in range(NUM_WAVES):
+                                print(f"  w{w}: ", end="")
+                                for lane in range(WAVESIZE):
+                                    tid = w * WAVESIZE + lane
+                                    if results_b[tid] != expected_b[tid]:
+                                        print(f" t{tid}:{results_b[tid]}!={expected_b[tid]}", end="")
+                                print()
+                        if not mismatches_a and not mismatches_b:
+                            print("\n  All offsets match expected values.")
                 else:
                     print(f"\n{'tid':>4} | {'offsetA':>10} | {'offsetB':>10} | {'expA':>10} | {'expB':>10} | {'ok':>3}")
                     print("-" * 60)
