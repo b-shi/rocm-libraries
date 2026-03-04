@@ -491,8 +491,31 @@ class TestGraTileAssignmentGPU:
             print(f"{tid:4d} | {results_a[tid]:10d} | {results_b[tid]:10d}")
 
 
+def print_offset_grid(label, results, wavesize, num_waves):
+    """Print offsets as a 2D grid: rows = waves, columns = lanes."""
+    print(f"\n--- {label} offsets (rows=waves, cols=lanes) ---")
+    # Header: lane indices
+    print(f"{'wave':>6}", end="")
+    for lane in range(wavesize):
+        print(f" {lane:>6}", end="")
+    print()
+    print("-" * (7 + 7 * wavesize))
+    for w in range(num_waves):
+        print(f"{w:>6}", end="")
+        for lane in range(wavesize):
+            tid = w * wavesize + lane
+            print(f" {results[tid]:>6}", end="")
+        print()
+
+
 if __name__ == "__main__":
     """Run standalone without pytest."""
+    import argparse
+    parser = argparse.ArgumentParser(description="GPU test for graTileAssignment")
+    parser.add_argument("--grid", action="store_true",
+                        help="Display offsets as 2D grid (waves x lanes) for A and B")
+    args = parser.parse_args()
+
     for cfg in TILE_CONFIGS:
         print(f"\n{'='*60}")
         print(f"  Tile Config: {cfg.label}")
@@ -526,8 +549,13 @@ if __name__ == "__main__":
             if HAS_HIP:
                 results_a, results_b = run_on_gpu(co_path, cfg.stride_a, cfg.stride_b, NUM_THREADS)
 
-                print(f"\n{'tid':>4} | {'offsetA':>10} | {'offsetB':>10} | {'expA':>10} | {'expB':>10} | {'ok':>3}")
-                print("-" * 60)
+                if args.grid:
+                    print_offset_grid(f"Matrix A ({cfg.label})", results_a, WAVESIZE, NUM_WAVES)
+                    print_offset_grid(f"Matrix B ({cfg.label})", results_b, WAVESIZE, NUM_WAVES)
+                else:
+                    print(f"\n{'tid':>4} | {'offsetA':>10} | {'offsetB':>10} | {'expA':>10} | {'expB':>10} | {'ok':>3}")
+                    print("-" * 60)
+
                 errors = 0
                 for tid in range(NUM_THREADS):
                     exp_a = compute_expected_offset(tid, cfg.stride_a, cfg.mt_a, cfg.depth_u, BPE, LOAD_WIDTH, WAVESIZE)
@@ -535,7 +563,7 @@ if __name__ == "__main__":
                     ok = "OK" if (results_a[tid] == exp_a and results_b[tid] == exp_b) else "FAIL"
                     if ok == "FAIL":
                         errors += 1
-                    if tid < 64 or ok == "FAIL":
+                    if not args.grid and (tid < 64 or ok == "FAIL"):
                         print(f"{tid:4d} | {results_a[tid]:10d} | {results_b[tid]:10d} | {exp_a:10d} | {exp_b:10d} | {ok}")
 
                 print(f"\nTotal: {NUM_THREADS} threads, {errors} errors")
