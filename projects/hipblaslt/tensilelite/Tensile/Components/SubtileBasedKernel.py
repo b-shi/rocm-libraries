@@ -313,6 +313,8 @@ class TileInfo:
     # Allocate registers for each subtile
     # TODOBS: Check TLU instead of hardcoding False
     perpDimSize = (self.localSubtileGrid[1] if False else self.localSubtileGrid[0])
+    if self.loadRatioGR == 2.0:
+      perpDimSize = math.ceil(perpDimSize / self.loadRatioGR)
     for reg in range(perpDimSize):
       tmpSgprBuffer = 30 # Hardcoded for now, the amount of sgprs to use for temps
       sgprLimit = writer.states.regCaps["MaxSgpr"] - tmpSgprBuffer
@@ -324,7 +326,6 @@ class TileInfo:
       for i in range(self.numGRPerSubtile):
         # TODOBS: Need to prevent overflow here, better way to do it?
         self.localSubtilesRegister[-1].append(regPool.checkOut(1, preventOverflow=False))
-
     # Iterate through subtiles and allocate vgpr/sgpr if needed
     linearId = 0
     for st in self.localSubtiles:
@@ -334,6 +335,11 @@ class TileInfo:
 
       # TODOBS: Check TLU instead of hardcoding
       slowId = sId1 if False else sId0
+      # Only associate a SGPR to 1 other subtile when loadRatioGR == 2.0 
+      if self.loadRatioGR == 2.0 and slowId %2 == 0:
+        slowId = int(slowId // self.loadRatioGR)
+      else:
+        slowId = 0  
       st.regListId = slowId
       st.useSgpr = self.localSubtilesRegister[slowId].regPool == writer.sgprPool
 
@@ -494,9 +500,9 @@ def _grComputeSubtileOffsets(module, tileInfo):
 
   s_stride = rowOffset * tileInfo.bpe
 
-  for st in tileInfo.localSubtiles:
-    for reg in tileInfo.localSubtilesRegister[st.regListId]:
-      module.add(SMulI32(dst=sgpr(reg), src0=hex(s_stride * st.subtileId[0]), src1=sgpr(strideRef), comment="%s: %u rows offset"%(tc, rowOffset)))
+  for regId in range(len(tileInfo.localSubtilesRegister)):
+    for reg in tileInfo.localSubtilesRegister[regId]:
+      module.add(SMulI32(dst=sgpr(reg), src0=hex(s_stride * regId), src1=sgpr(strideRef), comment="%s: %u rows offset, stride %u, %u"%(tc, rowOffset, s_stride, regId)))
 
 ##################################################
 # Subroutine to generate GR offset calculation code
