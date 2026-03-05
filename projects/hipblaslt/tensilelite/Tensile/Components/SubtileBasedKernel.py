@@ -10,7 +10,6 @@ from rocisa.label import LabelManager
 import math
 from copy import deepcopy
 from dataclasses import dataclass, field
-from enum import Enum, auto
 from typing import Dict, List, NamedTuple, Optional,Tuple, Type
 from contextlib import contextmanager
 from collections import deque
@@ -126,7 +125,6 @@ class TileInfo:
   localSubtileGrid: List[int]  = field(init=False)
 
   localSubtiles: List[SubtileInfo] = field(init=False)
-  # localSubtileRegisters: List[RegisterList] = field(init=False)
 
   loadRatioGR: int = 0
   numGRPerSubtile: int = 0 # may not be needed
@@ -316,6 +314,8 @@ class TileInfo:
     if self.loadRatioGR == 2.0:
       perpDimSize = math.ceil(perpDimSize / self.loadRatioGR)
     for reg in range(perpDimSize):
+      # Increasing tmpSgprBuffer value to 30 to avoid Tensilelite failing on no solution error. 
+      # allocOffsetRegisters needs to be called before graTileAssignment is called. TODO: improve allocation logic to avoid this hack.
       tmpSgprBuffer = 30 # Hardcoded for now, the amount of sgprs to use for temps
       sgprLimit = writer.states.regCaps["MaxSgpr"] - tmpSgprBuffer
       regPool = writer.sgprPool if writer.sgprPool.size() < sgprLimit else writer.vgprPool
@@ -456,37 +456,6 @@ def _grComputeOffset(module, writer, tileInfo, col_id, row_id, split_id):
   writer.vgprPool.checkIn(tmpVgpr)
 
 ##################################################
-# Debug: Write a VGPR value to D[threadId] for inspection
-#
-# Writes the content of the specified VGPR as a u32 to D[Serial],
-# using flat_store. Uses 2 temp VGPRs from the pool for the address.
-#
-# Usage:
-#   debugExportVgprToD(module, writer, tileInfoA.sharedVgprGROffset[0])
-#
-def debugExportVgprToD(module, writer, vgprIdx, cvtToFloat=True):
-  module.addComment0("DEBUG: Export v%u to D[threadId]" % vgprIdx)
-
-  if cvtToFloat:
-    tmpVgpr = writer.vgprPool.checkOut(2)
-    tmpData = tmpVgpr
-    tmpOffset = tmpVgpr + 1
-    module.add(TextBlock("v_cvt_f32_u32 v%u, v%u // DEBUG: int -> float\n" % (tmpData, vgprIdx)))
-  else:
-    tmpVgpr = writer.vgprPool.checkOut(1)
-    tmpData = vgprIdx
-    tmpOffset = tmpVgpr
-
-  # byte offset = Serial * 4
-  module.add(VLShiftLeftB32(dst=vgpr(tmpOffset), shiftHex=hex(2), src=vgpr("Serial"), comment="DEBUG: byte offset = threadId * 4"))
-  # global_store_dword voffset, vdata, s[base:base+1]
-  module.add(TextBlock("global_store_dword v%u, v%u, s[sgprAddressC:sgprAddressC+1] // DEBUG: store v%u to D[threadId]\n" % (tmpOffset, tmpData, vgprIdx)))
-  module.add(SWaitCnt(vlcnt=0, comment="DEBUG: wait for store"))
-
-  writer.vgprPool.checkIn(tmpVgpr)
-  module.addComment0("DEBUG: End export")
-
-##################################################
 # Compute subtile perpendicular offsets for a single matrix
 #
 def _grComputeSubtileOffsets(module, tileInfo):
@@ -518,9 +487,6 @@ def graTileAssignment(writer, kernel, useSwizzling=True):
   depthUBytes = depthU * bpeA
   wavesize = kernel["WavefrontSize"]
   ldsRowBankSize = 64 * 4 # 64 banks, 4 bytes per bank.
-
-  
-
 
   assert bpeA == 2 and bpeB == 2, "Only support fp16 for now"
   assert depthUBytes % 128 == 0, "Only support depthUBytes multiple of 128 for now"
