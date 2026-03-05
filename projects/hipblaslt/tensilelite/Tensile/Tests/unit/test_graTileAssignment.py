@@ -45,39 +45,39 @@ def compute_expected_offset(thread_id, cfg, tileInfo):
     """
     stride = cfg.stride_a if tileInfo.tc == 'A' else cfg.stride_b
     mt0 = cfg.mt_a if tileInfo.tc == 'A' else cfg.mt_b
-    block_size = (cfg.depth_u * BPE) // LOAD_WIDTH
-    subtile_size = tileInfo.subtileShape[0]*tileInfo.mmaTileShape[0]
-    new_serial = (thread_id & (WAVESIZE//2 - 1)) | ((thread_id // WAVESIZE) * (WAVESIZE//2))
-    wave_split_id = (thread_id // (WAVESIZE//2)) % 2
+    blockSize = (cfg.depth_u * BPE) // LOAD_WIDTH
+    subtileSize = tileInfo.subtileShape[0]*tileInfo.mmaTileShape[0]
+    newSerial = (thread_id & (WAVESIZE//2 - 1)) | ((thread_id // WAVESIZE) * (WAVESIZE//2))
+    waveSplitId = (thread_id // (WAVESIZE//2)) % 2
 
     # Read contiguous subtiles if loadRatioGR=2.0 (1x4 config for A or 4x1 config for B), otherwise stride by mt0//2 (2x2 config)
     if tileInfo.loadRatioGR == 2.0:
-        rowOffset = subtile_size
+        rowOffset = subtileSize
         # we also need to change the sOffset
     else:
         rowOffset = (mt0 // 2)
 
     # local col/row in wave
-    col = new_serial % block_size
-    row = new_serial // block_size
+    col = newSerial % blockSize
+    row = newSerial // blockSize
 
     if cfg.use_swizzling:
         col = col + 1  if col % 2 ==0 else col - 1  # swap even/odd cols for initial swizzle
         rowLds = row // 2
-        col = (col + (block_size - (rowLds // 2) * 2))%block_size  # rotation to avoid bank conflicts: block_size - (lds_row_id//4)*2
+        col = (col + (blockSize - (rowLds // 2) * 2))%blockSize  # rotation to avoid bank conflicts: blockSize - (lds_row_id//4)*2
 
-    row_g = row + wave_split_id * rowOffset
-    col_g = col * LOAD_WIDTH
-    base = row_g * stride * BPE + col_g
+    rowG = row + waveSplitId * rowOffset
+    colG = col * LOAD_WIDTH
+    base = rowG * stride * BPE + colG
     # numGRPerSubtile can only be 1 or 2
     if tileInfo.numGRPerSubtile == 1:
         return [base]
     return [base, base + (mt0//4) * stride * BPE]
 
-def compute_expected_subtile(subtile_id0, stride):
+def compute_expected_subtile(subtileId0, stride):
     """Compute expected subtile register value: rowsPerWave * bpe * subtileId0 * stride."""
-    rows_per_subtile = 16 # tileInfo.subtileShape[0]*tileInfo.mmaTileShape[0] // block_size
-    return rows_per_subtile * BPE * subtile_id0 * stride
+    rowsPerSubtile = 16 # tileInfo.subtileShape[0]*tileInfo.mmaTileShape[0] // blockSize
+    return rowsPerSubtile * BPE * subtileId0 * stride
 
 
 # Tile configs to test
