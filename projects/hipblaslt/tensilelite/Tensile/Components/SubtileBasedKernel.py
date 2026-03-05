@@ -483,14 +483,20 @@ def debugExportVgprToD(module, writer, vgprIdx, cvtToFloat=True):
 ##################################################
 # Compute subtile perpendicular offsets for a single matrix
 #
-def _grComputeSubtileOffsets(module, tileInfo, rowsPerWave):
+def _grComputeSubtileOffsets(module, tileInfo):
   tc = tileInfo.tc
   strideRef = "StrideA0I" if tc == 'A' else "StrideB1J"
-  s_stride = rowsPerWave * tileInfo.bpe
+  subtile_size = tileInfo.subtileShape[0]*tileInfo.mmaTileShape[0]
+  if tileInfo.loadRatioGR == 2.0:
+    rowOffset = 2*subtile_size
+  else:
+    rowOffset = subtile_size
+
+  s_stride = rowOffset * tileInfo.bpe
 
   for st in tileInfo.localSubtiles:
     for reg in tileInfo.localSubtilesRegister[st.regListId]:
-      module.add(SMulI32(dst=sgpr(reg), src0=hex(s_stride * st.subtileId[0]), src1=sgpr(strideRef), comment="%s: %u rows offset"%(tc, rowsPerWave * st.subtileId[0])))
+      module.add(SMulI32(dst=sgpr(reg), src0=hex(s_stride * st.subtileId[0]), src1=sgpr(strideRef), comment="%s: %u rows offset"%(tc, rowOffset)))
 
 ##################################################
 # Subroutine to generate GR offset calculation code
@@ -574,11 +580,11 @@ def graTileAssignment(writer, kernel, useSwizzling=True):
 
   writer.vgprPool.checkIn(tmpVgpr)
 
-  rowsPerWave = wavesize // block_size // 2
+ 
 
   # Compute subtile offsets for A and B
-  _grComputeSubtileOffsets(module, tileInfoA, rowsPerWave)
-  _grComputeSubtileOffsets(module, tileInfoB, rowsPerWave)
+  _grComputeSubtileOffsets(module, tileInfoA)
+  _grComputeSubtileOffsets(module, tileInfoB)
 
   return module
 

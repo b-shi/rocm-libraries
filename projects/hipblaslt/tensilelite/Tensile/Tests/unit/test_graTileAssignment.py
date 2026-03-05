@@ -457,9 +457,8 @@ def compute_expected_offset(thread_id, stride, mt0, depth_u, bpe, load_width, wa
 
 def compute_expected_subtile(subtile_id0, stride, depth_u, bpe, load_width, wavesize):
     """Compute expected subtile register value: rowsPerWave * bpe * subtileId0 * stride."""
-    block_size = (depth_u * bpe) // load_width
-    rows_per_wave = wavesize // block_size // 2
-    return rows_per_wave * bpe * subtile_id0 * stride
+    rows_per_subtile = 16 # tileInfo.subtileShape[0]*tileInfo.mmaTileShape[0] // block_size
+    return rows_per_subtile * bpe * subtile_id0 * stride
 
 
 # ---- Pytest tests ----
