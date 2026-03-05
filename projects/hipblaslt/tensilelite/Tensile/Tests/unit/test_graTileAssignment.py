@@ -74,10 +74,10 @@ def compute_expected_offset(thread_id, cfg, tileInfo):
         return [base]
     return [base, base + (mt0//4) * stride * BPE]
 
-def compute_expected_subtile(subtileId0, stride):
-    """Compute expected subtile register value: rowsPerWave * bpe * subtileId0 * stride."""
-    rowsPerSubtile = 16 # tileInfo.subtileShape[0]*tileInfo.mmaTileShape[0] // blockSize
-    return rowsPerSubtile * BPE * subtileId0 * stride
+def compute_expected_subtile(subtileId0, stride, tileInfo):
+    """Compute expected subtile register value: subtileSize * bpe * subtileId0 * stride."""
+    subtileSize = tileInfo.subtileShape[0] * tileInfo.mmaTileShape[0]
+    return subtileSize * BPE * subtileId0 * stride
 
 
 # Tile configs to test
@@ -85,12 +85,12 @@ TILE_CONFIGS = [
     # 2x2 configs
     TileConfig(mt_a=256, mt_b=256, depth_u=64, stride_a=4096, stride_b=1024, use_swizzling=False),
     TileConfig(mt_a=256, mt_b=256, depth_u=64, stride_a=4096, stride_b=1024, use_swizzling=True),
+    TileConfig(mt_a=96, mt_b=256, depth_u=64, stride_a=1024, stride_b=256, use_swizzling=True),
     # 1x4 configs
     TileConfig(mt_a=80, mt_b=64, depth_u=64, stride_a=1024, stride_b=256, use_swizzling=True),
-    TileConfig(mt_a=96, mt_b=256, depth_u=64, stride_a=1024, stride_b=256, use_swizzling=True),
+    TileConfig(mt_a=80, mt_b=64, depth_u=64, stride_a=64, stride_b=64, use_swizzling=True),
     # 4x1 configs
     TileConfig(mt_a=64, mt_b=80, depth_u=64, stride_a=1024, stride_b=256, use_swizzling=True),
-    TileConfig(mt_a=256, mt_b=240, depth_u=64, stride_a=1024, stride_b=256, use_swizzling=True),
     # mt0<32 (read size)
     TileConfig(mt_a=16, mt_b=64, depth_u=64, stride_a=64, stride_b=64, use_swizzling=True),
 ]
@@ -148,7 +148,7 @@ class TestGraTileAssignmentGPU:
                 results = build_and_run(gra_env.gra_asm, reg, st.useSgpr, cfg,
                                         gra_env.tmp_path,
                                         f"subtileA_s{reg}_{cfg.label}")
-                expected = compute_expected_subtile(st.subtileId[0], cfg.stride_a)
+                expected = compute_expected_subtile(st.subtileId[0], cfg.stride_a, tileInfo)
                 # sgpr is uniform: check thread 0
                 actual = results[0]
                 assert actual == expected, \
@@ -164,7 +164,7 @@ class TestGraTileAssignmentGPU:
                 results = build_and_run(gra_env.gra_asm, reg, st.useSgpr, cfg,
                                         gra_env.tmp_path,
                                         f"subtileB_s{reg}_{cfg.label}")
-                expected = compute_expected_subtile(st.subtileId[0], cfg.stride_b)
+                expected = compute_expected_subtile(st.subtileId[0], cfg.stride_b, tileInfo)
                 actual = results[0]
                 assert actual == expected, \
                     f"[{cfg.label}] B subtile s{reg} (subtileId0={st.subtileId[0]}): " \
@@ -207,7 +207,6 @@ if __name__ == "__main__":
                 for tc, tileInfo, stride, mt in [("A", tileInfoA, cfg.stride_a, cfg.mt_a),
                                                   ("B", tileInfoB, cfg.stride_b, cfg.mt_b)]:
                     for idx, reg in enumerate(tileInfo.sharedVgprGROffset):
-                        print("Regl",reg)
                         results = build_and_run(gra_asm, reg, False, cfg, tmp_path,
                                                 f"offset{tc}_v{reg}_{cfg.label}")
 
@@ -255,7 +254,7 @@ if __name__ == "__main__":
                             print("Regl",reg)
                             results = build_and_run(gra_asm, reg, st.useSgpr, cfg, tmp_path,
                                                     f"subtile{tc}_s{reg}_{cfg.label}")
-                            expected = compute_expected_subtile(st.subtileId[0], stride)
+                            expected = compute_expected_subtile(st.subtileId[0], stride, tileInfo)
                             actual = results[0]
                             status = "OK" if actual == expected else "FAIL"
                             print(f"  Subtile {tc} s{reg} (id0={st.subtileId[0]}): {actual} (expected {expected}) {status}")
