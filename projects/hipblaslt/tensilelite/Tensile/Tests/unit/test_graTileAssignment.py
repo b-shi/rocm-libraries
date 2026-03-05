@@ -65,12 +65,13 @@ class TileConfig:
 
 # Tile configs to test
 TILE_CONFIGS = [
-    TileConfig(mt_a=256, mt_b=256, depth_u=64, stride_a=64, stride_b=64, use_swizzling=False),
+    # TileConfig(mt_a=256, mt_b=256, depth_u=64, stride_a=64, stride_b=64, use_swizzling=False),
     # TileConfig(mt_a=256, mt_b=256, depth_u=64, stride_a=64, stride_b=64, use_swizzling=True),
     # TileConfig(mt_a=16, mt_b=64, depth_u=64, stride_a=64, stride_b=64, use_swizzling=True),
     # No change in offset calculation (will use OOB to mask 2nd 16x128 sub-tile)
     # TileConfig(mt_a=16, mt_b=64, depth_u=64, stride_a=64, stride_b=64, use_swizzling=True),
-    # TileConfig(mt_a=80, mt_b=64, depth_u=64, stride_a=64, stride_b=64, use_swizzling=True),
+    TileConfig(mt_a=80, mt_b=64, depth_u=64, stride_a=64, stride_b=64, use_swizzling=True),
+    TileConfig(mt_a=96, mt_b=256, depth_u=64, stride_a=64, stride_b=64, use_swizzling=True),
 ]
 
 
@@ -419,15 +420,23 @@ def build_and_run(gra_asm, export_reg, is_sgpr, cfg, tmp_path, label):
 # ---- Reference implementations ----
 
 def compute_expected_offset(thread_id, stride, mt0, depth_u, bpe, load_width, wavesize,
-                            use_swizzling=False):
+                            tileInfo, use_swizzling=False):
     """Python reference implementation matching _grComputeOffset logic.
 
     When use_swizzling=True, applies the LDS bank-conflict avoidance
     swizzle (quad_perm + rotation) before computing the final byte offset.
     """
     block_size = (depth_u * bpe) // load_width
+    subtile_size = tileInfo.subtileShape[0]*tileInfo.mmaTileShape[0]
     new_serial = (thread_id & (wavesize//2 - 1)) | ((thread_id // wavesize) * (wavesize//2))
     wave_split_id = (thread_id // (wavesize//2)) % 2
+
+    # Read contiguous subtiles if loadRatioGR=2.0 (1x4 config for A or 4x1 config for B), otherwise stride by mt0//2 (2x2 config)
+    if tileInfo.loadRatioGR == 2.0:
+        rowOffset = subtile_size 
+        # we also need to change the sOffset
+    else:
+        rowOffset = (mt0 // 2)
 
     # local col/row in wave
     col = new_serial % block_size
@@ -438,13 +447,13 @@ def compute_expected_offset(thread_id, stride, mt0, depth_u, bpe, load_width, wa
         rowLds = row // 2
         col = (col + (block_size - (rowLds // 2) * 2))%block_size  # rotation to avoid bank conflicts: block_size - (lds_row_id//4)*2
 
-    # number of rows per wave (half-wave because of wave_split_id)
-    numRows = (wavesize // 2) * load_width // (depth_u * bpe)
-
-    row_g = row + wave_split_id * (mt0 // 2)
+    row_g = row + wave_split_id * rowOffset
     col_g = col * load_width
-    return row_g * stride * bpe + col_g
-
+    base = row_g * stride * bpe + col_g
+    # numGRPerSubtile can only be 1 or 2
+    if tileInfo.numGRPerSubtile == 1:
+        return [base]
+    return [base, base + (mt0//4) * stride * bpe]
 
 def compute_expected_subtile(subtile_id0, stride, depth_u, bpe, load_width, wavesize):
     """Compute expected subtile register value: rowsPerWave * bpe * subtileId0 * stride."""
@@ -481,9 +490,10 @@ class TestGraTileAssignmentGPU:
 
             for tid in range(NUM_THREADS):
                 expected = compute_expected_offset(tid, cfg.stride_a, cfg.mt_a, cfg.depth_u,
-                                                   BPE, LOAD_WIDTH, WAVESIZE, cfg.use_swizzling)
-                assert results[tid] == expected, \
-                    f"[{cfg.label}] A offset[{idx}] v{reg} mismatch at tid={tid}: got {results[tid]}, expected {expected}"
+                                                   BPE, LOAD_WIDTH, WAVESIZE,
+                                                   gra_env.tileInfoA, cfg.use_swizzling)
+                assert results[tid] == expected[idx], \
+                    f"[{cfg.label}] A offset[{idx}] v{reg} mismatch at tid={tid}: got {results[tid]}, expected {expected[idx]}"
 
     def test_offset_b(self, gra_env):
         """Validate all sharedVgprGROffset vgprs for matrix B across all threads."""
@@ -494,9 +504,10 @@ class TestGraTileAssignmentGPU:
 
             for tid in range(NUM_THREADS):
                 expected = compute_expected_offset(tid, cfg.stride_b, cfg.mt_b, cfg.depth_u,
-                                                   BPE, LOAD_WIDTH, WAVESIZE, cfg.use_swizzling)
-                assert results[tid] == expected, \
-                    f"[{cfg.label}] B offset[{idx}] v{reg} mismatch at tid={tid}: got {results[tid]}, expected {expected}"
+                                                   BPE, LOAD_WIDTH, WAVESIZE,
+                                                   gra_env.tileInfoB, cfg.use_swizzling)
+                assert results[tid] == expected[idx], \
+                    f"[{cfg.label}] B offset[{idx}] v{reg} mismatch at tid={tid}: got {results[tid]}, expected {expected[idx]}"
 
     def test_subtile_registers_a(self, gra_env):
         """Validate localSubtilesRegister values for matrix A."""
@@ -597,7 +608,8 @@ if __name__ == "__main__":
 
                             if args.debug:
                                 expected = [compute_expected_offset(tid, stride, mt, cfg.depth_u,
-                                                                     BPE, LOAD_WIDTH, WAVESIZE, cfg.use_swizzling)
+                                                                     BPE, LOAD_WIDTH, WAVESIZE,
+                                                                     tileInfo, cfg.use_swizzling)[idx]
                                             for tid in range(NUM_THREADS)]
                                 print_offset_grid(f"Matrix {tc} EXPECTED offset[{idx}] ({cfg.label})",
                                                   expected, WAVESIZE, NUM_WAVES)
@@ -618,7 +630,8 @@ if __name__ == "__main__":
                         errors = 0
                         for tid in range(NUM_THREADS):
                             exp = compute_expected_offset(tid, stride, mt, cfg.depth_u,
-                                                          BPE, LOAD_WIDTH, WAVESIZE, cfg.use_swizzling)
+                                                          BPE, LOAD_WIDTH, WAVESIZE,
+                                                          tileInfo, cfg.use_swizzling)[idx]
                             if results[tid] != exp:
                                 errors += 1
                                 if not args.grid:

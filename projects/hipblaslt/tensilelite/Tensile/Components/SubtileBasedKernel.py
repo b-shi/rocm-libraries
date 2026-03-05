@@ -10,6 +10,7 @@ from rocisa.label import LabelManager
 import math
 from copy import deepcopy
 from dataclasses import dataclass, field
+from enum import Enum, auto
 from typing import Dict, List, NamedTuple, Optional,Tuple, Type
 from contextlib import contextmanager
 from collections import deque
@@ -494,10 +495,13 @@ def graTileAssignment(writer, kernel, useSwizzling=True):
   wavesize = kernel["WavefrontSize"]
   ldsRowBankSize = 64 * 4 # 64 banks, 4 bytes per bank.
 
+  
+
+
+  assert bpeA == 2 and bpeB == 2, "Only support fp16 for now"
   assert depthUBytes % 128 == 0, "Only support depthUBytes multiple of 128 for now"
   assert depthUBytes <= ldsRowBankSize, "Only support depthUBytes smaller than %u (lds row bank size) for now"%ldsRowBankSize
 
-  # Ignore scales for now.
   loadWidth = 16 # dwordx4 loads only
   block_size = depthUBytes // loadWidth
   numRowsPerLDSBanks = ldsRowBankSize // depthUBytes
@@ -505,8 +509,6 @@ def graTileAssignment(writer, kernel, useSwizzling=True):
   tileInfoA = writer.states.a.tileInfo
   tileInfoB = writer.states.b.tileInfo
   print("TileInfoA:\n%s\n"%(tileInfoA))
-
-  assert bpeA == 2 and bpeB == 2, "Only support fp16 for now"
 
   tmpVgpr = writer.vgprPool.checkOut(7)
   col_id     = tmpVgpr
