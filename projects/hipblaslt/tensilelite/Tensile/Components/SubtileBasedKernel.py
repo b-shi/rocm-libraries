@@ -416,8 +416,11 @@ def localReadResetOffsetsSubtile(writer, kernel):
 def _grComputeOffset(module, writer, tileInfo, col_id, row_id, split_id):
   tc = tileInfo.tc
   bpe = tileInfo.bpe
-  addrVgpr = tileInfo.sharedVgprGROffset[0]
+
+  assert len(tileInfo.sharedVgprGROffset)<=2, "Only support 2 GR offset vgpr for now, found %u"%(len(tileInfo.sharedVgprGROffset))
+  
   MT0 = tileInfo.globalMMATileGrid[0] * tileInfo.mmaTileShape[0]
+  subtile_size = tileInfo.subtileShape[0]*tileInfo.mmaTileShape[0]
   strideRef = "StrideA0I" if tc == 'A' else "StrideB1J"
 
   tmpVgpr = writer.vgprPool.checkOut(2)
@@ -429,10 +432,19 @@ def _grComputeOffset(module, writer, tileInfo, col_id, row_id, split_id):
   module.add(VAddU32(dst=vgpr(tmpVgpr), src0=vgpr(col_id), src1=vgpr(tmpVgpr), comment="%s: GR row_offset"%tc))
 
   # # apply top-half / bottom half offset according to wave split id
-  module.add(SMovB32(dst=sgpr(sHalfOffset), src=(MT0 * bpe) // 2, comment="%s: Half Tile row offset x bytes"%tc))
+  if tileInfo.loadRatioGR == 2.0:
+    module.add(SMovB32(dst=sgpr(sHalfOffset), src=(subtile_size * bpe), comment="%s: subtile row offset x bytes"%tc))
+  else:
+    module.add(SMovB32(dst=sgpr(sHalfOffset), src=(MT0 * bpe) // 2, comment="%s: Half Tile row offset x bytes"%tc))
   module.add(VMulLOU32(dst=vgpr(tmpVgpr+1), src0=sgpr(sHalfOffset), src1=vgpr(split_id), comment="%s: Apply offset for 2nd half wave"%tc))
   module.add(VMulLOU32(dst=vgpr(tmpVgpr+1), src0=sgpr(strideRef), src1=vgpr(tmpVgpr+1), comment="%s: Multiply by stride"%tc))
-  module.add(VAddU32(dst=vgpr(addrVgpr), src0=vgpr(tmpVgpr), src1=vgpr(tmpVgpr+1), comment="%s: GR offset = row_offset + split_wave_offset"%tc))
+
+  module.add(VAddU32(dst=vgpr(tileInfo.sharedVgprGROffset[0]), src0=vgpr(tmpVgpr), src1=vgpr(tmpVgpr+1), comment="%s: GR offset = row_offset + split_wave_offset"%tc))
+
+  if len(tileInfo.sharedVgprGROffset)>1:
+    module.add(SMovB32(dst=sgpr(sHalfOffset), src=(MT0 * bpe) // 4, comment="%s: 2nd GR offset calc : + %u rows"%(tc,MT0 // 4)))
+    module.add(SMulI32(dst=sgpr(sHalfOffset), src0=sgpr(strideRef), src1=(MT0 * bpe) // 4, comment="%s: 2nd GR offset calc : + %u rows"%(tc,MT0 // 4)))
+    module.add(VAddU32(dst=vgpr(tileInfo.sharedVgprGROffset[1]), src0=vgpr(tileInfo.sharedVgprGROffset[0]), src1=sgpr(sHalfOffset), comment="%s: GR offset for 2nd subtile = GR offset + subtile row offset"%tc))
 
   writer.sgprPool.checkIn(sHalfOffset)
   writer.vgprPool.checkIn(tmpVgpr)
