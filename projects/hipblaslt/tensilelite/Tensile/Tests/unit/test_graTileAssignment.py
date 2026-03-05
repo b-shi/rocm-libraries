@@ -17,10 +17,22 @@ from gpu_test_helpers import (
     HAS_HIP,
     TileConfig,
     BPE, LOAD_WIDTH, WAVESIZE, NUM_THREADS, NUM_WAVES,
-    generate_gra_asm,
+    create_writer_for_gpu,
+    init_rocisa,
     build_and_run,
     print_offset_grid,
 )
+from Tensile.Components.SubtileBasedKernel import graTileAssignment
+
+
+def generate_gra_asm(cfg):
+    """Run graTileAssignment and return (gra_asm, tileInfoA, tileInfoB, kernel)."""
+    writer, kernel, tileInfoA, tileInfoB = create_writer_for_gpu(cfg)
+    init_rocisa()
+
+    module = graTileAssignment(writer, kernel, useSwizzling=cfg.use_swizzling)
+    gra_asm = str(module)
+    return gra_asm, tileInfoA, tileInfoB, kernel
 
 
 # ---- Reference implementations ----

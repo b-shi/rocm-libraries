@@ -4,9 +4,8 @@
 #
 # Provides:
 #   - TileConfig dataclass for parameterized tile configurations
-#   - Mock/kernel creation helpers (_mock_dtype, _create_kernel, _create_writer_for_gpu)
-#   - rocIsa initialization (_init_rocisa)
-#   - GRA assembly generation (generate_gra_asm)
+#   - Mock/kernel creation helpers (_mock_dtype, _create_kernel, create_writer_for_gpu)
+#   - rocIsa initialization (init_rocisa)
 #   - Generic single-register-export kernel generator (generate_export_kernel)
 #   - Assembly & GPU execution (assemble_kernel, run_on_gpu, build_and_run)
 #   - Debug utilities (print_offset_grid)
@@ -37,7 +36,7 @@ from dataclasses import dataclass
 
 from rocisa.register import RegisterPool
 from rocisa.enum import RegisterType
-from Tensile.Components.SubtileBasedKernel import TileInfo, graTileAssignment
+from Tensile.Components.SubtileBasedKernel import TileInfo
 
 # ---- Constants ----
 GFX_TARGET = "gfx950"
@@ -116,12 +115,12 @@ def _create_kernel(cfg):
     }
 
 
-def _create_writer_for_gpu(cfg):
+def create_writer_for_gpu(cfg):
     """Create a mock writer with register pools laid out for GPU execution.
 
     Register layout (must match the kernel prologue/epilogue):
       v0           = Serial
-      v1+          = allocated by allocOffsetRegisters and graTileAssignment
+      v1+          = allocated by allocOffsetRegisters and the function under test
 
       s0:s1        = kernarg_segment_ptr
       s2           = workgroup_id_x
@@ -147,7 +146,7 @@ def _create_writer_for_gpu(cfg):
 
     # Build kernel and TileInfo
     kernel = _create_kernel(cfg)
-    print("Kernel config:", kernel)
+    
     tileInfoA = TileInfo('A', kernel)
     tileInfoB = TileInfo('B', kernel)
 
@@ -160,13 +159,10 @@ def _create_writer_for_gpu(cfg):
     tileInfoA.allocOffsetRegisters(writer, kernel)
     tileInfoB.allocOffsetRegisters(writer, kernel)
 
-    print("tileInfoA", tileInfoA)
-    print("tileInfoB", tileInfoB)
-
     return writer, kernel, tileInfoA, tileInfoB
 
 
-def _init_rocisa():
+def init_rocisa():
     """Initialize rocIsa singleton if needed."""
     from rocisa import rocIsa
     ri = rocIsa.getInstance()
@@ -177,23 +173,13 @@ def _init_rocisa():
     ri.setKernel((9, 5, 0), WAVESIZE)
 
 
-def generate_gra_asm(cfg):
-    """Run graTileAssignment and return (gra_asm, tileInfoA, tileInfoB, kernel)."""
-    writer, kernel, tileInfoA, tileInfoB = _create_writer_for_gpu(cfg)
-    _init_rocisa()
-
-    module = graTileAssignment(writer, kernel, useSwizzling=cfg.use_swizzling)
-    gra_asm = str(module)
-    return gra_asm, tileInfoA, tileInfoB, kernel
-
-
 # ---- Generic kernel generator ----
 
-def generate_export_kernel(gra_asm, export_reg, is_sgpr=False):
-    """Generate a kernel that runs gra_asm and exports a single register.
+def generate_export_kernel(test_asm, export_reg, is_sgpr=False):
+    """Generate a kernel that runs test_asm and exports a single register.
 
     Args:
-        gra_asm:    Assembly string from graTileAssignment.
+        test_asm:    Assembly string from the function under test.
         export_reg: Register index to export (e.g. 3 for v3 or s3).
         is_sgpr:    True to export an sgpr (uniform value, broadcast to all
                     threads), False to export a vgpr (per-thread value).
@@ -206,9 +192,9 @@ def generate_export_kernel(gra_asm, export_reg, is_sgpr=False):
     Returns:
         Assembly source string.
     """
-    # Find highest register indices used by gra_asm
-    vgpr_indices = set(int(m) for m in re.findall(r'\bv(\d+)\b', gra_asm))
-    sgpr_indices = set(int(m) for m in re.findall(r'\bs(\d+)\b', gra_asm))
+    # Find highest register indices used by test_asm
+    vgpr_indices = set(int(m) for m in re.findall(r'\bv(\d+)\b', test_asm))
+    sgpr_indices = set(int(m) for m in re.findall(r'\bs(\d+)\b', test_asm))
 
     tmp_vgpr = max(vgpr_indices | {0}) + 1      # byte-offset register
     data_vgpr = tmp_vgpr + 1 if is_sgpr else export_reg
@@ -225,20 +211,20 @@ def generate_export_kernel(gra_asm, export_reg, is_sgpr=False):
     return f"""\
 .amdgcn_target "amdgcn-amd-amdhsa--{GFX_TARGET}"
 
-// Register name mappings for graTileAssignment symbolic references
+// Register name mappings for symbolic references
 .set vgprSerial, 0
 .set sgprStrideA0I, 8
 .set sgprStrideB1J, 9
 
 .text
-.protected test_gra_offset
-.globl test_gra_offset
+.protected test_kernel
+.globl test_kernel
 .p2align 8
-.type test_gra_offset,@function
+.type test_kernel,@function
 
 .section .rodata,#alloc
 .p2align 6
-.amdhsa_kernel test_gra_offset
+.amdhsa_kernel test_kernel
   .amdhsa_user_sgpr_kernarg_segment_ptr 1
   .amdhsa_accum_offset {max_vgpr}
   .amdhsa_next_free_vgpr {max_vgpr}
@@ -254,15 +240,15 @@ def generate_export_kernel(gra_asm, export_reg, is_sgpr=False):
 .end_amdhsa_kernel
 
 .text
-test_gra_offset:
+test_kernel:
   // ---- Prologue: Load kernel arguments ----
   s_load_dwordx2 s[4:5], s[0:1], 0x00     // output_ptr
   s_load_dword s[sgprStrideA0I], s[0:1], 0x08   // strideA -> s8
   s_load_dword s[sgprStrideB1J], s[0:1], 0x0c   // strideB -> s9
   s_waitcnt lgkmcnt(0)
 
-  // ---- Generated graTileAssignment code ----
-{gra_asm}
+  // ---- Generated test code ----
+{test_asm}
   // ---- Epilogue: Export register ----
 {epilogue}
   s_waitcnt vmcnt(0)
@@ -274,8 +260,8 @@ amdhsa.version:
   - 1
   - 1
 amdhsa.kernels:
-  - .name: test_gra_offset
-    .symbol: 'test_gra_offset.kd'
+  - .name: test_kernel
+    .symbol: 'test_kernel.kd'
     .language: OpenCL C
     .language_version:
       - 2
@@ -344,7 +330,7 @@ def run_on_gpu(co_path, stride_a, stride_b, num_threads):
     device = hip_check(hip.hipGetDevice())
 
     module = hip_check(hip.hipModuleLoad(co_path.encode() if isinstance(co_path, str) else co_path))
-    kernel = hip_check(hip.hipModuleGetFunction(module, b"test_gra_offset"))
+    kernel = hip_check(hip.hipModuleGetFunction(module, b"test_kernel"))
 
     buf_size = num_threads * 4  # 4 bytes per u32
     d_out = hip_check(hip.hipMalloc(buf_size))
@@ -392,10 +378,10 @@ def run_on_gpu(co_path, stride_a, stride_b, num_threads):
     return struct.unpack(f"{num_threads}I", h_out)
 
 
-def build_and_run(gra_asm, export_reg, is_sgpr, cfg, tmp_path, label):
+def build_and_run(test_asm, export_reg, is_sgpr, cfg, tmp_path, label):
     """Generate, assemble, run a single-register export kernel. Returns results tuple."""
     sys.stdout.flush()  # flush before GPU calls to avoid buffering issues with HIP runtime
-    asm = generate_export_kernel(gra_asm, export_reg, is_sgpr=is_sgpr)
+    asm = generate_export_kernel(test_asm, export_reg, is_sgpr=is_sgpr)
     co_path = str(tmp_path / f"test_{label}.co")
     asm_path = str(tmp_path / f"test_{label}.s")
     with open(asm_path, "w") as f:
