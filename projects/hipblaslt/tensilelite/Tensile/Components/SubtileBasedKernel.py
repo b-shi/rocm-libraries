@@ -125,6 +125,7 @@ class TileInfo:
   localSubtileGrid: List[int]  = field(init=False)
 
   localSubtiles: List[SubtileInfo] = field(init=False)
+  localSubtilesRegister: List[RegisterList] = field(init=False) 
 
   loadRatioGR: int = 0
   numGRPerSubtile: int = 0 # may not be needed
@@ -534,9 +535,6 @@ def graTileAssignment(writer, kernel, useSwizzling=True):
     module.add(VAddU32(dst=vgpr(col_id), src0=vgpr(tmp), src1=vgpr(col_id), comment=""))
     module.add(VAndB32(dst=vgpr(col_id), src0=vgpr(col_id), src1=hex(block_size-1), comment="(col + offset) % block_size"))
 
-    
-    # module.add(VMovB32(dst=vgpr(tileInfoA.sharedVgprGROffset[0]), src=vgpr(new_serial), comment=""))
-    # return module
 
   module.add(VLShiftLeftB32(dst=vgpr(col_id), shiftHex=hex(loadWidth.bit_length()-1), src=vgpr(col_id), comment="scale col_id by load_width"))
 
