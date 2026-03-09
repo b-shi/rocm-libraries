@@ -452,7 +452,7 @@ def _applyWavePartitionLROffset(module, writer, kernel, tileInfo, waveId):
   loadWidth = tileInfo.mmaTileShape[0] * tileInfo.mmaTileShape[1] * tileInfo.bpe // wavesize
   bytes_loaded = wavesize * loadWidth
 
-  tmpSgpr = writer.vgprPool.checkOut(1)
+  tmpSgpr = writer.sgprPool.checkOut(1)
   tmp = writer.vgprPool.checkOut(2)
   tmp1 = tmp + 1
 
@@ -486,11 +486,11 @@ def _applyWavePartitionLROffset(module, writer, kernel, tileInfo, waveId):
 
   else:
     writer.vgprPool.checkIn(tmp)
-    writer.vgprPool.checkIn(tmpSgpr)
+    writer.sgprPool.checkIn(tmpSgpr)
     raise NotImplementedError("Unsupported loadRatioGR for wave partition: %s"%str(tileInfo.loadRatioGR))
 
   writer.vgprPool.checkIn(tmp)
-  writer.vgprPool.checkIn(tmpSgpr)
+  writer.sgprPool.checkIn(tmpSgpr)
 
 def _lraWavePartitioning(module, writer, kernel):
   """Compute waveId and apply per-matrix wave partition offsets."""
@@ -583,11 +583,11 @@ def lraTileAssignment(writer, kernel):
 
   # Apply global offset on B (B data follows A in LDS).
   MT0A = tileInfoA.globalMMATileGrid[0] * tileInfoA.mmaTileShape[0]
-  tmpSgpr = writer.vgprPool.checkOut(1)
+  tmpSgpr = writer.sgprPool.checkOut(1)
   module.add(SMovB32(dst=sgpr(tmpSgpr), src=hex(MT0A*depthUBytes), comment="LDS offset for B matrix"))
   for vgprId in range(len(tileInfoB.sharedVgprLROffset)):
     module.add(VAddU32(dst=vgpr(tileInfoB.sharedVgprLROffset[vgprId]), src0=vgpr(tileInfoB.sharedVgprLROffset[vgprId]), src1=sgpr(tmpSgpr), comment="B matrix offset : mt0*depthUBytes"))
-  writer.vgprPool.checkIn(tmpSgpr)
+  writer.sgprPool.checkIn(tmpSgpr)
 
   return module
 
