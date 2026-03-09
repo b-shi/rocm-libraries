@@ -147,6 +147,7 @@ TILE_CONFIGS = [
     TileConfig(mt_a=80, mt_b=64, depth_u=64),
     # 4x1 configs
     TileConfig(mt_a=64, mt_b=80, depth_u=64),
+    TileConfig(mt_a=128, mt_b=240, depth_u=64),
 ]
 
 
