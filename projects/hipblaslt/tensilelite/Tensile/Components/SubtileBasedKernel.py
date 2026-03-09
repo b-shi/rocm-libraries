@@ -522,8 +522,6 @@ def lraTileAssignment(writer, kernel):
 
   tileInfoA = writer.states.a.tileInfo
   tileInfoB = writer.states.b.tileInfo
-
-  print("TileInfo A", tileInfoA)
   
   # Input Parameters.
   depthU = kernel["DepthU"]
@@ -695,7 +693,6 @@ def graTileAssignment(writer, kernel, useSwizzling=True):
 
   tileInfoA = writer.states.a.tileInfo
   tileInfoB = writer.states.b.tileInfo
-  print("TileInfoA:\n%s\n"%(tileInfoA))
 
   tmpVgpr = writer.vgprPool.checkOut(7)
   col_id     = tmpVgpr
