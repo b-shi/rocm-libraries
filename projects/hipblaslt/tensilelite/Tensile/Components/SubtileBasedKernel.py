@@ -975,7 +975,7 @@ def globalReadDTLInitCommonSgpr(writer, kernel):
   vgprWaveId = writer.vgprPool.checkOut(1)
   module.addComment0("Compute shared offsets used by m0 in DTL loads")
   module.add(VLShiftRightB32(dst=vgpr(vgprWaveId), shiftHex=hex(wavesize.bit_length()-1), src=vgpr("Serial"), comment="Wave Id"))
-  module.add(VLShiftLeftB32(dst=vgpr(vgprWaveId), shiftHex=hex(loadWidth * wavesize), src=vgpr(vgprWaveId), comment="Apply wave-specific offset of %u"%(loadWidth * wavesize)))
+  module.add(VLShiftLeftB32(dst=vgpr(vgprWaveId), shiftHex=hex((loadWidth * wavesize).bit_length()-1), src=vgpr(vgprWaveId), comment="Apply wave-specific offset of %u"%(loadWidth * wavesize)))
   module.add(VReadfirstlaneB32(dst=sgpr("LocalWriteBaseAddr"), src=vgpr(vgprWaveId), comment="Store base LDS offset, will be modified"))
   module.add(VReadfirstlaneB32(dst=sgpr("LocalWriteDTLOffset"), src=vgpr(vgprWaveId), comment="Store DTL wave-specific offset, this will not be modified"))
   writer.vgprPool.checkIn(vgprWaveId)
