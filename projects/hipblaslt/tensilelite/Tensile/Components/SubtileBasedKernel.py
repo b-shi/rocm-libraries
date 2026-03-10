@@ -20,7 +20,7 @@ from collections import deque
 from rocisa import rocIsa, countInstruction, countGlobalRead, \
             countLocalRead, countLocalWrite, countDSStoreB256, getMFMAs
 from rocisa.code import Module, TextBlock, StructuredModule, KernelBody
-from rocisa.container import RegisterContainer, replaceHolder, HWRegContainer, VCC, vgpr, sgpr, DPPModifiers, EXEC
+from rocisa.container import RegisterContainer, replaceHolder, HWRegContainer, VCC, vgpr, sgpr, DPPModifiers, DSModifiers, EXEC
 from rocisa.label import LabelManager
 from rocisa.asmpass import rocIsaPass, rocIsaPassOption
 from rocisa.instruction import BufferLoadB128, BufferLoadB32, BufferLoadB64, \
@@ -281,8 +281,8 @@ class TileInfo:
           baseLR = math.floor(linearId / self.loadRatioLR)
           for nLL in range(self.numLRPerSubtile):
             subtileInfo.localReadMap.append(baseLR + nLL)
-          #print("GR map", sId0, sId1, subtileInfo.globalReadMap)
-          #print("LR map", sId0, sId1, subtileInfo.localReadMap)
+          print("GR map", sId0, sId1, subtileInfo.globalReadMap)
+          print("LR map", sId0, sId1, subtileInfo.localReadMap)
 
 
 
@@ -326,6 +326,10 @@ class TileInfo:
     sId0 = linearId % self.localSubtileGrid[0]
     sId1 = linearId // self.localSubtileGrid[0]
     return [sId0, sId1]
+
+  def getSubtileShapeLinearId(self, k0, k1):
+    # Returns linear id within a subtile, col major
+    return k1 * self.subtileShape[0] + k0
 
   def getLocalMMATileLinearId(self, mmaId0, mmaId1):
     # Returns linear id for subtiles assumes block col major format
@@ -869,6 +873,31 @@ def globalReadDoSubtile(tc, writer, kernel):
 
   return module
 
+def emitSubtileDsRead(tc, writer, kernel, subtileId):
+  
+  module = Module()
+  sId0 = subtileId[0]
+  sId1 = subtileId[1]
+  tileInfo = writer.states.a.tileInfo if tc == 'A' else writer.states.b.tileInfo
+
+  linearId = tileInfo.getLocalSubtileLinearId(sId0, sId1)
+  subtileInfo = tileInfo.localSubtiles[linearId]
+
+  module.addComment0("Emit LR load for %s subtile: [%u, %u]"%(tc, sId0, sId1))
+
+  for mfmaC in range(tileInfo.subtileShape[1]):
+    for mfmaR in range(tileInfo.subtileShape[0]):
+      mfmaId = tileInfo.getSubtileShapeLinearId(mfmaC, mfmaR)
+      addrVgpr = tileInfo.sharedVgprLROffset[mfmaId]
+      dstTile = tileInfo.vgprTiles[subtileInfo.localReadMap[mfmaId]]
+      dstVgpr = dstTile.regList.regValues[0]
+      numRegs = len(dstTile.regList.regValues)
+      offset = sId0*2*tileInfo.subtileSize
+      module.add(DSLoadB128(dst=vgpr(dstVgpr, numRegs), src=vgpr(addrVgpr), ds=DSModifiers(offset=offset),
+                            comment="Subtile%s[%u,%u] mfmaId=[%u,%u]"%(tc, sId0, sId1, mfmaR, mfmaC)))
+     
+  return module
+
 ##################################################
 # Subroutine to generate LR load code
 # Initial idea: maybe store asm in modules in a separate obj?
@@ -880,8 +909,8 @@ def localReadDoSubtile(tc, writer, kernel):
 
   for i in range(tileInfo.localSubtileGrid[0]):
     for j in range(tileInfo.localSubtileGrid[1]):
-      for k in range(tileInfo.numLRPerSubtile):
-        module.addComment("Emit LR code for subtile %s(%u, %u) - %u"%(tc, i,j,k))
+        # module.addComment("Emit LR code for subtile %s(%u, %u) - %u"%(tc, i,j,k))
+        module.add(emitSubtileDsRead(tc, writer, kernel, [i, j]))
 
   return module
 
