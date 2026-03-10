@@ -873,17 +873,14 @@ def globalReadDoSubtile(tc, writer, kernel):
 
   return module
 
-def emitSubtileDsRead(tc, writer, kernel, subtileId):
+def emitSubtileDsRead(writer, kernel, tileInfo, subtileId):
   
   module = Module()
   sId0 = subtileId[0]
   sId1 = subtileId[1]
-  tileInfo = writer.states.a.tileInfo if tc == 'A' else writer.states.b.tileInfo
 
   linearId = tileInfo.getLocalSubtileLinearId(sId0, sId1)
   subtileInfo = tileInfo.localSubtiles[linearId]
-
-  module.addComment0("Emit LR load for %s subtile: [%u, %u]"%(tc, sId0, sId1))
 
   for mfmaC in range(tileInfo.subtileShape[1]):
     for mfmaR in range(tileInfo.subtileShape[0]):
@@ -894,7 +891,7 @@ def emitSubtileDsRead(tc, writer, kernel, subtileId):
       numRegs = len(dstTile.regList.regValues)
       offset = sId0*2*tileInfo.subtileSize
       module.add(DSLoadB128(dst=vgpr(dstVgpr, numRegs), src=vgpr(addrVgpr), ds=DSModifiers(offset=offset),
-                            comment="Subtile%s[%u,%u] mfmaId=[%u,%u]"%(tc, sId0, sId1, mfmaR, mfmaC)))
+                            comment="Subtile%s[%u,%u] mfmaId=[%u,%u]"%(tileInfo.tc, sId0, sId1, mfmaR, mfmaC)))
      
   return module
 
@@ -909,8 +906,7 @@ def localReadDoSubtile(tc, writer, kernel):
 
   for i in range(tileInfo.localSubtileGrid[0]):
     for j in range(tileInfo.localSubtileGrid[1]):
-        # module.addComment("Emit LR code for subtile %s(%u, %u) - %u"%(tc, i,j,k))
-        module.add(emitSubtileDsRead(tc, writer, kernel, [i, j]))
+        module.add(emitSubtileDsRead(writer, kernel, tileInfo, [i, j]))
 
   return module
 
@@ -1026,8 +1022,13 @@ def mainLoopImpl(writer, kernel, isNLL = False):
     #module.add(Label("testL", comment=""))
     module.add(globalReadDoSubtile('A', writer, kernel))
     module.add(globalReadDoSubtile('B', writer, kernel))
+    module.add(SWaitCnt(dscnt=-1, vlcnt=0, vscnt=-1, comment="Wait for all subtile GRs to complete"))
+    module.add(SBarrier(comment=""))
+
   module.add(localReadDoSubtile('A', writer, kernel))
   module.add(localReadDoSubtile('B', writer, kernel))
+  module.add(SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for all subtile LRs to complete"))
+  
 
   #module.add(globalReadLDSBufferSwap('A', writer, kernel))
   #module.add(globalReadLDSBufferSwap('B', writer, kernel))
