@@ -281,8 +281,8 @@ class TileInfo:
           baseLR = math.floor(linearId / self.loadRatioLR)
           for nLL in range(self.numLRPerSubtile):
             subtileInfo.localReadMap.append(baseLR + nLL)
-          print("GR map", sId0, sId1, subtileInfo.globalReadMap)
-          print("LR map", sId0, sId1, subtileInfo.localReadMap)
+          # print("GR map", sId0, sId1, subtileInfo.globalReadMap)
+          # print("LR map", sId0, sId1, subtileInfo.localReadMap)
 
 
 
