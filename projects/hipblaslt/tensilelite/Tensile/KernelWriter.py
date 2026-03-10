@@ -3559,7 +3559,6 @@ class KernelWriter(metaclass=abc.ABCMeta):
     self.states.a.tileInfo.allocVgprTileRegisters(self, kernel)
     self.states.b.tileInfo.allocVgprTileRegisters(self, kernel)
     self.states.d.tileInfo.allocVgprTileRegisters(self, kernel)
-
     module.add(initVgprTilesToZero(self, kernel,self.states.d.tileInfo))
 
     self.states.scheduleInfo = ScheduleInfo(self.states.a.tileInfo, self.states.b.tileInfo)
