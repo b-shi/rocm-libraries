@@ -32,7 +32,7 @@ from rocisa.instruction import BufferLoadB128, BufferLoadB32, BufferLoadB64, \
   MFMAInstruction, SAddU32, SBarrier, SBranch, SCBranchSCC0, SCBranchSCC1, SCBranchVCCNZ, SCmpEQU32, SCmpLeU32, \
   SMFMAInstruction, SNop, SSetPrior, SSetRegIMM32B32, SSubU32, SWaitCnt, SWaitAlu, \
   SLongBranchPositive, VAccvgprWrite, VFmaMixF32, VMadMixF32, VMovB32, VAndB32, VCmpXEqU32, VCndMaskB32, VReadfirstlaneB32, \
-  VMovB64, VLShiftRightB32, VLShiftLeftB32, VMulLOU32, VAddU32, VAddCOU32, VAddCCOU32, SMovB32, SMulI32, FlatStoreB32, SWaitCnt, SMovB64, VSubU32, VPermlane16SwapB32
+  VMovB64, VLShiftRightB32, VLShiftLeftB32, VMulLOU32, VAddU32, VAddCOU32, VAddCCOU32, SMovB32, SMulI32, FlatStoreB32, SWaitCnt, SMovB64, VSubU32, VPermlane16SwapB32, MFMAInstruction
 from rocisa.register import RegisterPool
 from rocisa.enum import RegisterType, DataTypeEnum
 # Store various scheduling info
@@ -619,6 +619,59 @@ def lraTileAssignment(writer, kernel):
   for vgprId in range(len(tileInfoB.sharedVgprLROffset)):
     module.add(VAddU32(dst=vgpr(tileInfoB.sharedVgprLROffset[vgprId]), src0=vgpr(tileInfoB.sharedVgprLROffset[vgprId]), src1=sgpr(tmpSgpr), comment="B matrix offset : mt0*depthUBytes"))
   writer.sgprPool.checkIn(tmpSgpr)
+
+  return module
+
+
+def _zeroRegRange(module, writer, tileInfo, firstReg, totalRegs, isAgpr):
+  """Zero a contiguous register range using MFMA for blocks of 16, scalar writes for remainder."""
+  tileAlias = accvgpr if isAgpr else vgpr
+  tileCopyInst = VAccvgprWrite if isAgpr else VMovB32
+  regsPerMfma = 16
+  numMfma = totalRegs // regsPerMfma
+
+  if numMfma > 0:
+    tmpVgpr = writer.vgprPool.checkOutAligned(2, 2)
+    module.add(VMovB64(dst=vgpr(tmpVgpr, 2), src=0, comment=""))
+    module.add(SNop(waitState=1, comment="wait for vgpr to be ready before MFMA"))
+    for i in range(numMfma):
+      r = firstReg + i * regsPerMfma
+      module.add(MFMAInstruction(instType=InstType.INST_I8, accType=InstType.INST_I32,
+                                 variant=[32, 32, 16, 1], mfma1k=False,
+                                 acc=tileAlias(r, regsPerMfma),
+                                 a=vgpr(tmpVgpr, 2), b=vgpr(tmpVgpr, 2),
+                                 acc2=0,
+                                 comment="init%s: [%u:%u]"%(tileInfo.tc, r, r + regsPerMfma - 1)))
+    writer.vgprPool.checkIn(tmpVgpr)
+
+  for i in range(numMfma * regsPerMfma, totalRegs):
+    module.add(tileCopyInst(dst=tileAlias(firstReg + i), src=0, comment="init%s"%(tileInfo.tc)))
+
+def initVgprTilesToZero(writer, kernel, tileInfo):
+  """Initialize vgprTiles to zero using MFMA for blocks of 16, scalar writes for remainder."""
+  module = Module()
+  module.addComment0("Init %s vgprTiles to zero"%(tileInfo.tc))
+
+  if not tileInfo.vgprTiles:
+    return module
+
+  # Group contiguous tiles by pool type (agpr vs vgpr) since D tiles can use both
+  firstReg = tileInfo.vgprTiles[0].regList.regValues[0]
+  totalRegs = 0
+  curPool = tileInfo.vgprTiles[0].regList.regPool
+
+  for tile in tileInfo.vgprTiles:
+    pool = tile.regList.regPool
+    numRegs = len(tile.regList.regValues)
+    if pool != curPool:
+      _zeroRegRange(module, writer, tileInfo, firstReg, totalRegs, curPool == writer.agprPool)
+      firstReg = tile.regList.regValues[0]
+      totalRegs = numRegs
+      curPool = pool
+    else:
+      totalRegs += numRegs
+
+  _zeroRegRange(module, writer, tileInfo, firstReg, totalRegs, curPool == writer.agprPool)
 
   return module
 
