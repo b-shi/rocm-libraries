@@ -54,6 +54,7 @@ namespace rocisa
         BFloat8,
         Float8BFloat8,
         BFloat8Float8,
+        Float4,
         Count,
         None = Count
     };
@@ -99,6 +100,8 @@ namespace rocisa
         case DataType::Float8BFloat8:
             return 1;
         case DataType::BFloat8Float8:
+            return 1;
+        case DataType::Float4:
             return 1;
         default:
             return -1; // Invalid type
@@ -147,6 +150,8 @@ namespace rocisa
             return "Float8BFloat8";
         case DataType::BFloat8Float8:
             return "BFloat8Float8";
+        case DataType::Float4:
+            return "Float4";
         default:
             return "Invalid";
         }

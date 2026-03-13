@@ -219,6 +219,15 @@ class DataType:
             'hip': 'ERROR',
             'isComplex': False,
         },
+        {   # MX FP4 (E2M1)
+            'enum': DataTypeEnum.Float4,
+            'char': 'F4',
+            'nameAbbrev': 'fp4',
+            'miOutTypeNameAbbrev': 'f32',
+            'reg': 0.125,
+            'hip': 'ERROR',
+            'isComplex': False,
+        },
     ]
     lookup = {}
 
@@ -333,6 +342,8 @@ class DataType:
     def isAnyBFloat8Float8(self):
         return (self.value == DataTypeEnum.BFloat8Float8.value \
                 or self.value == DataTypeEnum.BFloat8Float8_fnuz.value)
+    def isFloat4(self):
+        return self.value == DataTypeEnum.Float4.value
     def is8bitFloat(self):
         return _is8bitFloat(self.value)
     def isFloat8A(self):
