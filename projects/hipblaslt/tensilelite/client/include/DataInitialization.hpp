@@ -713,7 +713,11 @@ namespace TensileLite
                 {
                     std::vector<size_t> coord(tensor.dimensions(), 0);
                     CoordNumbered(idx, coord.begin(), coord.end(), sizes.begin(), sizes.end());
-                    array[tensor.index(coord)] = static_cast<T>(idx);
+                    size_t i = idx / 64;
+                    size_t j = idx % 64;
+                    size_t st = getenvt("ST") ? atoi(getenv("ST")) : 0;
+                    T val = i >= st * 16 && i < (st+1) * 16 ? T(1) : T(0);
+                    array[tensor.index(coord)] = static_cast<T>(val);
                 }
             }
 
