@@ -668,30 +668,13 @@ def _grComputeOffset(module, writer, tileInfo, colId, rowId, output):
   loadWidth = 16
 
   module.add(VLShiftLeftB32(dst=vgpr(colBytes), shiftHex=hex(loadWidth.bit_length()-1), src=vgpr(colId), comment="scale col_id by load_width"))
-  
-  # rowId = rowOffset # re-use rowOffset
-  # assert len(tileInfo.sharedVgprGROffset)<=2, "Only support 2 GR offset vgpr for now, found %u"%(len(tileInfo.sharedVgprGROffset))
-
   MT0 = tileInfo.globalMMATileGrid[0] * tileInfo.mmaTileShape[0]
   subtileSize = tileInfo.subtileShape[0]*tileInfo.mmaTileShape[0]
   strideRef = "StrideA0I" if tc == 'A' else "StrideB1J"
-
-  # sHalfOffset = writer.sgprPool.checkOut(1, preventOverflow=False)
-
   module.add(VMulLOU32(dst=vgpr(tmpVgpr), src0=sgpr(strideRef), src1=vgpr(rowId), comment="%s: rowId * stride"%tc))
-  # TODO : handle FP4 (sub byte type once available)
   module.add(VLShiftLeftB32(dst=vgpr(tmpVgpr), shiftHex=hex(bpeBits.bit_length()-1), src=vgpr(tmpVgpr), comment="%s: rowId*stride*bpe"%tc))
   module.add(VLShiftRightB32(dst=vgpr(tmpVgpr), shiftHex=hex(3), src=vgpr(tmpVgpr), comment="to bytes"))
   module.add(VAddU32(dst=vgpr(output), src0=vgpr(colBytes), src1=vgpr(tmpVgpr), comment="%s: GR row_offset"%tc))
-
-  # if len(tileInfo.sharedVgprGROffset)>1:
-  #   offset = math.ceil(subtileSize*tileInfo.loadRatioGR)
-  #   module.add(SMulI32(dst=sgpr(sHalfOffset), src0=sgpr(strideRef), src1=offset*bpe, comment="%s: 2nd GR offset calc : + %u rows"%(tc,offset)))
-
-  #   module.add(VAddU32(dst=vgpr(tileInfo.sharedVgprGROffset[1]), src0=vgpr(tileInfo.sharedVgprGROffset[0]), src1=sgpr(sHalfOffset), comment="%s: GR offset for 2nd subtile = GR offset + subtile row offset"%tc))
-  #   module.add(Label("seb", comment=""))
-
-  # writer.sgprPool.checkIn(sHalfOffset)
   writer.vgprPool.checkIn(tmpVgpr)
 
 ##################################################
@@ -728,10 +711,10 @@ def _grComputeRowPartition(module, kernel, writer, tileInfo, waveId, rowOffset):
   loadWidth = 16
   numRowsPerWave = wavesize // (depthUBytes // loadWidth)
   tc = tileInfo.tc
-  tmpVgpr1 = writer.vgprPool.checkOut(2)
+  tmpVgpr = writer.vgprPool.checkOut(2)
   tmpSgpr = writer.sgprPool.checkOut(1, preventOverflow=False)
-  localRow = tmpVgpr1
-  partitionRow = tmpVgpr1+1
+  localRow = tmpVgpr
+  partitionRow = tmpVgpr+1
   partitionOffset = tileInfo.mmaTileShape[0]*tileInfo.localSubtileGrid[0]
   module.add(SMovB32(dst=sgpr(tmpSgpr), src=partitionOffset, comment="%s: row offset"%tc))
 
@@ -752,7 +735,7 @@ def _grComputeRowPartition(module, kernel, writer, tileInfo, waveId, rowOffset):
   module.add(VAddU32(dst=vgpr(rowOffset), src0=vgpr(localRow), src1=vgpr(partitionRow), comment="%s: row offset"%tc))
   
 
-  writer.vgprPool.checkIn(tmpVgpr1)
+  writer.vgprPool.checkIn(tmpVgpr)
   writer.sgprPool.checkIn(tmpSgpr)
 
 ##################################################
