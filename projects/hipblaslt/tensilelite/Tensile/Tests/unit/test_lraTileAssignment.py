@@ -249,7 +249,7 @@ def generate_lra_scale_asm(cfg):
 
 
 def compute_expected_scale_lr_offset(thread_id, cfg, tileInfo, otherTileInfo):
-    """Python reference for scale LR offset, matching lraTileAssignmentScaleSwizzled logic.
+    """Python reference for scale LR offset (contiguous access, no swizzle/split).
 
     otherTileInfo: the tileInfo for the other matrix (needed for LDS base offset of B).
     """
@@ -262,23 +262,13 @@ def compute_expected_scale_lr_offset(thread_id, cfg, tileInfo, otherTileInfo):
     scaleMMATileK = tileInfo.scaleMMATileK
     numMFMACols = scaleMMATileK * scaleBpe // scaleLoadWidth
 
-    ldsRowBankSize = 64 * 4
-    numRowsPerLDSBanks = ldsRowBankSize // scaleDepthUBytes if scaleDepthUBytes > 0 else 1
-
     laneId = thread_id % WAVESIZE
     lane16 = laneId % mi_m
     lane16Group = laneId // mi_m
 
-    # Swizzling: rotation + permlane16_swap
+    # Simple col offset: lane16Group % scaleBlockSize (no swizzle/rotation)
     if scaleBlockSize > 1:
-        lds_row_id = lane16 // numRowsPerLDSBanks
-        rotation = (lds_row_id // 2) * 2
-        # permlane16_swap: active for lanes where (laneId%4) < 2
-        if (laneId % 4) // 2 == 0:
-            effective_group = lane16Group ^ 1
-        else:
-            effective_group = lane16Group
-        colOffset = (rotation + effective_group) % scaleBlockSize
+        colOffset = lane16Group % scaleBlockSize
     else:
         colOffset = 0
 
@@ -290,16 +280,7 @@ def compute_expected_scale_lr_offset(thread_id, cfg, tileInfo, otherTileInfo):
         newCol = (colOffset + numMFMACols * i) % scaleBlockSize if scaleBlockSize > 1 else colOffset
         offsets.append(rowOffset + newCol * scaleLoadWidth)
 
-    # Split offset (when loadRatioGR <= 1.0)
-    if tileInfo.loadRatioGR <= 1.0:
-        numRowsPerHalfWave = WAVESIZE // max(scaleBlockSize, 1) // 2
-        halfWaveBytes = WAVESIZE * scaleLoadWidth // 2
-        if numRowsPerHalfWave > 0:
-            splitVal = (lane16 // numRowsPerHalfWave) * halfWaveBytes
-        else:
-            splitVal = 0
-        for i in range(len(offsets)):
-            offsets[i] += splitVal
+    # No split offset for scale (contiguous access)
 
     # Wave partitioning
     waveId = thread_id // WAVESIZE
@@ -333,7 +314,6 @@ def compute_expected_scale_lr_offset(thread_id, cfg, tileInfo, otherTileInfo):
         baseLdsOffset = dataLdsSize
     else:
         scaleASize = cfg.mt_a * otherTileInfo.scaleDepthU * otherTileInfo.scaleBpe if otherTileInfo.mxBlock > 0 else 0
-        # Round up to alignment boundary to prevent partial-wave read overlap
         scaleAAligned = ((scaleASize + ldsAlignment - 1) // ldsAlignment) * ldsAlignment if scaleASize > 0 else 0
         baseLdsOffset = dataLdsSize + scaleAAligned
 
@@ -372,34 +352,34 @@ class TestLraTileAssignmentScaleGPU:
         )
 
     def test_offset_a_scale(self, lra_scale_env):
-        """Validate sharedVgprLRScaleOffset for matrix A across all threads."""
+        """Validate scale LR offset for matrix A (stored in sharedVgprLROffset[0])."""
         cfg = lra_scale_env.cfg
         tileInfoA = lra_scale_env.tileInfoA
         tileInfoB = lra_scale_env.tileInfoB
-        for idx, reg in enumerate(tileInfoA.sharedVgprLRScaleOffset):
-            results = build_and_run(lra_scale_env.lra_asm, reg, False, cfg,
-                                    lra_scale_env.tmp_path,
-                                    f"scaleLR_A_v{reg}_{cfg.label}")
-            for tid in range(NUM_THREADS):
-                expected = compute_expected_scale_lr_offset(tid, cfg, tileInfoA, tileInfoB)
-                assert results[tid] == expected[idx], \
-                    f"[{cfg.label}] Scale A LR[{idx}] v{reg} tid={tid}: " \
-                    f"got {results[tid]}, expected {expected[idx]}"
+        reg = tileInfoA.sharedVgprLROffset[0]
+        results = build_and_run(lra_scale_env.lra_asm, reg, False, cfg,
+                                lra_scale_env.tmp_path,
+                                f"scaleLR_A_v{reg}_{cfg.label}")
+        for tid in range(NUM_THREADS):
+            expected = compute_expected_scale_lr_offset(tid, cfg, tileInfoA, tileInfoB)
+            assert results[tid] == expected[0], \
+                f"[{cfg.label}] Scale A LR v{reg} tid={tid}: " \
+                f"got {results[tid]}, expected {expected[0]}"
 
     def test_offset_b_scale(self, lra_scale_env):
-        """Validate sharedVgprLRScaleOffset for matrix B across all threads."""
+        """Validate scale LR offset for matrix B (stored in sharedVgprLROffset[0])."""
         cfg = lra_scale_env.cfg
         tileInfoA = lra_scale_env.tileInfoA
         tileInfoB = lra_scale_env.tileInfoB
-        for idx, reg in enumerate(tileInfoB.sharedVgprLRScaleOffset):
-            results = build_and_run(lra_scale_env.lra_asm, reg, False, cfg,
-                                    lra_scale_env.tmp_path,
-                                    f"scaleLR_B_v{reg}_{cfg.label}")
-            for tid in range(NUM_THREADS):
-                expected = compute_expected_scale_lr_offset(tid, cfg, tileInfoB, tileInfoA)
-                assert results[tid] == expected[idx], \
-                    f"[{cfg.label}] Scale B LR[{idx}] v{reg} tid={tid}: " \
-                    f"got {results[tid]}, expected {expected[idx]}"
+        reg = tileInfoB.sharedVgprLROffset[0]
+        results = build_and_run(lra_scale_env.lra_asm, reg, False, cfg,
+                                lra_scale_env.tmp_path,
+                                f"scaleLR_B_v{reg}_{cfg.label}")
+        for tid in range(NUM_THREADS):
+            expected = compute_expected_scale_lr_offset(tid, cfg, tileInfoB, tileInfoA)
+            assert results[tid] == expected[0], \
+                f"[{cfg.label}] Scale B LR v{reg} tid={tid}: " \
+                f"got {results[tid]}, expected {expected[0]}"
 
 
 if __name__ == "__main__":

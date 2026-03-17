@@ -186,54 +186,29 @@ def generate_gra_scale_asm(cfg):
 
 
 def compute_expected_scale_gr_offset(thread_id, cfg, tileInfo):
-    """Python reference for scale GR offset, matching _grScaleComputeOffset logic."""
+    """Python reference for scale GR offset (contiguous access, no swizzle/split)."""
     stride = cfg.stride_a if tileInfo.tc == 'A' else cfg.stride_b
-    mt0 = cfg.mt_a if tileInfo.tc == 'A' else cfg.mt_b
     scaleBpe = tileInfo.scaleBpe
     scaleBlockSize = tileInfo.scaleBlockSize
     scaleLoadWidth = tileInfo.scaleLoadWidth
-    scaleDepthUBytes = tileInfo.scaleDepthU * scaleBpe
-    subtileSize = tileInfo.subtileShape[0] * tileInfo.mmaTileShape[0]
-
-    ldsRowBankSize = 64 * 4
-    numRowsPerLDSBanks = ldsRowBankSize // scaleDepthUBytes if scaleDepthUBytes > 0 else 1
-
-    # newSerial remapping (same half-wave interleave as data GR)
-    newSerial = (thread_id & (WAVESIZE // 2 - 1)) | ((thread_id // WAVESIZE) * (WAVESIZE // 2))
-    waveSplitId = (thread_id // (WAVESIZE // 2)) % 2
-
-    if scaleBlockSize > 1:
-        col = newSerial % scaleBlockSize
-        row = newSerial // scaleBlockSize
-    else:
-        col = 0
-        row = newSerial
-
-    # Swizzling: quad_perm swap + rotation (same pattern as data GR)
-    if scaleBlockSize > 1 and numRowsPerLDSBanks > 0:
-        rowLds = row // numRowsPerLDSBanks
-        if rowLds % 2 == 0:
-            col = col + 1 if col % 2 == 0 else col - 1
-        rotation = (rowLds // 2) * 2
-        col = (col + scaleBlockSize - rotation) % scaleBlockSize
-
-    col *= scaleLoadWidth
-
-    # Scale stride = data stride / mxBlock
     mxBlock = tileInfo.mxBlock
     scaleStride = stride // mxBlock
 
-    # base = row * scaleStride * scaleBpe + col
+    # Simple col/row from serial (contiguous access)
+    if scaleBlockSize > 1:
+        col = thread_id % scaleBlockSize
+        row = thread_id // scaleBlockSize
+    else:
+        col = 0
+        row = thread_id
+
+    col *= scaleLoadWidth
+
+    # offset = row * scaleStride * scaleBpe + col
     base = (row * scaleStride) << max(0, scaleBpe.bit_length() - 1)
     base += col
 
-    # Split wave offset
-    if tileInfo.loadRatioGR == 2.0:
-        halfOffset = subtileSize * scaleBpe
-    else:
-        halfOffset = (mt0 * scaleBpe) // 2
-
-    return [base + waveSplitId * halfOffset * scaleStride]
+    return [base]
 
 
 SCALE_TILE_CONFIGS = [
@@ -265,32 +240,32 @@ class TestGraTileAssignmentScaleGPU:
         )
 
     def test_offset_a_scale(self, gra_scale_env):
-        """Validate sharedVgprGRScaleOffset for matrix A across all threads."""
+        """Validate scale GR offset for matrix A (stored in sharedVgprGROffset[0])."""
         cfg = gra_scale_env.cfg
         tileInfo = gra_scale_env.tileInfoA
-        for idx, reg in enumerate(tileInfo.sharedVgprGRScaleOffset):
-            results = build_and_run(gra_scale_env.gra_asm, reg, False, cfg,
-                                    gra_scale_env.tmp_path,
-                                    f"scaleGR_A_v{reg}_{cfg.label}")
-            for tid in range(NUM_THREADS):
-                expected = compute_expected_scale_gr_offset(tid, cfg, tileInfo)
-                assert results[tid] == expected[idx], \
-                    f"[{cfg.label}] Scale A GR[{idx}] v{reg} tid={tid}: " \
-                    f"got {results[tid]}, expected {expected[idx]}"
+        reg = tileInfo.sharedVgprGROffset[0]
+        results = build_and_run(gra_scale_env.gra_asm, reg, False, cfg,
+                                gra_scale_env.tmp_path,
+                                f"scaleGR_A_v{reg}_{cfg.label}")
+        for tid in range(NUM_THREADS):
+            expected = compute_expected_scale_gr_offset(tid, cfg, tileInfo)
+            assert results[tid] == expected[0], \
+                f"[{cfg.label}] Scale A GR v{reg} tid={tid}: " \
+                f"got {results[tid]}, expected {expected[0]}"
 
     def test_offset_b_scale(self, gra_scale_env):
-        """Validate sharedVgprGRScaleOffset for matrix B across all threads."""
+        """Validate scale GR offset for matrix B (stored in sharedVgprGROffset[0])."""
         cfg = gra_scale_env.cfg
         tileInfo = gra_scale_env.tileInfoB
-        for idx, reg in enumerate(tileInfo.sharedVgprGRScaleOffset):
-            results = build_and_run(gra_scale_env.gra_asm, reg, False, cfg,
-                                    gra_scale_env.tmp_path,
-                                    f"scaleGR_B_v{reg}_{cfg.label}")
-            for tid in range(NUM_THREADS):
-                expected = compute_expected_scale_gr_offset(tid, cfg, tileInfo)
-                assert results[tid] == expected[idx], \
-                    f"[{cfg.label}] Scale B GR[{idx}] v{reg} tid={tid}: " \
-                    f"got {results[tid]}, expected {expected[idx]}"
+        reg = tileInfo.sharedVgprGROffset[0]
+        results = build_and_run(gra_scale_env.gra_asm, reg, False, cfg,
+                                gra_scale_env.tmp_path,
+                                f"scaleGR_B_v{reg}_{cfg.label}")
+        for tid in range(NUM_THREADS):
+            expected = compute_expected_scale_gr_offset(tid, cfg, tileInfo)
+            assert results[tid] == expected[0], \
+                f"[{cfg.label}] Scale B GR v{reg} tid={tid}: " \
+                f"got {results[tid]}, expected {expected[0]}"
 
 
 if __name__ == "__main__":
