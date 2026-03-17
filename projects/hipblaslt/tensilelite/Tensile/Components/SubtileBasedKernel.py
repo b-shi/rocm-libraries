@@ -763,6 +763,55 @@ def _grComputeAllOffsets(module, writer, tileInfo, colId, rowId, rowOffset):
     writer.vgprPool.checkIn(rotatedcolId)
 
 ##################################################
+# Apply swizzling and rotation to col IDs for GR offset calculation.
+#
+# Swizzling reorders column indices to avoid LDS bank conflicts.
+# Two levels of rotation are applied to the column IDs:
+#   1. Intra-wave rotation: rotates colId based on the LDS row id within
+#      a single wave. The rotation offset is: blockSize - (ldsRowId // 2) * 2.
+#      This ensures consecutive rows access different LDS banks.
+#   2. Inter-wave rotation: an additional per-wave offset derived from waveId
+#      shifts the column further so that different waves also avoid bank
+#      conflicts with each other. Only applied when loadRatioGR != 0.5
+#      (i.e. when multiple waves share the same subtile region).
+#
+def _grSwizzleColIds(module, writer, tileInfoA, tileInfoB, blockSize, numRowsPerLDSBanks,
+                     laneId, colIdA, colIdB, waveId):
+  tmpVgpr = writer.vgprPool.checkOut(3)
+  ldsRowId = tmpVgpr
+  tmp = tmpVgpr + 1
+  waveRotation = tmpVgpr + 2
+
+  module.addComment0("Swizzling")
+  module.add(VLShiftRightB32(dst=vgpr(ldsRowId), shiftHex=hex(blockSize.bit_length()-1), src=vgpr(laneId), comment="row id within wave"))
+  module.add(VLShiftRightB32(dst=vgpr(ldsRowId), shiftHex=hex(numRowsPerLDSBanks.bit_length()-1), src=vgpr(ldsRowId), comment="lds row id"))
+  module.add(VAndB32(dst=vgpr(tmp), src0=vgpr(ldsRowId), src1=hex(1), comment="lds row id % 2"))
+  module.add(VCmpXEqU32(dst=VCC(), src0=0, src1=vgpr(tmp), comment="lds row id % 2 == 0 ?"))
+  module.add(VMovB32(dst=vgpr(colIdA), src=vgpr(colIdA), dpp=DPPModifiers(quad_perm=[1,0,3,2]), comment="swap colId pairs for swizzling"))
+  module.add(SMovB64(dst=EXEC(), src=-1))
+  module.add(VMovB32(dst=vgpr(colIdB), src=vgpr(colIdA), comment=""))
+  module.addComment0("Rotation within a single wave")
+  # wave rotation
+  module.add(VLShiftRightB32(dst=vgpr(tmp), shiftHex=hex(1), src=vgpr(ldsRowId), comment=""))
+  module.add(VLShiftLeftB32(dst=vgpr(tmp), shiftHex=hex(1), src=vgpr(tmp), comment="(ldsRowId //2) * 2"))
+  module.add(VSubU32(dst=vgpr(tmp), src0=hex(blockSize), src1=vgpr(tmp), comment="rotation offset : blockSize - (ldsRowId//2)*2"))
+
+  for tInfo, cId in [(tileInfoA, colIdA), (tileInfoB, colIdB)]:
+    if tInfo.loadRatioGR != 0.5:
+      module.addComment0("Rotation per wave")
+      module.add(VAndB32(dst=vgpr(waveRotation), src0=vgpr(waveId), src1=hex(1), comment=""))
+      module.add(VLShiftLeftB32(dst=vgpr(waveRotation), shiftHex=hex((2*numRowsPerLDSBanks).bit_length() - 1), src=vgpr(waveRotation), comment=""))
+      module.add(VSubU32(dst=vgpr(waveRotation), src0=vgpr(tmp), src1=vgpr(waveRotation), comment=""))
+      module.add(VAddU32(dst=vgpr(cId), src0=vgpr(waveRotation), src1=vgpr(cId), comment=""))
+    else:
+      module.add(VAddU32(dst=vgpr(cId), src0=vgpr(tmp), src1=vgpr(cId), comment=""))
+
+  module.add(VAndB32(dst=vgpr(colIdA), src0=vgpr(colIdA), src1=hex(blockSize-1), comment="(col + offset) % block_size"))
+  module.add(VAndB32(dst=vgpr(colIdB), src0=vgpr(colIdB), src1=hex(blockSize-1), comment="(col + offset) % block_size"))
+
+  writer.vgprPool.checkIn(tmpVgpr)
+
+##################################################
 # Subroutine to generate GR offset calculation code
 #
 def graTileAssignment(writer, kernel, useSwizzling=True):
@@ -785,64 +834,26 @@ def graTileAssignment(writer, kernel, useSwizzling=True):
 
   numRowsPerLDSBanks = ldsRowBankSize // depthUBytes
 
-  tmpVgpr = writer.vgprPool.checkOut(10)
-  colId = tmpVgpr
-  rowId = tmpVgpr + 1
-  rowOffsetA = tmpVgpr + 2
-  rowOffsetB = tmpVgpr + 3
-  ldsRowId = tmpVgpr + 4
+  tmpVgpr = writer.vgprPool.checkOut(7)
+  colIdA = tmpVgpr
+  colIdB = tmpVgpr + 1
+  rowId = tmpVgpr + 2
+  rowOffsetA = tmpVgpr + 3
+  rowOffsetB = tmpVgpr + 4
   waveId = tmpVgpr + 5
-  tmp = tmpVgpr + 6
-  laneId = tmpVgpr + 7
-  waveRotation = tmpVgpr + 8
-  colIdB = tmpVgpr + 9
+  laneId = tmpVgpr + 6
 
   # Compute waveId and laneId
   module.add(VLShiftRightB32(dst=vgpr(waveId), shiftHex=hex(wavesize.bit_length()-1), src=vgpr("Serial"), comment="Wave Id"))
   module.add(VAndB32(dst=vgpr(laneId), src0=vgpr("Serial"), src1=wavesize-1, comment=""))
   # Common code for both A & B
   # Calculate col and row id within a wave for 128b loads
-  module.add(VAndB32(dst=vgpr(colId), src0=vgpr("Serial"), src1=(blockSize-1), comment="get col_id in wave for %uB load"%loadWidth))
+  module.add(VAndB32(dst=vgpr(colIdA), src0=vgpr("Serial"), src1=(blockSize-1), comment="get col_id in wave for %uB load"%loadWidth))
   module.add(VLShiftRightB32(dst=vgpr(rowId), shiftHex=hex(blockSize.bit_length()-1), src=vgpr(laneId), comment="row id within wave"))
 
-  useSwizzling = True
-  if useSwizzling:
-    module.addComment0("Swizzling")
-    module.add(VLShiftRightB32(dst=vgpr(ldsRowId), shiftHex=hex(blockSize.bit_length()-1), src=vgpr(laneId), comment="row id within wave"))
-    module.add(VLShiftRightB32(dst=vgpr(ldsRowId), shiftHex=hex(numRowsPerLDSBanks.bit_length()-1), src=vgpr(ldsRowId), comment="lds row id"))
-    module.add(VAndB32(dst=vgpr(tmp), src0=vgpr(ldsRowId), src1=hex(1), comment="lds row id % 2"))
-    module.add(VCmpXEqU32(dst=VCC(), src0=0, src1=vgpr(tmp), comment="lds row id % 2 == 0 ?"))
-    module.add(VMovB32(dst=vgpr(colId), src=vgpr(colId), dpp=DPPModifiers(quad_perm=[1,0,3,2]), comment="swap colId pairs for swizzling"))
-    module.add(SMovB64(dst=EXEC(), src=-1))
-    module.add(VMovB32(dst=vgpr(colIdB), src=vgpr(colId), comment=""))
-    colIdA = colId
-    # wave rotation
-    module.add(VLShiftRightB32(dst=vgpr(tmp), shiftHex=hex(1), src=vgpr(ldsRowId), comment=""))
-    module.add(VLShiftLeftB32(dst=vgpr(tmp), shiftHex=hex(1), src=vgpr(tmp), comment="(ldsRowId //2) * 2"))
-    module.add(VSubU32(dst=vgpr(tmp), src0=hex(blockSize), src1=vgpr(tmp), comment="rotation offset : blockSize - (ldsRowId//2)*2"))
-    
-    if tileInfoA.loadRatioGR != 0.5:
-      #Wave specific rotation
-      module.add(VAndB32(dst=vgpr(waveRotation), src0=vgpr(waveId), src1=hex(1), comment=""))
-      module.add(VLShiftLeftB32(dst=vgpr(waveRotation), shiftHex=hex((2*numRowsPerLDSBanks).bit_length() - 1), src=vgpr(waveRotation), comment=""))
-      
-      module.add(VSubU32(dst=vgpr(waveRotation), src0=vgpr(tmp), src1=vgpr(waveRotation), comment=""))
-      module.add(VAddU32(dst=vgpr(colId), src0=vgpr(waveRotation), src1=vgpr(colId), comment=""))
-    else:
-      module.add(VAddU32(dst=vgpr(colId), src0=vgpr(tmp), src1=vgpr(colId), comment=""))
-
-    if tileInfoB.loadRatioGR != 0.5:
-      #Wave specific rotation
-      module.add(VAndB32(dst=vgpr(waveRotation), src0=vgpr(waveId), src1=hex(1), comment=""))
-      module.add(VLShiftLeftB32(dst=vgpr(waveRotation), shiftHex=hex((2*numRowsPerLDSBanks).bit_length() - 1), src=vgpr(waveRotation), comment=""))
-      module.add(VSubU32(dst=vgpr(waveRotation), src0=vgpr(tmp), src1=vgpr(waveRotation), comment=""))
-      module.add(VAddU32(dst=vgpr(colIdB), src0=vgpr(waveRotation), src1=vgpr(colIdB), comment=""))
-    else:
-      module.add(VAddU32(dst=vgpr(colIdB), src0=vgpr(tmp), src1=vgpr(colIdB), comment=""))
-
-
-    module.add(VAndB32(dst=vgpr(colIdA), src0=vgpr(colIdA), src1=hex(blockSize-1), comment="(col + offset) % block_size"))
-    module.add(VAndB32(dst=vgpr(colIdB), src0=vgpr(colIdB), src1=hex(blockSize-1), comment="(col + offset) % block_size"))
+  # Apply swizzling and rotation to colId for A and B
+  _grSwizzleColIds(module, writer, tileInfoA, tileInfoB, blockSize, numRowsPerLDSBanks,
+                   laneId, colIdA, colIdB, waveId)
     
   # Compute rowOffsetA and rowOffsetB row offset based on wave partitioning (e.g. 2x2, 4x1/1x4)
   _grComputeRowPartition(module, kernel, writer, tileInfoA, waveId, rowOffsetA)
