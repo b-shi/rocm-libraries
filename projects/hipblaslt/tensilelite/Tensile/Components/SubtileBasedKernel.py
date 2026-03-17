@@ -455,7 +455,7 @@ def _computeLROffset(module, kernel, tileInfo, colOffset, rowOffset):
     module.add(VLShiftLeftB32(dst=vgpr(tileInfo.sharedVgprLROffset[vgprId]), shiftHex=hex(loadWidth.bit_length()-1), src=vgpr(tileInfo.sharedVgprLROffset[vgprId]), comment="%s: colOffset*loadWidth"%tc))
     module.add(VAddU32(dst=vgpr(tileInfo.sharedVgprLROffset[vgprId]), src0=vgpr(tileInfo.sharedVgprLROffset[vgprId]), src1=vgpr(rowOffset), comment="%s: row + col"%tc))
 
-def _applyWavePartitionLROffset(module, writer, kernel, tileInfo, waveId):
+def _applyWavePartitionLROffset(module, writer, kernel, tileInfo):
   """Apply wave-based partition offset to LR offsets.
 
   loadRatioGR >= 2.0: no partition needed, contiguous subtiles (1x4 for A , 4x1 for B)
@@ -470,68 +470,43 @@ def _applyWavePartitionLROffset(module, writer, kernel, tileInfo, waveId):
   wavesize = kernel["WavefrontSize"]
   depthUBytes = tileInfo.depthUBytes
   MT = tileInfo.globalMMATileGrid[0] * tileInfo.mmaTileShape[0]
-  loadWidth = tileInfo.loadWidthLR
-  bytes_loaded = wavesize * loadWidth
 
-  tmpSgpr = writer.sgprPool.checkOut(1)
-  tmp = writer.vgprPool.checkOut(2)
-  tmp1 = tmp + 1
+  waveId = writer.vgprPool.checkOut(1)
+  module.add(VLShiftRightB32(dst=vgpr(waveId), shiftHex=hex(wavesize.bit_length()-1), src=vgpr("Serial"), comment="waveId"))
 
+  # Interleaved needed to be compatible with tensilelite storeC code.
   interleaved = True
   if tileInfo.loadRatioGR == 1.0:
     # W0 W2
     # W1 W3
     # W1-3 : A / W2-3 : B
     if tc == 'A':
-      module.add(VAndB32(dst=vgpr(tmp), src0=hex(1), src1=vgpr(waveId), comment="%s: waveId %% 2"%tc))
+      module.add(VAndB32(dst=vgpr(waveId), src0=hex(1), src1=vgpr(waveId), comment="%s: waveId %% 2"%tc))
     else:
-      module.add(VLShiftRightB32(dst=vgpr(tmp), shiftHex=hex(1), src=vgpr(waveId), comment="%s: waveId / 2"%tc))
-    
-    # If interleaved, W0 and W1 get consecutive subtitles otherwise W0 and W1 are spaced by MT//2 (half subtiles)
-    if interleaved:
-      module.add(SMovB32(dst=sgpr(tmpSgpr), src=tileInfo.subtileSize, comment="%s: bytes loaded per wave"%tc))
-    else:
-      module.add(SMovB32(dst=sgpr(tmpSgpr), src=MT*depthUBytes//2, comment="%s: bytes loaded per wave / 2"%tc))
+      module.add(VLShiftRightB32(dst=vgpr(waveId), shiftHex=hex(1), src=vgpr(waveId), comment="%s: waveId / 2"%tc))
 
-    module.add(VMulLOU32(dst=vgpr(tmp), src0=sgpr(tmpSgpr), src1=vgpr(tmp), comment="%s: wave partition offset"%tc))
-
-    for vgprId in range(len(tileInfo.sharedVgprLROffset)):
-      module.add(VAddU32(dst=vgpr(tileInfo.sharedVgprLROffset[vgprId]), src0=vgpr(tileInfo.sharedVgprLROffset[vgprId]), src1=vgpr(tmp), comment="%s: wave partition LR offset"%tc))
-
+    sInterval = tileInfo.subtileSize if interleaved else MT * depthUBytes // 2
   elif tileInfo.loadRatioGR == 0.5:
-    MT0 = tileInfo.globalMMATileGrid[0] * tileInfo.mmaTileShape[0]
-    if interleaved:
-      module.add(SMovB32(dst=sgpr(tmpSgpr), src=hex(tileInfo.subtileSize), comment="%s: interleave stride"%tc))
-    else:
-      module.add(SMovB32(dst=sgpr(tmpSgpr), src=hex(MT0*depthUBytes//4), comment="%s: non-interleave stride"%tc))
-
-    module.add(VMulLOU32(dst=vgpr(tmp), src1=vgpr(waveId), src0=sgpr(tmpSgpr), comment=""))
-
-
-    for vgprId in range(len(tileInfo.sharedVgprLROffset)):
-      module.add(VAddU32(dst=vgpr(tileInfo.sharedVgprLROffset[vgprId]), src0=vgpr(tileInfo.sharedVgprLROffset[vgprId]), src1=vgpr(tmp), comment="%s: wave partition LR offset"%tc))
-
+    sInterval = tileInfo.subtileSize if interleaved else MT * depthUBytes // 4
   else:
-    writer.vgprPool.checkIn(tmp)
-    writer.sgprPool.checkIn(tmpSgpr)
     raise NotImplementedError("Unsupported loadRatioGR for wave partition: %s"%str(tileInfo.loadRatioGR))
+  
+  tmpSgpr = writer.sgprPool.checkOut(1)
+  module.add(SMovB32(dst=sgpr(tmpSgpr), src=hex(sInterval), comment="%s: interleave stride"%tc))
+  module.add(VMulLOU32(dst=vgpr(waveId), src1=vgpr(waveId), src0=sgpr(tmpSgpr), comment=""))
+  for vgprId in range(len(tileInfo.sharedVgprLROffset)):
+    module.add(VAddU32(dst=vgpr(tileInfo.sharedVgprLROffset[vgprId]), src0=vgpr(tileInfo.sharedVgprLROffset[vgprId]), src1=vgpr(waveId), comment="%s: wave partition LR offset"%tc))
 
-  writer.vgprPool.checkIn(tmp)
+  writer.vgprPool.checkIn(waveId)
   writer.sgprPool.checkIn(tmpSgpr)
 
 def _lraWavePartitioning(module, writer, kernel):
   """Compute waveId and apply per-matrix wave partition offsets."""
   tileInfoA = writer.states.a.tileInfo
   tileInfoB = writer.states.b.tileInfo
-  wavesize = kernel["WavefrontSize"]
+  _applyWavePartitionLROffset(module, writer, kernel, tileInfoA)
+  _applyWavePartitionLROffset(module, writer, kernel, tileInfoB)
 
-  waveId = writer.vgprPool.checkOut(1)
-  module.add(VLShiftRightB32(dst=vgpr(waveId), shiftHex=hex(wavesize.bit_length()-1), src=vgpr("Serial"), comment="waveId"))
-
-  _applyWavePartitionLROffset(module, writer, kernel, tileInfoA, waveId)
-  _applyWavePartitionLROffset(module, writer, kernel, tileInfoB, waveId)
-
-  writer.vgprPool.checkIn(waveId)
 
 def setExecMask(module, writer, maskLo, maskHi):
   tmpSgpr = writer.sgprPool.checkOutAligned(2, 2, "setExecMask tmpSgpr", False)
@@ -562,8 +537,8 @@ def lraTileAssignment(writer, kernel):
 
   blockSize = depthUBytes // loadWidth
 
-  tmpVgpr = writer.vgprPool.checkOut(8)
-  lane16, lane16Group, rotation, rowOffset, colOffset, waveId, tmp, tmp1 = range(tmpVgpr, tmpVgpr + 8)
+  tmpVgpr = writer.vgprPool.checkOut(6)
+  lane16, lane16Group, rotation, rowOffset, colOffset = range(tmpVgpr, tmpVgpr + 5)
 
   # Calculate lane16 and lane16Group for current wave (used by MFMA layout)
   module.add(VAndB32(dst=vgpr(lane16Group), src0=vgpr("Serial"), src1=wavesize-1, comment="laneId"))
@@ -601,11 +576,8 @@ def lraTileAssignment(writer, kernel):
 
   # Apply global offset on B (B data follows A in LDS).
   MT0A = tileInfoA.globalMMATileGrid[0] * tileInfoA.mmaTileShape[0]
-  tmpSgpr = writer.sgprPool.checkOut(1)
-  module.add(SMovB32(dst=sgpr(tmpSgpr), src=hex(writer.ldsStartOffsetB), comment="LDS offset for B matrix"))
   for vgprId in range(len(tileInfoB.sharedVgprLROffset)):
-    module.add(VAddU32(dst=vgpr(tileInfoB.sharedVgprLROffset[vgprId]), src0=vgpr(tileInfoB.sharedVgprLROffset[vgprId]), src1=sgpr(tmpSgpr), comment="B matrix offset : mt0*depthUBytes"))
-  writer.sgprPool.checkIn(tmpSgpr)
+    module.add(VAddU32(dst=vgpr(tileInfoB.sharedVgprLROffset[vgprId]), src0=writer.ldsStartOffsetB, src1=vgpr(tileInfoB.sharedVgprLROffset[vgprId]), comment="B matrix offset in LDS"))
 
   return module
 
