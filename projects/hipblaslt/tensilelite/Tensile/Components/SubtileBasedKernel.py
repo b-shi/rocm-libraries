@@ -574,7 +574,7 @@ def lraTileAssignment(writer, kernel):
   # Wave partitioning (e.g. 2x2 or 4x1/1x4)
   _lraWavePartitioning(module, writer, kernel)
 
-  # Apply global offset on B (B data follows A in LDS).
+  # Apply global offset on B
   MT0A = tileInfoA.globalMMATileGrid[0] * tileInfoA.mmaTileShape[0]
   for vgprId in range(len(tileInfoB.sharedVgprLROffset)):
     module.add(VAddU32(dst=vgpr(tileInfoB.sharedVgprLROffset[vgprId]), src0=writer.ldsStartOffsetB, src1=vgpr(tileInfoB.sharedVgprLROffset[vgprId]), comment="B matrix offset in LDS"))
@@ -720,9 +720,9 @@ def _grComputeSubtileOffsets(writer, module, tileInfo):
         writer.sgprPool.checkIn(stmp)
 
 ##################################################
-# Apply wave partition offset to rowId for a single matrix (A or B)
+# Compute wave partition offset for a single tile (A or B)
 #
-def _grComputeRowOffset(module, kernel, writer, tileInfo, waveId, rowOffset):
+def _grComputeRowPartition(module, kernel, writer, tileInfo, waveId, rowOffset):
   depthUBytes = tileInfo.depthUBytes
   wavesize = kernel["WavefrontSize"]
   loadWidth = 16
@@ -765,12 +765,19 @@ def _grComputeAllOffsets(module, writer, tileInfo, colId, rowId, rowOffset):
     subtileSize = tileInfo.subtileShape[0] * tileInfo.mmaTileShape[0]
     offset = math.ceil(subtileSize * tileInfo.loadRatioGR)
     module.add(VAddU32(dst=vgpr(rowOffset), src0=offset, src1=vgpr(rowOffset), comment="%s: advance row for GR offset %u"%(tileInfo.tc, i)))
-    rotationCol = writer.vgprPool.checkOut(1)
-    blockSize = 8
-    module.add(VAddU32(dst=vgpr(rotationCol), src0=4, src1=vgpr(colId), comment="%s: advance row for GR offset %u"%(tileInfo.tc, i)))
-    module.add(VAndB32(dst=vgpr(rotationCol), src0=vgpr(rotationCol), src1=hex(blockSize-1), comment="(col + offset) % block_size"))
-    _grComputeOffset(module, writer, tileInfo, rotationCol, rowOffset, tileInfo.sharedVgprGROffset[i])
-    writer.vgprPool.checkIn(rotationCol)
+
+    # Apply Rotation on entire wave. Only applies to 4x case as a subtile is loaded by a single wave in 2 steps. (waveId rotation not applied)
+    rotatedcolId = writer.vgprPool.checkOut(1)
+    loadWidth = 16
+    if tileInfo.loadRatioGR == 0.5:
+      blockSize = tileInfo.depthUBytes // loadWidth
+      module.add(VAddU32(dst=vgpr(rotatedcolId), src0=4, src1=vgpr(colId), comment="%s: advance row for GR offset %u"%(tileInfo.tc, i)))
+      module.add(VAndB32(dst=vgpr(rotatedcolId), src0=vgpr(rotatedcolId), src1=hex(blockSize-1), comment="(col + offset) % block_size"))
+    else:
+      module.add(VMovB32(dst=vgpr(rotatedcolId), src=vgpr(colId), comment=""))
+
+    _grComputeOffset(module, writer, tileInfo, rotatedcolId, rowOffset, tileInfo.sharedVgprGROffset[i])
+    writer.vgprPool.checkIn(rotatedcolId)
 
 ##################################################
 # Subroutine to generate GR offset calculation code
@@ -854,9 +861,9 @@ def graTileAssignment(writer, kernel, useSwizzling=True):
     module.add(VAndB32(dst=vgpr(colIdA), src0=vgpr(colIdA), src1=hex(blockSize-1), comment="(col + offset) % block_size"))
     module.add(VAndB32(dst=vgpr(colIdB), src0=vgpr(colIdB), src1=hex(blockSize-1), comment="(col + offset) % block_size"))
     
-  # Apply row offset based on wave partitioning (e.g. 2x2, 4x1/1x4)
-  _grComputeRowOffset(module, kernel, writer, tileInfoA, waveId, rowOffsetA)
-  _grComputeRowOffset(module, kernel, writer, tileInfoB, waveId, rowOffsetB)
+  # Compute rowOffsetA and rowOffsetB row offset based on wave partitioning (e.g. 2x2, 4x1/1x4)
+  _grComputeRowPartition(module, kernel, writer, tileInfoA, waveId, rowOffsetA)
+  _grComputeRowPartition(module, kernel, writer, tileInfoB, waveId, rowOffsetB)
 
   # Compute GR offset for A and B
   _grComputeAllOffsets(module, writer, tileInfoA, colIdA, rowId, rowOffsetA)
@@ -1014,14 +1021,12 @@ def globalReadDTLInitCommonSgpr(writer, kernel):
   atile = writer.states.a.tileInfo
   btile = writer.states.b.tileInfo
 
-  print("atile : ", atile)
-
   tmpVgpr = writer.vgprPool.checkOut(2)
   rowOffsetA = tmpVgpr 
   rowOffsetB = tmpVgpr + 1
 
-  _grComputeRowOffset(module, kernel, writer, atile, vgprWaveId, rowOffsetA)
-  _grComputeRowOffset(module, kernel, writer, btile, vgprWaveId, rowOffsetB)
+  _grComputeRowPartition(module, kernel, writer, atile, vgprWaveId, rowOffsetA)
+  _grComputeRowPartition(module, kernel, writer, btile, vgprWaveId, rowOffsetB)
 
   depthUBytes = atile.depthUBytes
 
