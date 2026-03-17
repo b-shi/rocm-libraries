@@ -1150,10 +1150,8 @@ def mainLoopImpl(writer, kernel, isNLL = False):
     module.add(globalReadDoSubtile('B', writer, kernel))
     module.add(SWaitCnt(dscnt=-1, vlcnt=0, vscnt=-1, comment="Wait for all subtile GRs to complete"))
     module.add(SBarrier(comment=""))
-    
-    module.add(Label("debug", comment=""))
-
-  
+ 
+ 
 
   module.add(localReadDoSubtile('A', writer, kernel))
   module.add(localReadDoSubtile('B', writer, kernel))
