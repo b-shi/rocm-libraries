@@ -4950,7 +4950,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
 
       self.ldsStartOffsetA = 0
       aTileInfo = self.states.a.tileInfo
-      bTileInfo = self.states.a.tileInfo
+      bTileInfo = self.states.b.tileInfo
       numASubtiles = aTileInfo.globalSubtileGrid[0] * aTileInfo.globalSubtileGrid[1]
       numBSubtiles = bTileInfo.globalSubtileGrid[0] * bTileInfo.globalSubtileGrid[1]
       readSize = 2*aTileInfo.subtileSize
