@@ -279,6 +279,8 @@ class TileInfo:
         self.scaleDepthU = depthU // self.mxBlock
         self.scaleLoadWidth = self.scaleBpe  # 1 byte per load (DSLoadU8)
         self.scaleBlockSize = (self.scaleDepthU * self.scaleBpe) // self.scaleLoadWidth
+        assert self.scaleBlockSize > 0 and (self.scaleBlockSize & (self.scaleBlockSize - 1)) == 0, \
+          "scaleBlockSize must be power of 2, got %d" % self.scaleBlockSize
         self.numLRScalePerSubtile = 1  # 1 VGPR; MMA tile selection via ds_offset at emit time
       else:
         self.scaleBpe = 0
@@ -910,6 +912,12 @@ def graTileAssignmentScaleSwizzled(writer, kernel):
     module.addComment0("Scale GR offsets: skipped (no MX block scaling)")
     return module
 
+  # col/row decomposition is shared between A and B — requires matching scale geometry
+  if tileInfoA.mxBlock > 0 and tileInfoB.mxBlock > 0:
+    assert tileInfoA.scaleBlockSize == tileInfoB.scaleBlockSize, \
+      "Scale GR offset sharing requires identical scaleBlockSize for A (%d) and B (%d)" \
+      % (tileInfoA.scaleBlockSize, tileInfoB.scaleBlockSize)
+
   module.addComment0("GR Offset Calculation for Scale Tensors (DTL)")
 
   scaleBpeA = tileInfoA.scaleBpe if tileInfoA.mxBlock > 0 else 1
@@ -1039,6 +1047,12 @@ def lraTileAssignmentScaleSwizzled(writer, kernel):
   if tileInfoA.mxBlock == 0 and tileInfoB.mxBlock == 0:
     module.addComment0("Scale LR offsets: skipped (no MX block scaling)")
     return module
+
+  # Lane mapping is shared between A and B — requires matching scale geometry
+  if tileInfoA.mxBlock > 0 and tileInfoB.mxBlock > 0:
+    assert tileInfoA.scaleBlockSize == tileInfoB.scaleBlockSize, \
+      "Scale LR offset sharing requires identical scaleBlockSize for A (%d) and B (%d)" \
+      % (tileInfoA.scaleBlockSize, tileInfoB.scaleBlockSize)
 
   module.addComment0("LR Offset Calculation for Scale Tensors")
 
