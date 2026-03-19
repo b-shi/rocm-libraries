@@ -272,7 +272,7 @@ class TileInfo:
 
       # Scale tensor geometry (MX block scaling)
       mxBlockKey = "MXBlock%s"%tc
-      self.mxBlock = kernel["ProblemType"].get(mxBlockKey, 0) if isinstance(kernel["ProblemType"], dict) else 0
+      self.mxBlock = kernel["ProblemType"].get(mxBlockKey, 0)
       if self.mxBlock > 0:
         self.scaleBpe = 1  # UE8M0 = 1 byte
         self.scaleMMATileK = mmaTileShape1 // self.mxBlock
