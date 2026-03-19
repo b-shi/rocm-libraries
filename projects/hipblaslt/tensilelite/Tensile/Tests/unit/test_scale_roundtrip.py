@@ -31,11 +31,12 @@ import numpy as np
 from gpu_test_helpers import (
     HAS_HIP,
     TileConfig,
-    BPE, WAVESIZE, NUM_THREADS, GFX_TARGET,
+    BPE, WAVESIZE, NUM_WAVES, NUM_THREADS, GFX_TARGET,
     create_writer_for_gpu,
     init_rocisa,
     assemble_kernel,
     hip_check,
+    print_offset_grid,
 )
 
 from test_graTileAssignment import compute_expected_scale_gr_offset
@@ -451,6 +452,44 @@ class TestScaleRoundtripGPU:
 
 
 # ---------------------------------------------------------------------------
+# Debug helpers
+# ---------------------------------------------------------------------------
+def print_intermediate_values(cfg, tileInfoA, tileInfoB, tc, kernel):
+    """Print GR offset, LR offset, writer thread, and expected value per thread."""
+    tileInfo = tileInfoA if tc == 'A' else tileInfoB
+    otherTileInfo = tileInfoB if tc == 'A' else tileInfoA
+
+    dataLdsSize, scaleALdsSize, _ = compute_lds_sizes(cfg, tileInfoA, tileInfoB, kernel)
+    scaleBase = dataLdsSize if tc == 'A' else (dataLdsSize + scaleALdsSize)
+
+    print(f"\n  Intermediate values for scale {tc}:")
+    print(f"  dataLdsSize={dataLdsSize}, scaleALdsSize={scaleALdsSize}, scaleBase={scaleBase}")
+    print(f"  scaleBlockSize={tileInfo.scaleBlockSize}, scaleDepthU={tileInfo.scaleDepthU}, "
+          f"loadRatioGR={tileInfo.loadRatioGR}")
+    print(f"  {'tid':>4} {'GR_off':>7} {'LR_off':>7} {'LR_adj':>7} {'writer':>7}")
+    print(f"  {'-'*36}")
+    for T in range(min(NUM_THREADS, 64)):  # first wave
+        gr_off = compute_expected_scale_gr_offset(T, cfg, tileInfo)[0]
+        lr_off = compute_expected_scale_lr_offset(T, cfg, tileInfo, otherTileInfo)[0]
+        writer = lr_off - scaleBase
+        print(f"  {T:>4} {gr_off:>7} {lr_off:>7} {lr_off - scaleBase:>7} {writer:>7}")
+
+
+def print_scale_asm_only(kernel_asm):
+    """Print only the scale-related sections of the kernel assembly."""
+    in_section = False
+    for line in kernel_asm.split('\n'):
+        if ('GR Offset Calculation for Scale' in line or
+            'LR Offset Calculation for Scale' in line or
+            'Roundtrip for scale' in line):
+            in_section = True
+        if in_section:
+            print(f"  {line}")
+            if line.strip().startswith('s_endpgm') or line.strip().startswith('s_barrier'):
+                in_section = False
+
+
+# ---------------------------------------------------------------------------
 # Standalone runner
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
@@ -458,10 +497,24 @@ if __name__ == "__main__":
     import tempfile
 
     parser = argparse.ArgumentParser(description="Scale GR-LR roundtrip GPU test")
-    parser.add_argument("--debug", action="store_true", help="Print kernel asm")
+    parser.add_argument("--debug", action="store_true",
+                        help="Print intermediate values and full asm (implies --grid)")
+    parser.add_argument("--grid", action="store_true",
+                        help="Display actual/expected as 2D matrix grids")
     parser.add_argument("--config", type=int, default=None, help="Config index (default: all)")
     parser.add_argument("--tc", default="AB", help="Matrix to test: A, B, or AB (default)")
+    parser.add_argument("--list", action="store_true", help="List available configs and exit")
     args = parser.parse_args()
+
+    if args.list:
+        for i, cfg in enumerate(SCALE_ROUNDTRIP_CONFIGS):
+            print(f"  {i}: {cfg.label}  (mt_a={cfg.mt_a}, mt_b={cfg.mt_b}, "
+                  f"du={cfg.depth_u}, stride_a={cfg.stride_a}, stride_b={cfg.stride_b}, "
+                  f"mx={cfg.mxblock})")
+        sys.exit(0)
+
+    if args.debug:
+        args.grid = True
 
     if not HAS_HIP:
         print("HIP not available")
@@ -473,26 +526,79 @@ if __name__ == "__main__":
 
     for cfg in configs:
         for tc in tc_list:
-            print(f"\n{'='*50}")
-            print(f"Config: {cfg.label}, matrix: {tc}")
+            print(f"\n{'='*60}")
+            print(f"  Config: {cfg.label}, matrix: {tc}")
+            print(f"{'='*60}")
 
             with tempfile.TemporaryDirectory() as tmp_dir:
                 tmp_path = type('P', (), {'__truediv__': lambda s, n: os.path.join(tmp_dir, n)})()
-                results, expected = build_and_run_roundtrip(cfg, tc, tmp_path, debug=args.debug)
+
+                test_asm, tileInfoA, tileInfoB, kernel = generate_scale_asm(cfg)
+                kernel_asm, lds_bytes = generate_roundtrip_kernel(
+                    test_asm, tileInfoA, tileInfoB, cfg, tc, kernel)
+
+                if args.debug:
+                    print("\n--- Scale ASM (filtered) ---")
+                    print_scale_asm_only(kernel_asm)
+                    print("--- End ---")
+                    print_intermediate_values(cfg, tileInfoA, tileInfoB, tc, kernel)
+
+                tileInfo = tileInfoA if tc == 'A' else tileInfoB
+                input_size = compute_input_size(cfg, tileInfo)
+                input_data = generate_input_data(input_size)
+
+                other_tileInfo = tileInfoB if tc == 'A' else tileInfoA
+                other_input_size = compute_input_size(cfg, other_tileInfo)
+                other_input = generate_input_data(other_input_size)
+
+                if tc == 'A':
+                    input_a, input_b = input_data, other_input
+                else:
+                    input_a, input_b = other_input, input_data
+
+                label = f"scale_roundtrip_{tc}_{cfg.label}"
+                co_path = str(tmp_path / f"{label}.co")
+                asm_path = str(tmp_path / f"{label}.s")
+                with open(asm_path, "w") as f:
+                    f.write(kernel_asm)
+                assemble_kernel(kernel_asm, co_path)
+
+                results = run_roundtrip_on_gpu(co_path, input_a, input_b, cfg, lds_bytes)
+                expected = compute_expected_roundtrip(
+                    cfg, tileInfoA, tileInfoB, input_data, tc, kernel)
+
+                if args.grid:
+                    print_offset_grid(f"Scale {tc} GPU result ({cfg.label})",
+                                      results, WAVESIZE, NUM_WAVES)
+                    print_offset_grid(f"Scale {tc} EXPECTED ({cfg.label})",
+                                      expected, WAVESIZE, NUM_WAVES)
 
                 errors = 0
                 for tid in range(NUM_THREADS):
                     if results[tid] != expected[tid]:
                         errors += 1
                         if errors <= 8 or args.debug:
-                            print(f"  MISMATCH tid={tid}: got {results[tid]}, expected {expected[tid]}")
+                            print(f"  MISMATCH tid={tid}: got {results[tid]}, "
+                                  f"expected {expected[tid]}")
 
                 if errors == 0:
                     print(f"  PASS")
                 else:
                     print(f"  FAIL: {errors} mismatches")
+                    if args.grid:
+                        diff = [("." if results[t] == expected[t]
+                                 else f"{results[t]}!={expected[t]}")
+                                for t in range(NUM_THREADS)]
+                        print(f"\n  Diff (wave x lane):")
+                        for w in range(NUM_WAVES):
+                            print(f"  w{w}: ", end="")
+                            for lane in range(WAVESIZE):
+                                tid = w * WAVESIZE + lane
+                                if diff[tid] != ".":
+                                    print(f" t{tid}:{diff[tid]}", end="")
+                            print()
                     total_errors += errors
 
-    print(f"\n{'='*50}")
+    print(f"\n{'='*60}")
     print(f"{'PASSED' if total_errors == 0 else f'FAILED ({total_errors} errors)'}")
     sys.exit(0 if total_errors == 0 else 1)
