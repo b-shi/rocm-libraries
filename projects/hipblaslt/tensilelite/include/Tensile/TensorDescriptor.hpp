@@ -468,11 +468,13 @@ namespace TensileLite
         if(decorated)
             stream << "[";
 
+        constexpr size_t packing = TypeInfo<std::remove_cv_t<T>>::Packing;
+
         if(desc.sizes()[0] > 0)
             stream << data[0];
 
-        for(size_t i = 1; i < desc.sizes()[0]; i++)
-            stream << " " << data[i];
+        for(size_t i = packing; i < desc.sizes()[0]; i += packing)
+            stream << " " << data[i / packing];
 
         if(decorated)
             stream << "]" << std::endl;
@@ -527,18 +529,20 @@ namespace TensileLite
                 stream << ")" << std::endl << "[" << std::endl;
             }
 
+            constexpr size_t packing = TypeInfo<std::remove_cv_t<T>>::Packing;
+
             for(coord[1] = 0; coord[1] < sizes[1]; coord[1]++)
             {
                 coord[0] = 0;
 
-                auto const* localPtr = data + desc.index(coord);
+                auto const* localPtr = data + desc.index(coord) / packing;
 
                 if(sizes[0] > 0)
                     stream << localPtr[0];
 
-                for(coord[0] = 1; coord[0] < sizes[0]; coord[0]++)
+                for(coord[0] = packing; coord[0] < sizes[0]; coord[0] += packing)
                 {
-                    stream << " " << localPtr[coord[0] * stride0];
+                    stream << " " << localPtr[coord[0] * stride0 / packing];
                 }
 
                 stream << std::endl;
