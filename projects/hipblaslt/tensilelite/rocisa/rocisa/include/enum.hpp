@@ -102,7 +102,7 @@ namespace rocisa
         case DataType::BFloat8Float8:
             return 1;
         case DataType::Float4:
-            return 1;
+            return 1; // 4-bit type; int return type cannot represent 0.5
         default:
             return -1; // Invalid type
         }

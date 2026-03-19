@@ -211,7 +211,7 @@ def compute_expected_scale_gr_offset(thread_id, cfg, tileInfo):
     return [base]
 
 
-SCALE_TILE_CONFIGS = [
+SCALE_GR_TILE_CONFIGS = [
     # 2x2 configs
     TileConfig(mt_a=256, mt_b=256, depth_u=64, stride_a=4096, stride_b=1024, mxblock=32),
     TileConfig(mt_a=256, mt_b=256, depth_u=128, stride_a=4096, stride_b=1024, mxblock=32),
@@ -226,7 +226,7 @@ SCALE_TILE_CONFIGS = [
 @pytest.mark.skipif(not HAS_HIP, reason="HIP Python bindings not available")
 class TestGraTileAssignmentScaleGPU:
 
-    @pytest.fixture(params=SCALE_TILE_CONFIGS, ids=lambda c: c.label)
+    @pytest.fixture(params=SCALE_GR_TILE_CONFIGS, ids=lambda c: c.label)
     def gra_scale_env(self, request, tmp_path):
         cfg = request.param
         gra_asm, tileInfoA, tileInfoB, kernel = generate_gra_scale_asm(cfg)

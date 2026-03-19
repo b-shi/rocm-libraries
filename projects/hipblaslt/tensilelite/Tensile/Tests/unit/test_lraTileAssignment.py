@@ -308,11 +308,12 @@ def compute_expected_scale_lr_offset(thread_id, cfg, tileInfo, otherTileInfo):
     # LDS base offsets: scale A after data A+B, scale B after data A+B + aligned(scaleA)
     dataLdsSize = cfg.mt_a * cfg.depth_u * BPE + cfg.mt_b * cfg.depth_u * BPE
     numWaves = NUM_WAVES
-    ldsAlignment = WAVESIZE * numWaves * (otherTileInfo.scaleLoadWidth if otherTileInfo.mxBlock > 0 else 1)
 
     if tileInfo.tc == 'A':
         baseLdsOffset = dataLdsSize
     else:
+        # Alignment uses tileInfoA's scaleLoadWidth (matching production code)
+        ldsAlignment = WAVESIZE * numWaves * (otherTileInfo.scaleLoadWidth if otherTileInfo.mxBlock > 0 else 1)
         scaleASize = cfg.mt_a * otherTileInfo.scaleDepthU * otherTileInfo.scaleBpe if otherTileInfo.mxBlock > 0 else 0
         scaleAAligned = ((scaleASize + ldsAlignment - 1) // ldsAlignment) * ldsAlignment if scaleASize > 0 else 0
         baseLdsOffset = dataLdsSize + scaleAAligned
@@ -323,7 +324,7 @@ def compute_expected_scale_lr_offset(thread_id, cfg, tileInfo, otherTileInfo):
     return offsets
 
 
-SCALE_TILE_CONFIGS = [
+SCALE_LR_TILE_CONFIGS = [
     # 2x2 configs
     TileConfig(mt_a=256, mt_b=256, depth_u=64, mxblock=32),
     TileConfig(mt_a=256, mt_b=256, depth_u=128, mxblock=32),
@@ -338,7 +339,7 @@ SCALE_TILE_CONFIGS = [
 @pytest.mark.skipif(not HAS_HIP, reason="HIP Python bindings not available")
 class TestLraTileAssignmentScaleGPU:
 
-    @pytest.fixture(params=SCALE_TILE_CONFIGS, ids=lambda c: c.label)
+    @pytest.fixture(params=SCALE_LR_TILE_CONFIGS, ids=lambda c: c.label)
     def lra_scale_env(self, request, tmp_path):
         cfg = request.param
         lra_asm, tileInfoA, tileInfoB, kernel = generate_lra_scale_asm(cfg)
