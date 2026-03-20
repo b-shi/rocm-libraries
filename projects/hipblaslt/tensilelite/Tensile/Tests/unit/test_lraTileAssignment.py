@@ -276,11 +276,20 @@ class TestLraTileAssignmentGPU:
 # ---- Scale LR tests ----
 
 def generate_lra_scale_asm(cfg):
-    """Run lraTileAssignmentScaleSwizzled and return (asm, tileInfoA, tileInfoB, kernel)."""
-    writer, kernel, tileInfoA, tileInfoB = create_writer_for_gpu(cfg)
+    """Run lraTileAssignmentScaleSwizzled and return (asm, writer, tileInfoA, tileInfoB, kernel)."""
+    writer, kernel, tileInfoA, tileInfoB = create_writer(cfg)
     init_rocisa()
+
+    writer.sgprPool.checkOut(12)
+    writer.sgprs["StrideA0I"] = 10
+    writer.sgprs["StrideB1J"] = 11
+    tileInfoA.allocOffsetRegisters(writer, kernel)
+    tileInfoB.allocOffsetRegisters(writer, kernel)
+
+    prologue = generate_load_params(EXPORT_LOAD_PARAMS)
     module = lraTileAssignmentScaleSwizzled(writer, kernel)
-    return str(module), tileInfoA, tileInfoB, kernel
+    lra_asm = f"{prologue}\n{module}"
+    return lra_asm, writer, tileInfoA, tileInfoB, kernel
 
 
 def compute_expected_scale_lr_offset(thread_id, cfg, tileInfo, otherTileInfo):
@@ -377,10 +386,11 @@ class TestLraTileAssignmentScaleGPU:
     @pytest.fixture(params=SCALE_LR_TILE_CONFIGS, ids=lambda c: c.label)
     def lra_scale_env(self, request, tmp_path):
         cfg = request.param
-        lra_asm, tileInfoA, tileInfoB, kernel = generate_lra_scale_asm(cfg)
+        lra_asm, writer, tileInfoA, tileInfoB, kernel = generate_lra_scale_asm(cfg)
         return SimpleNamespace(
             cfg=cfg,
             lra_asm=lra_asm,
+            writer=writer,
             tileInfoA=tileInfoA,
             tileInfoB=tileInfoB,
             kernel=kernel,
@@ -393,9 +403,9 @@ class TestLraTileAssignmentScaleGPU:
         tileInfoA = lra_scale_env.tileInfoA
         tileInfoB = lra_scale_env.tileInfoB
         reg = tileInfoA.sharedVgprLROffset[0]
-        results = build_and_run(lra_scale_env.lra_asm, reg, False, cfg,
-                                lra_scale_env.tmp_path,
-                                f"scaleLR_A_v{reg}_{cfg.label}")
+        results = export_register(lra_scale_env.writer, lra_scale_env.lra_asm, reg, False,
+                                  cfg, lra_scale_env.tmp_path,
+                                  f"scaleLR_A_v{reg}_{cfg.label}")
         for tid in range(NUM_THREADS):
             expected = compute_expected_scale_lr_offset(tid, cfg, tileInfoA, tileInfoB)
             assert results[tid] == expected[0], \
@@ -408,9 +418,9 @@ class TestLraTileAssignmentScaleGPU:
         tileInfoA = lra_scale_env.tileInfoA
         tileInfoB = lra_scale_env.tileInfoB
         reg = tileInfoB.sharedVgprLROffset[0]
-        results = build_and_run(lra_scale_env.lra_asm, reg, False, cfg,
-                                lra_scale_env.tmp_path,
-                                f"scaleLR_B_v{reg}_{cfg.label}")
+        results = export_register(lra_scale_env.writer, lra_scale_env.lra_asm, reg, False,
+                                  cfg, lra_scale_env.tmp_path,
+                                  f"scaleLR_B_v{reg}_{cfg.label}")
         for tid in range(NUM_THREADS):
             expected = compute_expected_scale_lr_offset(tid, cfg, tileInfoB, tileInfoA)
             assert results[tid] == expected[0], \

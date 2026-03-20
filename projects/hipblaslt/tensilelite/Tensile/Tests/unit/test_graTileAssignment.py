@@ -261,11 +261,20 @@ class TestGraTileAssignmentGPU:
 # ---- Scale GR tests ----
 
 def generate_gra_scale_asm(cfg):
-    """Run graTileAssignmentScaleSwizzled and return (asm, tileInfoA, tileInfoB, kernel)."""
-    writer, kernel, tileInfoA, tileInfoB = create_writer_for_gpu(cfg)
+    """Run graTileAssignmentScaleSwizzled and return (asm, writer, tileInfoA, tileInfoB, kernel)."""
+    writer, kernel, tileInfoA, tileInfoB = create_writer(cfg)
     init_rocisa()
+
+    writer.sgprPool.checkOut(12)
+    writer.sgprs["StrideA0I"] = 10
+    writer.sgprs["StrideB1J"] = 11
+    tileInfoA.allocOffsetRegisters(writer, kernel)
+    tileInfoB.allocOffsetRegisters(writer, kernel)
+
+    prologue = generate_load_params(EXPORT_LOAD_PARAMS)
     module = graTileAssignmentScaleSwizzled(writer, kernel)
-    return str(module), tileInfoA, tileInfoB, kernel
+    gra_asm = f"{prologue}\n{module}"
+    return gra_asm, writer, tileInfoA, tileInfoB, kernel
 
 
 def compute_expected_scale_gr_offset(thread_id, cfg, tileInfo):
@@ -312,10 +321,11 @@ class TestGraTileAssignmentScaleGPU:
     @pytest.fixture(params=SCALE_GR_TILE_CONFIGS, ids=lambda c: c.label)
     def gra_scale_env(self, request, tmp_path):
         cfg = request.param
-        gra_asm, tileInfoA, tileInfoB, kernel = generate_gra_scale_asm(cfg)
+        gra_asm, writer, tileInfoA, tileInfoB, kernel = generate_gra_scale_asm(cfg)
         return SimpleNamespace(
             cfg=cfg,
             gra_asm=gra_asm,
+            writer=writer,
             tileInfoA=tileInfoA,
             tileInfoB=tileInfoB,
             kernel=kernel,
@@ -327,9 +337,9 @@ class TestGraTileAssignmentScaleGPU:
         cfg = gra_scale_env.cfg
         tileInfo = gra_scale_env.tileInfoA
         reg = tileInfo.sharedVgprGROffset[0]
-        results = build_and_run(gra_scale_env.gra_asm, reg, False, cfg,
-                                gra_scale_env.tmp_path,
-                                f"scaleGR_A_v{reg}_{cfg.label}")
+        results = export_register(gra_scale_env.writer, gra_scale_env.gra_asm, reg, False,
+                                  cfg, gra_scale_env.tmp_path,
+                                  f"scaleGR_A_v{reg}_{cfg.label}")
         for tid in range(NUM_THREADS):
             expected = compute_expected_scale_gr_offset(tid, cfg, tileInfo)
             assert results[tid] == expected[0], \
@@ -341,9 +351,9 @@ class TestGraTileAssignmentScaleGPU:
         cfg = gra_scale_env.cfg
         tileInfo = gra_scale_env.tileInfoB
         reg = tileInfo.sharedVgprGROffset[0]
-        results = build_and_run(gra_scale_env.gra_asm, reg, False, cfg,
-                                gra_scale_env.tmp_path,
-                                f"scaleGR_B_v{reg}_{cfg.label}")
+        results = export_register(gra_scale_env.writer, gra_scale_env.gra_asm, reg, False,
+                                  cfg, gra_scale_env.tmp_path,
+                                  f"scaleGR_B_v{reg}_{cfg.label}")
         for tid in range(NUM_THREADS):
             expected = compute_expected_scale_gr_offset(tid, cfg, tileInfo)
             assert results[tid] == expected[0], \

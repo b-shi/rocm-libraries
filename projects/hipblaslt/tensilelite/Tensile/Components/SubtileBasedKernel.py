@@ -1124,8 +1124,8 @@ def lraTileAssignmentScaleSwizzled(writer, kernel):
   # Compute LDS layout sizes with alignment
   MT0A = tileInfoA.globalMMATileGrid[0] * tileInfoA.mmaTileShape[0]
   MT0B = tileInfoB.globalMMATileGrid[0] * tileInfoB.mmaTileShape[0]
-  dataLdsSize = (MT0A * kernel["DepthU"] * tileInfoA.bpe) + \
-                (MT0B * kernel["DepthU"] * tileInfoB.bpe)
+  dataLdsSize = int((MT0A * kernel["DepthU"] * tileInfoA.bpe) + \
+                    (MT0B * kernel["DepthU"] * tileInfoB.bpe))
   numWaves = kernel["MIWaveGroup"][0] * kernel["MIWaveGroup"][1]
   scaleALdsRaw = MT0A * tileInfoA.scaleDepthU * tileInfoA.scaleBpe if tileInfoA.mxBlock > 0 else 0
   ldsAlignment = wavesize * numWaves * (tileInfoA.scaleLoadWidth if tileInfoA.mxBlock > 0 else 1)
