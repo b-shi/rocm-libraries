@@ -6113,7 +6113,8 @@ class KernelWriter(metaclass=abc.ABCMeta):
     tensorParametersB["PackedIndices"] = kernel["PackedC%uIndicesX"%tensorParametersB["tile01Idx"]]
 
     tensorParametersMXSA = None
-    if kernel["ProblemType"]["MXBlockA"]:
+    tensorParametersA["MX"] = None
+    if kernel["ProblemType"]["MXBlockA"] and not kernel["UseSubtileImpl"]:
       itP["MXSA"] = readWriteVectors("MXSA", vwmxsa, kernel)
       tensorParametersMXSA = {}
       self.getTensorParameters(tensorParametersMXSA, kernel, itP, "MXSA")
@@ -6121,7 +6122,8 @@ class KernelWriter(metaclass=abc.ABCMeta):
       tensorParametersA["MX"] = tensorParametersMXSA
 
     tensorParametersMXSB = None
-    if kernel["ProblemType"]["MXBlockB"]:
+    tensorParametersB["MX"] = None
+    if kernel["ProblemType"]["MXBlockB"] and not kernel["UseSubtileImpl"]:
       itP["MXSB"] = readWriteVectors("MXSB", vwmxsb, kernel)
       tensorParametersMXSB = {}
       self.getTensorParameters(tensorParametersMXSB, kernel, itP, "MXSB")
@@ -6619,7 +6621,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
       else:
         statesMXSANumVgprG2LAllocated = statesMXSANumVgprG2L
 
-      if (not kernel["DirectToLdsMXSA"] or self.do["KeepDirectToLdsAlloc"]) and not kernel["enableTDMA"]:
+      if (not kernel["DirectToLdsMXSA"] or self.do["KeepDirectToLdsAlloc"]) and not kernel["enableTDMA"] and not kernel["UseSubtileImpl"]:
         self.states.mxsa.numVgprG2L = statesMXSANumVgprG2L
         self.states.mxsa.numVgprG2LAllocated = statesMXSANumVgprG2LAllocated
         self.states.mxsa.numVgprG2LTailloopAllocated = self.states.mxsa.numVgprG2LAllocated
@@ -6705,7 +6707,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
       else:
         statesMXSBNumVgprG2LAllocated = statesMXSBNumVgprG2L
 
-      if (not kernel["DirectToLdsMXSB"] or self.do["KeepDirectToLdsAlloc"]) and not kernel["enableTDMB"]:
+      if (not kernel["DirectToLdsMXSB"] or self.do["KeepDirectToLdsAlloc"]) and not kernel["enableTDMB"] and not kernel["UseSubtileImpl"]:
         self.states.mxsb.numVgprG2L = statesMXSBNumVgprG2L
         self.states.mxsb.numVgprG2LAllocated = statesMXSBNumVgprG2LAllocated
         self.states.mxsb.numVgprG2LTailloopAllocated = self.states.mxsb.numVgprG2LAllocated
@@ -6930,6 +6932,13 @@ class KernelWriter(metaclass=abc.ABCMeta):
       else:
         numVgprGlobalReadIncsMXSA = 0
 
+      # num vgprs: global read addresses MXSA
+      if kernel["ProblemType"]["MXBlockA"] and not kernel["UseSubtileImpl"]:
+        numGlobalReadsMXSA = kernel["NumLoadsCoalescedMXSA"] \
+            * kernel["NumLoadsPerpendicularMXSA"] * kernel["GlobalReadVectorWidthMXSA"]
+        numGlobalReadInstructionsMXSA = int(numGlobalReadsMXSA / \
+            (tensorParametersMXSA["globalReadInstruction"].blockWidth * 4))
+
     # num vgprs: global read addresses B
     numGlobalReadsB = kernel["NumLoadsCoalescedB"] \
         * kernel["NumLoadsPerpendicularB"] * kernel["GlobalReadVectorWidthB"]
@@ -6967,6 +6976,12 @@ class KernelWriter(metaclass=abc.ABCMeta):
             * self.states.rpga
       else:
         numVgprGlobalReadIncsMXSB = 0
+
+      if kernel["ProblemType"]["MXBlockB"] and not kernel["UseSubtileImpl"]:
+        numGlobalReadsMXSB = kernel["NumLoadsCoalescedMXSB"] \
+            * kernel["NumLoadsPerpendicularMXSB"] * kernel["GlobalReadVectorWidthMXSB"]
+        numGlobalReadInstructionsMXSB = int(numGlobalReadsMXSB / \
+            (tensorParametersMXSB["globalReadInstruction"].blockWidth * 4))
 
     # num vgprs: global read addresses M
     if tensorParametersM is not None:
@@ -8188,7 +8203,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
         numA = numA // kernel["VectorWidthA"]
       if kernel["ForceUnrollSubIter"]:
         numA = numA // factorSubIterA
-      if kernel["ProblemType"]["MXBlockA"]:
+      if kernel["ProblemType"]["MXBlockA"] and not kernel["UseSubtileImpl"]:
         self.states.numReadsPerUnrollMXSA = 1
         numMXSA = kernel["InnerUnroll"] * kernel["MIWaveTile"][0] // tensorParametersMXSA["localReadInstruction"].numOffsets
         if self.states.lrvwTileMXSA > 1:
@@ -8226,7 +8241,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
         numB = numB // kernel["VectorWidthB"]
       if kernel["ForceUnrollSubIter"]:
         numB = numB // factorSubIterB
-      if kernel["ProblemType"]["MXBlockB"]:
+      if kernel["ProblemType"]["MXBlockB"] and not kernel["UseSubtileImpl"]:
         self.states.numReadsPerUnrollMXSB = 1
         numMXSB = kernel["InnerUnroll"] * kernel["MIWaveTile"][1] // tensorParametersMXSB["localReadInstruction"].numOffsets
         if self.states.lrvwTileMXSB > 1:
@@ -8247,7 +8262,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
       # 2. using larger PLR to read more iterations, same number local reads in 1 iteration
       if kernel["InnerUnroll"] >= self.states.numReadsIterCoalescedA:
         numA //= self.states.numReadsIterCoalescedA
-      if kernel["ProblemType"]["MXBlockA"]:
+      if kernel["ProblemType"]["MXBlockA"] and not kernel["UseSubtileImpl"]:
         if kernel["InnerUnroll"] >= self.states.numReadsIterCoalescedMXSA:
           numMXSA //= self.states.numReadsIterCoalescedMXSA
       if kernel["ProblemType"]["Sparse"] and not kernel["DirectToVgprSparseMetadata"]:
@@ -8255,7 +8270,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
           numM //= self.states.numReadsIterCoalescedMetadata
       if kernel["InnerUnroll"] >= self.states.numReadsIterCoalescedB:
         numB //= self.states.numReadsIterCoalescedB
-      if kernel["ProblemType"]["MXBlockB"]:
+      if kernel["ProblemType"]["MXBlockB"] and not kernel["UseSubtileImpl"]:
         if kernel["InnerUnroll"] >= self.states.numReadsIterCoalescedMXSB:
           numMXSB //= self.states.numReadsIterCoalescedMXSB
 
@@ -8270,18 +8285,18 @@ class KernelWriter(metaclass=abc.ABCMeta):
 
     if not kernel["DirectToVgprA"]:
       self.states.numReadsPerIterA = numA
-      if kernel["ProblemType"]["MXBlockA"]:
+      if kernel["ProblemType"]["MXBlockA"] and not kernel["UseSubtileImpl"]:
         self.states.numReadsPerIterMXSA = numMXSA
     if not kernel["DirectToVgprB"]:
       self.states.numReadsPerIterB = numB
-      if kernel["ProblemType"]["MXBlockB"]:
+      if kernel["ProblemType"]["MXBlockB"] and not kernel["UseSubtileImpl"]:
         self.states.numReadsPerIterMXSB = numMXSB
 
     self.states.localReadDoCntA = 0
-    if kernel["ProblemType"]["MXBlockA"]:
+    if kernel["ProblemType"]["MXBlockA"] and not kernel["UseSubtileImpl"]:
       self.states.localReadDoCntMXSA = 0
     self.states.localReadDoCntB = 0
-    if kernel["ProblemType"]["MXBlockB"]:
+    if kernel["ProblemType"]["MXBlockB"] and not kernel["UseSubtileImpl"]:
       self.states.localReadDoCntMXSB = 0
     if kernel["ProblemType"]["Sparse"] and not kernel["DirectToVgprSparseMetadata"]:
       self.states.numReadsPerIterMetadata = numM
