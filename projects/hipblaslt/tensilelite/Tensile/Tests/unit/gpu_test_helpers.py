@@ -124,11 +124,7 @@ def _create_kernel(cfg):
         "MatrixInstK": 32,
         "MIWaveGroup": MIWaveGroup,
         "WavefrontSize": WAVESIZE,
-        "ProblemType": {
-            "DataTypeA": dtype,
-            "DataTypeB": dtype,
-            "ComputeDataType": _mock_dtype(4),
-        },
+        "ProblemType": problemType,
     }
 
 
@@ -503,6 +499,8 @@ def assemble_and_run(asm, tmp_path, label, output_size, inputs=(), scalars=(), l
         f.write(asm)
     assemble_kernel(asm, co_path)
     return run_on_gpu(co_path, output_size, inputs=inputs, scalars=scalars, lds_size=lds_size)
+
+
 
 # ---- Utilities ----
 

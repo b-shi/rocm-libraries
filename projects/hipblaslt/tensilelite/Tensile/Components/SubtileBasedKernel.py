@@ -457,30 +457,12 @@ class TileInfo:
         if vtiles.index(vval) % 4 == 0:
           pool.checkIn(vval)
 
-def _applySplitOffset(module, writer, kernel, tileInfo, lane16):
-  tc = tileInfo.tc
-  if tileInfo.loadRatioGR <= 1.0:
-    wavesize = kernel["WavefrontSize"]
-    depthUBytes = kernel["DepthU"] * tileInfo.bpe
-    loadWidth = tileInfo.mmaTileShape[0] * tileInfo.mmaTileShape[1] * tileInfo.bpe // wavesize
-    blockSize = depthUBytes // loadWidth
-    numRowsPerWave = wavesize // blockSize
-    offset = wavesize * loadWidth // 2  # bytes_loaded // 2
-
-    splitOffset = writer.vgprPool.checkOut(1)
-    module.add(VLShiftRightB32(dst=vgpr(splitOffset), shiftHex=hex((numRowsPerWave//2).bit_length()-1), src=vgpr(lane16), comment="%s: check 2nd half wave"%tc))
-    module.add(VLShiftLeftB32(dst=vgpr(splitOffset), shiftHex=hex(offset.bit_length()-1), src=vgpr(splitOffset), comment="%s: x splitOffset"%tc))
-    for vgprId in range(0, len(tileInfo.sharedVgprLROffset)):
-      module.add(VAddU32(dst=vgpr(tileInfo.sharedVgprLROffset[vgprId]), src0=vgpr(tileInfo.sharedVgprLROffset[vgprId]), src1=vgpr(splitOffset), comment="%s: +=splitOffset"%tc))
-    writer.vgprPool.checkIn(splitOffset)
-
 def _computeLROffset(module, kernel, tileInfo, colOffset, rowOffset):
   tc = tileInfo.tc
   wavesize = kernel["WavefrontSize"]
   depthUBytes = tileInfo.depthUBytes
   loadWidth = tileInfo.loadWidthLR
   numMFMACols = int(tileInfo.mmaTileShape[1] * tileInfo.bpe) // loadWidth  # TN case only
-
   blockSize = depthUBytes // loadWidth
 
   module.add(VMovB32(dst=vgpr(tileInfo.sharedVgprLROffset[0]), src=vgpr(colOffset), comment="%s: laneId"%tc))
@@ -870,6 +852,65 @@ def _grSwizzleColIds(module, writer, tileInfoA, tileInfoB, blockSize, numRowsPer
   module.add(VAndB32(dst=vgpr(colIdB), src0=vgpr(colIdB), src1=hex(blockSize-1), comment="(col + offset) % block_size"))
   writer.vgprPool.checkIn(tmpVgpr)
 
+# Subroutine to generate GR offset calculation code
+#
+def graTileAssignment(writer, kernel, useSwizzling=True):
+  module = Module()
+  module.addComment0("GR Offset Calculation for Subtile Based Tiling")
+  
+  tileInfoA = writer.states.a.tileInfo
+  tileInfoB = writer.states.b.tileInfo
+  
+  # Input Parameters.
+  depthUBytes = tileInfoA.depthUBytes
+  wavesize = kernel["WavefrontSize"]
+  ldsRowBankSize = 64 * 4 # 64 banks, 4 bytes per bank.
+
+  assert depthUBytes % 128 == 0, "Only support depthUBytes multiple of 128 for now"
+  assert depthUBytes <= ldsRowBankSize, "Only support depthUBytes smaller than %u (lds row bank size) for now"%ldsRowBankSize
+
+  loadWidth = 16 # dwordx4 loads only
+  blockSize = depthUBytes // loadWidth
+
+  numRowsPerLDSBanks = ldsRowBankSize // depthUBytes
+
+  tmpVgpr = writer.vgprPool.checkOut(7)
+  colIdA = tmpVgpr
+  colIdB = tmpVgpr + 1
+  rowId = tmpVgpr + 2
+  rowOffsetA = tmpVgpr + 3
+  rowOffsetB = tmpVgpr + 4
+  waveId = tmpVgpr + 5
+  laneId = tmpVgpr + 6
+
+  # Compute waveId and laneId
+  module.add(VLShiftRightB32(dst=vgpr(waveId), shiftHex=hex(wavesize.bit_length()-1), src=vgpr("Serial"), comment="Wave Id"))
+  module.add(VAndB32(dst=vgpr(laneId), src0=vgpr("Serial"), src1=wavesize-1, comment=""))
+  # Common code for both A & B
+  # Calculate col and row id within a wave for 128b loads
+  module.add(VAndB32(dst=vgpr(colIdA), src0=vgpr("Serial"), src1=(blockSize-1), comment="get col_id in wave for %uB load"%loadWidth))
+  module.add(VLShiftRightB32(dst=vgpr(rowId), shiftHex=hex(blockSize.bit_length()-1), src=vgpr(laneId), comment="row id within wave"))
+
+  # Apply swizzling and rotation to colId for A and B
+  _grSwizzleColIds(module, writer, tileInfoA, tileInfoB, blockSize, numRowsPerLDSBanks,
+                   laneId, colIdA, colIdB, waveId)
+    
+  # Compute rowOffsetA and rowOffsetB row offset based on wave partitioning (e.g. 2x2, 4x1/1x4)
+  _grComputeRowPartition(module, kernel, writer, tileInfoA, waveId, rowOffsetA)
+  _grComputeRowPartition(module, kernel, writer, tileInfoB, waveId, rowOffsetB)
+
+  # Compute GR offset for A and B
+  _grComputeAllOffsets(module, writer, tileInfoA, colIdA, rowId, rowOffsetA)
+  _grComputeAllOffsets(module, writer, tileInfoB, colIdB, rowId, rowOffsetB)
+
+  writer.vgprPool.checkIn(tmpVgpr)
+
+  # Compute subtile offsets for A and B
+  _grComputeSubtileOffsets(writer, module, tileInfoA)
+  _grComputeSubtileOffsets(writer, module, tileInfoB)
+
+  return module
+
 ##################################################
 # Generate GR offset calculation for scaleA/B (DTL).
 #
@@ -926,7 +967,6 @@ def graTileAssignmentScaleSwizzled(writer, kernel):
     _grScaleComputeOffset(module, writer, tileInfoB, col_id, row_id)
 
   writer.vgprPool.checkIn(tmpVgpr)
-
   return module
 
 
@@ -1105,60 +1145,6 @@ def lraTileAssignmentScaleSwizzled(writer, kernel):
     
   return module
 
-# Subroutine to generate GR offset calculation code
-#
-def graTileAssignment(writer, kernel, useSwizzling=True):
-  module = Module()
-  module.addComment0("GR Offset Calculation for Subtile Based Tiling")
-  # Input Parameters.
-  depthUBytes = tileInfoA.depthUBytes
-  wavesize = kernel["WavefrontSize"]
-  ldsRowBankSize = 64 * 4 # 64 banks, 4 bytes per bank.
-
-  assert depthUBytes % 128 == 0, "Only support depthUBytes multiple of 128 for now"
-  assert depthUBytes <= ldsRowBankSize, "Only support depthUBytes smaller than %u (lds row bank size) for now"%ldsRowBankSize
-
-  loadWidth = 16 # dwordx4 loads only
-  blockSize = depthUBytes // loadWidth
-
-  numRowsPerLDSBanks = ldsRowBankSize // depthUBytes
-
-  tmpVgpr = writer.vgprPool.checkOut(7)
-  colIdA = tmpVgpr
-  colIdB = tmpVgpr + 1
-  rowId = tmpVgpr + 2
-  rowOffsetA = tmpVgpr + 3
-  rowOffsetB = tmpVgpr + 4
-  waveId = tmpVgpr + 5
-  laneId = tmpVgpr + 6
-
-  # Compute waveId and laneId
-  module.add(VLShiftRightB32(dst=vgpr(waveId), shiftHex=hex(wavesize.bit_length()-1), src=vgpr("Serial"), comment="Wave Id"))
-  module.add(VAndB32(dst=vgpr(laneId), src0=vgpr("Serial"), src1=wavesize-1, comment=""))
-  # Common code for both A & B
-  # Calculate col and row id within a wave for 128b loads
-  module.add(VAndB32(dst=vgpr(colIdA), src0=vgpr("Serial"), src1=(blockSize-1), comment="get col_id in wave for %uB load"%loadWidth))
-  module.add(VLShiftRightB32(dst=vgpr(rowId), shiftHex=hex(blockSize.bit_length()-1), src=vgpr(laneId), comment="row id within wave"))
-
-  # Apply swizzling and rotation to colId for A and B
-  _grSwizzleColIds(module, writer, tileInfoA, tileInfoB, blockSize, numRowsPerLDSBanks,
-                   laneId, colIdA, colIdB, waveId)
-    
-  # Compute rowOffsetA and rowOffsetB row offset based on wave partitioning (e.g. 2x2, 4x1/1x4)
-  _grComputeRowPartition(module, kernel, writer, tileInfoA, waveId, rowOffsetA)
-  _grComputeRowPartition(module, kernel, writer, tileInfoB, waveId, rowOffsetB)
-
-  # Compute GR offset for A and B
-  _grComputeAllOffsets(module, writer, tileInfoA, colIdA, rowId, rowOffsetA)
-  _grComputeAllOffsets(module, writer, tileInfoB, colIdB, rowId, rowOffsetB)
-
-  writer.vgprPool.checkIn(tmpVgpr)
-
-  # Compute subtile offsets for A and B
-  _grComputeSubtileOffsets(writer, module, tileInfoA)
-  _grComputeSubtileOffsets(writer, module, tileInfoB)
-
-  return module
 
 ##################################################
 # Subroutine to generate GR load code
@@ -1420,7 +1406,7 @@ def mainLoopImpl(writer, kernel, isNLL = False):
     module.add(globalReadDoSubtile('A', writer, kernel))
     module.add(globalReadDoSubtile('B', writer, kernel))
     module.add(SWaitCnt(dscnt=-1, vlcnt=0, vscnt=-1, comment="Wait for all subtile GRs to complete"))
-    module.add(SBarrier(comment="")) 
+    module.add(SBarrier(comment=""))
  
 
   module.add(localReadDoSubtile('A', writer, kernel))
