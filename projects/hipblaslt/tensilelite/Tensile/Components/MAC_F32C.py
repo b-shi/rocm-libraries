@@ -28,7 +28,8 @@ from ..Common.DataType import DataType
 from ..Component import Component, MAC
 
 class MAC_F32C_Plain(MAC):
-    kernel = {"ProblemType": {"DataType": DataType(DataTypeEnum.ComplexFloat)}}
+    kernel = {"ProblemType": {"MacDataTypeA": DataType(DataTypeEnum.ComplexFloat),
+                              "MacDataTypeB": DataType(DataTypeEnum.ComplexFloat)}}
 
     def __call__(self, writer, m, innerUnroll):
         kernel = writer.states.kernel

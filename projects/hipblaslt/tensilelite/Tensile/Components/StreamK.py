@@ -126,10 +126,13 @@ class StreamK(Component):
         if kernel["PrefetchGlobalRead"]: # not self.prefetchAcrossPersistent
             if not kernel["UseSubtileImpl"]:
                 module.add(writer.localReadResetOffsets(kernel, tPA))
+                if kernel["ProblemType"]["MXBlockA"]:
+                    module.add(writer.localReadResetOffsets(kernel, tPA["MX"]))
                 module.add(writer.localReadResetOffsets(kernel, tPB))
+                if kernel["ProblemType"]["MXBlockB"]:
+                    module.add(writer.localReadResetOffsets(kernel, tPB["MX"]))
             else:
                 module.add(localReadResetOffsetsSubtile(writer, kernel))
-        
 
         module.addComment0("StreamK calculate tile idx and map to WG")
 
@@ -181,15 +184,23 @@ class StreamK(Component):
         return module
 
     @abc.abstractmethod
-    def computeLoadSrd(self, writer, kernel, tc, sTmp):
+    def computeLoadSrd(self, writer, kernel, tP, sTmp):
         pass
 
-    def computeLoadSrdCommon(self, writer, kernel, tc, sTmp):
+    def computeLoadSrdCommon(self, writer, kernel, tP, sTmp):
         module = Module("StreamK Common computeLoadSrd")
+
+        tc = tP["tensorChar"]
+        _DepthU = kernel["_DepthU%s" % tc]
+        # swizzle
+        if (tP["isSwizzled"] and tc == 'A'):
+            _DepthU = (_DepthU * 16)
+        elif (tP["isSwizzled"] and tc == 'B'):
+            _DepthU = (_DepthU * 16)
 
         tileStart = sTmp + 2
         # StreamK partial tile - offset to tile start index
-        module.add(SMulI32(dst=sgpr(sTmp), src0=sgpr("StreamKLocalStart"), src1="DepthU", comment="StreamK tile start offset"))
+        module.add(SMulI32(dst=sgpr(sTmp), src0=sgpr("StreamKLocalStart"), src1=_DepthU, comment="StreamK tile start offset"))
         strideL = writer.strideRef(tc, kernel["ProblemType"]["IndicesSummation"][0])
         module.add(writer.s_mul_u64_u32(sgpr(sTmp), sgpr(sTmp+1), sgpr(sTmp), strideL, comment="StreamK tile start offset"))
         # Overflow check removed
@@ -260,9 +271,16 @@ class StreamK(Component):
         module = Module("StreamK Common graAddresses")
 
         tc = tP["tensorChar"]
+        _DepthU = kernel["_DepthU%s" % tc]
+        # swizzle
+        if (tP["isSwizzled"] and tc == 'A'):
+            _DepthU = (_DepthU * 16)
+        elif (tP["isSwizzled"] and tc == 'B'):
+            _DepthU = (_DepthU * 16)
+
         # StreamK partial tile - offset to tile start index
         tmpOffset = writer.sgprPool.checkOut(2, "skStartOffset")
-        module.add(SMulI32(dst=sgpr(tmpOffset), src0=sgpr("StreamKLocalStart"), src1="DepthU*%d" % (tP["bpe"]), comment="StreamK tile start offset"))
+        module.add(SMulI32(dst=sgpr(tmpOffset), src0=sgpr("StreamKLocalStart"), src1=int(_DepthU * tP["bpe"]), comment="StreamK tile start offset"))
         strideL = writer.strideRef(tc, kernel["ProblemType"]["IndicesSummation"][0])
         module.add(writer.s_mul_u64_u32(sgpr(tmpOffset), sgpr(tmpOffset+1), sgpr(tmpOffset), strideL, "StreamK tile start offset"))
         # Overflow check removed
@@ -697,9 +715,9 @@ class StreamK(Component):
         # TODO: Minimum elems for StoreRemap
         # TODO: Which of DataType or DestDataType is in a better sense? 0114: Check Using DestDataType + HSS
         minElements = 1
-        if kernel["ProblemType"]["DataType"].isHalf() or kernel["ProblemType"]["DataType"].isBFloat16():
+        if kernel["ProblemType"]["MacDataTypeA"].isHalf() or kernel["ProblemType"]["MacDataTypeA"].isBFloat16():
             minElements = 2
-        elif kernel["ProblemType"]["DataType"].is8bitFloat():
+        elif kernel["ProblemType"]["MacDataTypeA"].is8bitFloat():
             # TODO STREAM-K check if needed
             minElements = 4
         minNeeded = minElements * ss.numVgprsPerElement
@@ -767,7 +785,7 @@ class StreamK(Component):
             numElementsPerBatch = ss.cfg.numElementsPerBatchLimitedBySgprs
 
         # TODO: Which of DataType or DestDataType is in a better sense? 0114: Check Using DestDataType + HSS
-        if (kernel["ProblemType"]["DataType"].isHalf() or kernel["ProblemType"]["DataType"].isBFloat16()):
+        if (kernel["ProblemType"]["MacDataTypeA"].isHalf() or kernel["ProblemType"]["MacDataTypeA"].isBFloat16()):
             # only do an even number of halves - since these share hi/lo pieces of some registers?
             if numElementsPerBatch > 1:
                 numElementsPerBatch = int(numElementsPerBatch/2)*2
@@ -782,7 +800,7 @@ class StreamK(Component):
                 if shrinkDb:
                     print("WARNING: half requires at least two elements per batch")
                 self.overflowedResources = 3
-        #elif kernel["ProblemType"]["DataType"].is8bitFloat():
+        #elif kernel["ProblemType"]["MacDataTypeA"].is8bitFloat():
         #    if numElementsPerBatch > 1:
         #        numElementsPerBatch = int(numElementsPerBatch/4)*4
 
@@ -1012,8 +1030,9 @@ class StreamK(Component):
             element = batchElements[elementIdx]
             addrCalc: AddrCalculation = ss.elementAddr[elementIdx]
             addr = addrCalc.addrDVgpr
-            sumIdx = ss.elementSumIdx[elementIdx]
-
+            # TODO: Check this later, updates vgpr indices to account for vgprValuC macro value
+            # previously this was assumes to zero. Need to check if this is the only change needed
+            sumIdx = ss.elementSumIdx[elementIdx] + writer.states.c.startVgprValu
             storeWidth = kernel["StoreVectorWidth"]
             # storeWidth = 2
             if batchIdx == 0 and elementIdx == 0:
@@ -1167,9 +1186,9 @@ class StreamK(Component):
             # TODO: Minimum elems for StoreRemap
             # TODO: Which of DataType or DestDataType is in a better sense? 0114: Check Using DestDataType + HSS
             minElements = 1
-            if kernel["ProblemType"]["DataType"].isHalf() or kernel["ProblemType"]["DataType"].isBFloat16():
+            if kernel["ProblemType"]["MacDataTypeA"].isHalf() or kernel["ProblemType"]["MacDataTypeA"].isBFloat16():
                 minElements = 2
-            elif kernel["ProblemType"]["DataType"].is8bitFloat():
+            elif kernel["ProblemType"]["MacDataTypeA"].is8bitFloat():
                 minElements = 4
             minNeeded = minElements * ss.numVgprsPerElement
 
@@ -1232,7 +1251,7 @@ class StreamK(Component):
                 numElementsPerBatch = ss.cfg.numElementsPerBatchLimitedBySgprs
 
             # TODO: Which of DataType or DestDataType is in a better sense? 0114: Check Using DestDataType + HSS
-            if (kernel["ProblemType"]["DataType"].isHalf() or kernel["ProblemType"]["DataType"].isBFloat16()):
+            if (kernel["ProblemType"]["MacDataTypeA"].isHalf() or kernel["ProblemType"]["MacDataTypeA"].isBFloat16()):
                 # only do an even number of halves - since these share hi/lo pieces of some registers?
                 if numElementsPerBatch > 1:
                     numElementsPerBatch = int(numElementsPerBatch/2)*2
@@ -1247,7 +1266,7 @@ class StreamK(Component):
                     if shrinkDb:
                         print("WARNING: half requires at least two elements per batch")
                     self.overflowedResources = 3
-            #elif kernel["ProblemType"]["DataType"].is8bitFloat():
+            #elif kernel["ProblemType"]["MacDataTypeA"].is8bitFloat():
             #    if numElementsPerBatch > 1:
             #        numElementsPerBatch = int(numElementsPerBatch/4)*4
 
@@ -1594,7 +1613,7 @@ class StreamK(Component):
                         module.add(VAddF32(dst=vgpr("ValuC+%u"%sumIdxV), src0=vgpr("ValuC+%u"%sumIdxV), src1=vgpr(tmpVgpr), comment="accum partials"))
 
                 elif kernel["ProblemType"]["ComputeDataType"].isSingle():
-                    if kernel["ProblemType"]["DataType"].isInt8():
+                    if kernel["ProblemType"]["MacDataTypeA"].isInt8():
                         newSumIdxV = sumIdxV - writer.states.c.startVgprValu
                         module.add(VAddU32(dst=vgpr("ValuC+%u"%newSumIdxV), src0=vgpr(dataV+0), src1=vgpr("ValuC+%u"%newSumIdxV), comment="accum partials"))
                     else:
@@ -1750,7 +1769,7 @@ class StreamKOff(StreamK):
         module = Module("StreamK Off graWorkGroup")
         return module
 
-    def computeLoadSrd(self, writer, kernel, tc, sTmp):
+    def computeLoadSrd(self, writer, kernel, tP, sTmp):
         module = Module("StreamK Off computeLoadSrd")
         return module
 
@@ -1866,9 +1885,9 @@ class StreamKBasic(StreamK):
 
         return module
 
-    def computeLoadSrd(self, writer, kernel, tc, sTmp):
+    def computeLoadSrd(self, writer, kernel, tP, sTmp):
         module = Module("StreamK Basic computeLoadSrd")
-        module.add(self.computeLoadSrdCommon(writer, kernel, tc, sTmp))
+        module.add(self.computeLoadSrdCommon(writer, kernel, tP, sTmp))
         return module
 
     def computeStoreSrdStart(self, writer, kernel):
@@ -1991,9 +2010,9 @@ class StreamKTwoTileOriginal(StreamK):
 
         return module
 
-    def computeLoadSrd(self, writer, kernel, tc, sTmp):
+    def computeLoadSrd(self, writer, kernel, tP, sTmp):
         module = Module("StreamK TwoTileOriginal computeLoadSrd")
-        module.add(self.computeLoadSrdCommon(writer, kernel, tc, sTmp))
+        module.add(self.computeLoadSrdCommon(writer, kernel, tP, sTmp))
         return module
 
     def computeStoreSrdStart(self, writer, kernel):
@@ -2261,9 +2280,9 @@ class StreamKTwoTileDPFirst(StreamK):
 
         return module
 
-    def computeLoadSrd(self, writer, kernel, tc, sTmp):
+    def computeLoadSrd(self, writer, kernel, tP, sTmp):
         module = Module("StreamK TwoTileDPFirst computeLoadSrd")
-        module.add(self.computeLoadSrdCommon(writer, kernel, tc, sTmp))
+        module.add(self.computeLoadSrdCommon(writer, kernel, tP, sTmp))
         return module
 
     def computeStoreSrdStart(self, writer, kernel):

@@ -48,12 +48,15 @@ namespace TensileLite
             , m_activationType(ActivationType::None)
             , m_activationNoGuard(false)
             , m_activationEnumArg(std::vector<ActivationType>(1, ActivationType::None))
-            , m_computeInputType(rocisa::DataType::Float)
+            , m_computeInputTypeA(rocisa::DataType::Float)
+            , m_computeInputTypeB(rocisa::DataType::Float)
             , m_f32XdlMathOp(rocisa::DataType::Float)
             , m_activationComputeType(rocisa::DataType::Float)
             , m_useUserArgs(false)
             , m_swizzleTensorA(false)
             , m_swizzleTensorB(false)
+            , m_mxBlockA(args["mx-block-a"].as<int>())
+            , m_mxBlockB(args["mx-block-b"].as<int>())
             , m_aOps(args["a-ops"].as<TensorOps>())
             , m_bOps(args["b-ops"].as<TensorOps>())
             , m_cOps(args["c-ops"].as<TensorOps>())
@@ -126,6 +129,10 @@ namespace TensileLite
                     m_tensorStrides[i] = std::vector<std::vector<size_t>>();
                 }
             }
+
+            m_tensorTypes[ContractionProblemGemm::TENSOR::MXSA] = rocisa::DataType::MXScale;
+            m_tensorTypes[ContractionProblemGemm::TENSOR::MXSB] = rocisa::DataType::MXScale;
+
             // Get constant types
             for(size_t i = 0; i < constants.size(); i++)
             {
@@ -186,10 +193,16 @@ namespace TensileLite
             if(args.count("max-workspace-size"))
                 m_maxWorkspaceSize = args["max-workspace-size"].as<size_t>();
 
-            if(args.count("compute-input-type"))
+            if(args.count("compute-input-type-A"))
             {
                 //accept mix-types (i.g. Float8BFloat8); there no need to set m_computeInputTypeA and m_computeInputTypeB
-                m_computeInputType = args["compute-input-type"].as<rocisa::DataType>();
+                m_computeInputTypeA = args["compute-input-type-A"].as<rocisa::DataType>();
+            }
+
+            if(args.count("compute-input-type-B"))
+            {
+                //accept mix-types (i.g. Float8BFloat8); there no need to set m_computeInputTypeA and m_computeInputTypeB
+                m_computeInputTypeB = args["compute-input-type-B"].as<rocisa::DataType>();
             }
 
             if(args.count("f32-xdl-math-op"))
@@ -318,7 +331,8 @@ namespace TensileLite
                                 m_dOps,
                                 m_constantValues[ContractionProblemGemm::CONST::BETA]));
 
-                            rv.back().setComputeInputType(m_computeInputType);
+                            rv.back().setComputeInputTypeA(m_computeInputTypeA);
+                            rv.back().setComputeInputTypeB(m_computeInputTypeB);
                             rv.back().setAlphaRestriction(toScalarValueEnum(
                                 m_constantValues[ContractionProblemGemm::CONST::ALPHA]));
                             rv.back().setCEqualsD(m_cEqualsD);
@@ -428,6 +442,14 @@ namespace TensileLite
                             rv.back().setF32XdlMathOp(m_f32XdlMathOp);
                             rv.back().setActivationComputeType(m_activationComputeType);
                             rv.back().setUseDeviceUserArguments(m_useUserArgs);
+                            if(m_mxBlockA)
+                            {
+                                rv.back().setMXScaleA(m_mxBlockA);
+                            }
+                            if(m_mxBlockB)
+                            {
+                                rv.back().setMXScaleB(m_mxBlockB);
+                            }
                         }
                     }
                 }

@@ -189,6 +189,14 @@ def validateMIParameters(
         else ptype["F32XdlMathOp"]
     )
 
+    if not solution.get("EnableF32XdlMathOp", False):
+      # For MFMA validation, use MacDataTypeA + MacDataTypeB combination as key
+      macDataTypeA = ptype.get("MacDataTypeA", miDataType)
+      macDataTypeB = ptype.get("MacDataTypeB", miDataType)
+      miDataTypeKey = macDataTypeA.toChar() + macDataTypeB.toChar()
+    else:
+      miDataTypeKey = miDataType.toChar() + miDataType.toChar()
+
     mi4 = solution[MI_KEY]
     miEnabled = solution[MI_ENABLED_KEY]
     assert len(mi4) == 4 or len(mi4) == 0, elineno() + ": MI length not 4 or 0"
@@ -230,7 +238,7 @@ def validateMIParameters(
 
     if not isSparse:
         if hasMFMA:
-            if not (miDataType.toChar() in validMFMA and mi4 in validMFMA[miDataType.toChar()]):
+            if not (miDataTypeKey in validMFMA and mi4 in validMFMA[miDataTypeKey]):
                 if miDataType.isBFloat16() and mi4 in validMFMA["B1k"]:  # but is valid bf16 MFMA
                     assert solution["MFMA_BF16_1K"], elineno()
                 else:
@@ -244,7 +252,7 @@ def validateMIParameters(
                 solution, printSolutionRejectionReason, f"Invalid WMMA configuration: {solution}"
             )
     else:
-        if not (miDataType.toChar() in validSMFMA and mi4 in validSMFMA[miDataType.toChar()]):
+        if not (miDataTypeKey in validSMFMA and mi4 in validSMFMA[miDataTypeKey]):
             return not reject(
                 solution, printSolutionRejectionReason, f"Invalid SMFMA configuration: {solution}"
             )

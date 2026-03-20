@@ -234,7 +234,7 @@ namespace Tensor
                 return desc;
             }
 
-            size_t getElementSize() const
+            float getElementSize() const
             {
                 return elementSize;
             }
@@ -317,9 +317,9 @@ namespace Tensor
         Tensor permute(const Tensor& tensor, const Permutation& perm)
         {
             assert(tensor.getDesc().numDims() == perm.size());
-            assert(sizeof(T) == tensor.getElementSize());
+            assert(sizeof(T) == size_t(tensor.getElementSize()));
             Shape  newShape = permute(tensor.getDesc().getShape(), perm);
-            Tensor permuted(newShape, tensor.getElementSize());
+            Tensor permuted(newShape, size_t(tensor.getElementSize()));
             permute<T>(permuted, tensor, perm);
             return permuted;
         }
@@ -367,8 +367,8 @@ namespace Tensor
         Tensor permute(const Tensor& tensor, const Permutation& perm)
         {
             Shape  newShape = permute(tensor.getDesc().getShape(), perm);
-            Tensor permuted(newShape, tensor.getElementSize());
-            switch(tensor.getElementSize())
+            Tensor permuted(newShape, size_t(tensor.getElementSize()));
+            switch(size_t(tensor.getElementSize()))
             {
             case 1:
                 permute<uint8_t>(permuted, tensor, perm);

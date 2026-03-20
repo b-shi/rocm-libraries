@@ -1,5 +1,5 @@
 /* ************************************************************************
- * Copyright (C) 2025 Advanced Micro Devices, Inc.
+ * Copyright (C) 2025-2026 Advanced Micro Devices, Inc.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -44,7 +44,7 @@ namespace rocisa
            && matrixInstB == 1)
         {
             if(dataType == DataType::Half || dataType == DataType::BFloat16
-               || dataType == DataType::Int8 || is8bitFloat(dataType))
+               || dataType == DataType::Int8 || is8bitFloat(dataType) || numBytes < 1)
             {
                 mi_divisor     = 4;
                 miIssueLatency = 1;
@@ -145,6 +145,20 @@ namespace rocisa
                 return variant[2] > 32 ? "f8f6f4" : "fp8_bf8";
             case InstType::INST_BF8_F8:
                 return variant[2] > 32 ? "f8f6f4" : "bf8_fp8";
+            case InstType::INST_F6:
+            case InstType::INST_BF6:
+            case InstType::INST_F4:
+            case InstType::INST_F8_F6:
+            case InstType::INST_F6_F8:
+            case InstType::INST_F8_F4:
+            case InstType::INST_F4_F8:
+            case InstType::INST_F6_B6:
+            case InstType::INST_B6_F6:
+            case InstType::INST_F6_F4:
+            case InstType::INST_F4_F6:
+            case InstType::INST_B6_F4:
+            case InstType::INST_F4_B6:
+                return "f8f6f4";
             default:
                 throw std::runtime_error("Type not found");
             }
@@ -183,21 +197,60 @@ namespace rocisa
             std::string negStr
                 = !neg ? "" : (getAsmCaps()["HasWMMA_V1"] ? " neg_lo:[1,1,1]" : " neg_lo:[1,1]");
             std::string inputPermuteStr = "";
-            if(getAsmCaps()["HasMFMA_f8f6f4"])
+            if(getAsmCaps()["HasMFMA_f8f6f4"] && variant[2] > 32)
             {
                 switch(instType)
                 {
                 case InstType::INST_F8:
-                    inputPermuteStr = variant[2] > 32 ? " cbsz:0 blgp:0" : "";
+                    inputPermuteStr = " cbsz:0 blgp:0";
                     break;
                 case InstType::INST_BF8:
-                    inputPermuteStr = variant[2] > 32 ? " cbsz:1 blgp:1" : "";
+                    inputPermuteStr = " cbsz:1 blgp:1";
                     break;
                 case InstType::INST_F8_BF8:
-                    inputPermuteStr = variant[2] > 32 ? " cbsz:0 blgp:1" : "";
+                    inputPermuteStr = " cbsz:0 blgp:1";
                     break;
                 case InstType::INST_BF8_F8:
-                    inputPermuteStr = variant[2] > 32 ? " cbsz:1 blgp:0" : "";
+                    inputPermuteStr = " cbsz:1 blgp:0";
+                    break;
+                case InstType::INST_F6:
+                    inputPermuteStr = " cbsz:2 blgp:2";
+                    break;
+                case InstType::INST_BF6:
+                    inputPermuteStr = " cbsz:3 blgp:3";
+                    break;
+                case InstType::INST_F4:
+                    inputPermuteStr = " cbsz:4 blgp:4";
+                    break;
+                case InstType::INST_F8_F6:
+                    inputPermuteStr = " cbsz:0 blgp:2";
+                    break;
+                case InstType::INST_F6_F8:
+                    inputPermuteStr = " cbsz:2 blgp:0";
+                    break;
+                case InstType::INST_F8_F4:
+                    inputPermuteStr = " cbsz:0 blgp:4";
+                    break;
+                case InstType::INST_F4_F8:
+                    inputPermuteStr = " cbsz:4 blgp:0";
+                    break;
+                case InstType::INST_F6_B6:
+                    inputPermuteStr = " cbsz:2 blgp:3";
+                    break;
+                case InstType::INST_B6_F6:
+                    inputPermuteStr = " cbsz:3 blgp:2";
+                    break;
+                case InstType::INST_F6_F4:
+                    inputPermuteStr = " cbsz:2 blgp:4";
+                    break;
+                case InstType::INST_F4_F6:
+                    inputPermuteStr = " cbsz:4 blgp:2";
+                    break;
+                case InstType::INST_B6_F4:
+                    inputPermuteStr = " cbsz:3 blgp:4";
+                    break;
+                case InstType::INST_F4_B6:
+                    inputPermuteStr = " cbsz:4 blgp:3";
                     break;
                 default:
                     break;
@@ -337,6 +390,140 @@ namespace rocisa
             auto dataType = instTypeToDataType(instType);
             auto [issueLatency, miLatency]
                 = getMFMAIssueLatency<true>(dataType, variant[0], variant[3]);
+            return issueLatency;
+        }
+    };
+
+    struct MXMFMAInstruction : public Instruction
+    {
+        InstType                           accType;
+        std::vector<int>                   variant;
+        std::shared_ptr<RegisterContainer> acc;
+        std::shared_ptr<RegisterContainer> a;
+        std::shared_ptr<RegisterContainer> b;
+        std::shared_ptr<RegisterContainer> acc2;
+        std::shared_ptr<RegisterContainer> mxsa;
+        std::shared_ptr<RegisterContainer> mxsb;
+
+        MXMFMAInstruction(InstType                                  instType,
+                          InstType                                  accType,
+                          const std::vector<int>&                   variant,
+                          const std::shared_ptr<RegisterContainer>& acc,
+                          const std::shared_ptr<RegisterContainer>& a,
+                          const std::shared_ptr<RegisterContainer>& b,
+                          const std::shared_ptr<RegisterContainer>& acc2    = nullptr,
+                          const std::shared_ptr<RegisterContainer>& mxsa    = nullptr,
+                          const std::shared_ptr<RegisterContainer>& mxsb    = nullptr,
+                          const std::string&                        comment = "")
+            : Instruction(instType, comment)
+            , accType(accType)
+            , variant(variant)
+            , acc(acc)
+            , a(a)
+            , b(b)
+            , acc2(acc2 ? acc2 : acc)
+            , mxsa(mxsa)
+            , mxsb(mxsb)
+        {
+        }
+
+        MXMFMAInstruction(const MXMFMAInstruction& other)
+            : Instruction(other.instType, other.comment)
+            , accType(other.accType)
+            , variant(other.variant)
+            , acc(other.acc ? other.acc->clone2() : nullptr)
+            , a(other.a ? other.a->clone2() : nullptr)
+            , b(other.b ? other.b->clone2() : nullptr)
+            , acc2(other.acc2 ? other.acc2->clone2() : nullptr)
+            , mxsa(other.mxsa ? other.mxsa->clone2() : nullptr)
+            , mxsb(other.mxsb ? other.mxsb->clone2() : nullptr)
+        {
+        }
+
+        std::shared_ptr<Item> clone() const override
+        {
+            return std::make_shared<MXMFMAInstruction>(*this);
+        }
+
+        std::vector<InstructionInput> getParams() const override
+        {
+            return {acc, a, b, acc2, mxsa, mxsb};
+        }
+
+        std::string preStr() const override
+        {
+            std::string variantStr = std::to_string(variant[0]) + "x" + std::to_string(variant[1])
+                                     + "x" + std::to_string(variant[2]);
+            return "v_mfma_scale_f32_" + variantStr + "_f8f6f4";
+        }
+
+        std::string inputPermuteStr() const
+        {
+            if(getAsmCaps()["HasMFMA_f8f6f4"] && variant[2] > 32)
+            {
+                switch(instType)
+                {
+                case InstType::INST_F8:
+                    return " cbsz:0 blgp:0";
+                case InstType::INST_BF8:
+                    return " cbsz:1 blgp:1";
+                case InstType::INST_F8_BF8:
+                    return " cbsz:0 blgp:1";
+                case InstType::INST_BF8_F8:
+                    return " cbsz:1 blgp:0";
+                case InstType::INST_F6:
+                    return " cbsz:2 blgp:2";
+                case InstType::INST_BF6:
+                    return " cbsz:3 blgp:3";
+                case InstType::INST_F4:
+                    return " cbsz:4 blgp:4";
+                case InstType::INST_F8_F6:
+                    return " cbsz:0 blgp:2";
+                case InstType::INST_F6_F8:
+                    return " cbsz:2 blgp:0";
+                case InstType::INST_F8_F4:
+                    return " cbsz:0 blgp:4";
+                case InstType::INST_F4_F8:
+                    return " cbsz:4 blgp:0";
+                case InstType::INST_F6_B6:
+                    return " cbsz:2 blgp:3";
+                case InstType::INST_B6_F6:
+                    return " cbsz:3 blgp:2";
+                case InstType::INST_F6_F4:
+                    return " cbsz:2 blgp:4";
+                case InstType::INST_F4_F6:
+                    return " cbsz:4 blgp:2";
+                case InstType::INST_B6_F4:
+                    return " cbsz:3 blgp:4";
+                case InstType::INST_F4_B6:
+                    return " cbsz:4 blgp:3";
+                default:
+                    break;
+                }
+            }
+            return "";
+        }
+
+        std::string getArgStr() const
+        {
+            std::string mxsaStr = mxsa ? mxsa->toString() : "";
+            std::string mxsbStr = mxsb ? mxsb->toString() : "";
+            return acc->toString() + ", " + a->toString() + ", " + b->toString() + ", "
+                   + acc2->toString() + ", " + mxsaStr + ", " + mxsbStr + inputPermuteStr();
+        }
+
+        std::string toString() const override
+        {
+            auto        newInstStr = preStr();
+            std::string kStr       = newInstStr + " " + getArgStr();
+            return formatWithComment(kStr);
+        }
+
+        int getIssueLatency() const override
+        {
+            auto dataType                  = instTypeToDataType(instType);
+            auto [issueLatency, miLatency] = getMFMAIssueLatency<false>(
+                dataType, variant[0], variant.size() > 3 ? variant[3] : 1);
             return issueLatency;
         }
     };

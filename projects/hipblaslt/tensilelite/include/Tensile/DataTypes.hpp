@@ -47,6 +47,10 @@
 #include <Tensile/DataTypes_Int8.hpp>
 #include <Tensile/DataTypes_Int8x4.hpp>
 #include <Tensile/DataTypes_XFloat32.hpp>
+#include <Tensile/DataTypes_Float6.hpp>
+#include <Tensile/DataTypes_BFloat6.hpp>
+#include <Tensile/DataTypes_Float4.hpp>
+#include <Tensile/DataTypes_MXScale.hpp>
 
 namespace rocisa
 {
@@ -129,6 +133,8 @@ namespace TensileLite
         /// Segments per element.
         constexpr static size_t Packing = T_Packing;
         /// Bytes per segment.
+        /// TODO: this needs to be enhanced as the value would be
+        ///       0 for MX data type, FP4: ElementSize=1 byte, Packing=2.
         constexpr static size_t SegmentSize = ElementSize / Packing;
 
         constexpr static bool IsComplex  = T_IsComplex;
@@ -233,6 +239,11 @@ namespace TensileLite
     };
 
     template <>
+    struct TypeInfo<Int8> : public BaseTypeInfo<Int8, rocisa::DataType::Int8, 1, false, true>
+    {
+    };
+
+    template <>
     struct TypeInfo<Float8> : public BaseTypeInfo<Float8, rocisa::DataType::Float8, 1, false, false>
     {
     };
@@ -291,6 +302,39 @@ namespace TensileLite
     {
     };
 
+#ifdef _WIN32
+    template <>
+    struct TypeInfo<Float6> : public BaseTypeInfo<Float6, rocisa::DataType::Float6, 1, false, false>
+    {
+    };
+    template <>
+    struct TypeInfo<BFloat6> : public BaseTypeInfo<BFloat6, rocisa::DataType::BFloat6, 1, false, false>
+    {
+    };
+    template <>
+    struct TypeInfo<Float4> : public BaseTypeInfo<Float4, rocisa::DataType::Float4, 1, false, false>
+    {
+    };
+#else // _WIN32
+    template <>
+    struct TypeInfo<Float6x32> : public BaseTypeInfo<Float6x32, rocisa::DataType::Float6, 32, false, false>
+    {
+    };
+    template <>
+    struct TypeInfo<BFloat6x32> : public BaseTypeInfo<BFloat6x32, rocisa::DataType::BFloat6, 32, false, false>
+    {
+    };
+    template <>
+    struct TypeInfo<Float4x2> : public BaseTypeInfo<Float4x2, rocisa::DataType::Float4, 2, false, false>
+    {
+    };
+#endif // _WIN32
+    template <>
+    struct TypeInfo<MXScale>
+        : public BaseTypeInfo<MXScale, rocisa::DataType::MXScale, 1, false, false>
+    {
+    };
+
     // Variant for constants
     using ConstantVariant = std::variant<float,
                                          double,
@@ -305,7 +349,14 @@ namespace TensileLite
                                          BFloat8,
                                          Float8_fnuz,
                                          BFloat8_fnuz,
-                                         int8_t>;
+                                         int8_t,
+#ifndef _WIN32
+                                         Float6x32,
+                                         BFloat6x32,
+                                         Float4x2,
+#endif // !_WIN32
+                                         MXScale
+                                        >;
 
     // Convert variants to type T
     template <typename T>
@@ -373,8 +424,54 @@ namespace TensileLite
         return static_cast<T>(*std::get_if<Int8x4>(&val));
     }
 
+#ifndef _WIN32
+    // Convert variants to type T
+    template <typename T>
+    typename std::enable_if<std::is_same<Float6x32, T>::value, T>::type
+        constVariantCast(const ConstantVariant& val)
+    {
+        switch(val.index())
+        {
+        case static_cast<int>(rocisa::DataType::Float6):
+            return static_cast<T>(*std::get_if<Float6x32>(&val));
+        default:
+            throw std::runtime_error("Unsupported variant cast type.");
+        }
+    }
+
+    // Convert variants to type T
+    template <typename T>
+    typename std::enable_if<std::is_same<BFloat6x32, T>::value, T>::type
+        constVariantCast(const ConstantVariant& val)
+    {
+        switch(val.index())
+        {
+        case static_cast<int>(rocisa::DataType::BFloat6):
+            return static_cast<T>(*std::get_if<BFloat6x32>(&val));
+        default:
+            throw std::runtime_error("Unsupported variant cast type.");
+        }
+    }
+
+    // Convert variants to type T
+    template <typename T>
+    typename std::enable_if<std::is_same<Float4x2, T>::value, T>::type
+        constVariantCast(const ConstantVariant& val)
+    {
+        switch(val.index())
+        {
+        case static_cast<int>(rocisa::DataType::Float4):
+            return static_cast<T>(*std::get_if<Float4x2>(&val));
+        default:
+            throw std::runtime_error("Unsupported variant cast type.");
+        }
+    }
+#endif // !_WIN32
+
     std::string ToString(ConstantVariant d);
     bool        CompareValue(const ConstantVariant& d, double value);
+
+    size_t multiplyElementSize(size_t element, float elementSize);
 
     /**
  * @}

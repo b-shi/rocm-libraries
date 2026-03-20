@@ -121,7 +121,7 @@ class LayerNormKernelGenerator:
                  arch: str,
                  isa: IsaVersion):
         self.io_type = io_type
-        self.bpe = io_type.numBytes()
+        self.bpe = int(io_type.numBytes())
         self.num_workitems = num_workitems
         self.num_load_count = num_load_count
         self.num_load_size = num_load_size

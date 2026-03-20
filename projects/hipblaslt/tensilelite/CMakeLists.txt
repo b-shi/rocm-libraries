@@ -15,8 +15,10 @@ if(TENSILELITE_ENABLE_HOST)
     set_target_properties(tensilelite-host
         PROPERTIES
             POSITION_INDEPENDENT_CODE ON
+            CXX_VISIBILITY_PRESET hidden
+            VISIBILITY_INLINES_HIDDEN ON
     )
-    target_compile_options(tensilelite-host PUBLIC -fvisibility=hidden)
+
     target_compile_features(tensilelite-host PUBLIC cxx_std_17)
     target_compile_definitions(tensilelite-host
         PUBLIC
@@ -54,6 +56,20 @@ if(TENSILELITE_ENABLE_HOST)
     add_subdirectory(include)
 
     if(TENSILELITE_ENABLE_CLIENT)
+        if(HIPBLASLT_ENABLE_MXDATAGENERATOR)
+            # Add mxDataGenerator if it hasn't been added by clients build
+            if(NOT TARGET roc::mxDataGenerator)
+                if(NOT ROCM_LIBS_SUPERBUILD)
+                    if(HIPBLASLT_ENABLE_THEROCK)
+                        find_package(mxDataGenerator REQUIRED)
+                    else()
+                        add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/../../../shared/mxdatagenerator"
+                                       "${CMAKE_CURRENT_BINARY_DIR}/mxdatagenerator")
+                    endif()
+                endif()
+            endif()
+        endif()
+
         add_subdirectory(client)
     endif()
 

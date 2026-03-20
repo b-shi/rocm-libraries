@@ -34,7 +34,8 @@ class FMA_F64_Plain(MAC):
     Plain MAC instruction implementation
     """
     asmCaps = {"v_fma_f64": True}
-    kernel = {"ProblemType": {"DataType": DataType(DataTypeEnum.Double)}}
+    kernel = {"ProblemType": {"MacDataTypeA": DataType(DataTypeEnum.Double),
+                              "MacDataTypeB": DataType(DataTypeEnum.Double)}}
 
     def __call__(self, writer, tPA, tPB, m, innerUnroll):
         kernel = writer.states.kernel

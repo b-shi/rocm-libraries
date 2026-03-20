@@ -128,7 +128,9 @@ namespace TensileLite
                      Base::template Pair<Predicates::Contraction::SupportDeviceUserArguments>(),
                      Base::template Pair<Predicates::Contraction::WorkgroupMappingXCCCheck>(),
                      Base::template Pair<Predicates::Contraction::SwizzleTensorA>(),
-                     Base::template Pair<Predicates::Contraction::SwizzleTensorB>()});
+                     Base::template Pair<Predicates::Contraction::SwizzleTensorB>(),
+                     Base::template Pair<Predicates::Contraction::MXBlockACheck>(),
+                     Base::template Pair<Predicates::Contraction::MXBlockBCheck>()});
 
                 auto gmap = Generic::GetSubclasses();
                 rv.insert(gmap.begin(), gmap.end());
@@ -564,6 +566,18 @@ namespace TensileLite
         template <typename IO>
         struct MappingTraits<Predicates::Contraction::SwizzleTensorB, IO>
             : public AutoMappingTraits<Predicates::Contraction::SwizzleTensorB, IO>
+        {
+        };
+
+        template <typename IO>
+        struct MappingTraits<Predicates::Contraction::MXBlockACheck, IO>
+            : public AutoMappingTraits<Predicates::Contraction::MXBlockACheck, IO>
+        {
+        };
+
+        template <typename IO>
+        struct MappingTraits<Predicates::Contraction::MXBlockBCheck, IO>
+            : public AutoMappingTraits<Predicates::Contraction::MXBlockBCheck, IO>
         {
         };
 

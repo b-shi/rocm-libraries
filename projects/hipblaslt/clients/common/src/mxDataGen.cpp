@@ -234,7 +234,6 @@ std::vector<float> generateData(T                           dgen,
 
     std::vector<uint8_t> scaleBytes = dgen.getScaleBytes();
 
-#ifdef HIPBLASLT_USE_ROCROLLER
     // Apply pre-swizzle to scale data
     size_t scaleRows = sizes[0] / elementsPerMXBlock;
     size_t scaleCols = sizes[1];
@@ -244,7 +243,6 @@ std::vector<float> generateData(T                           dgen,
         scaleBytes = DGen::preSwizzleScalesGFX950(scaleBytes, {scaleCols, scaleRows});
         
     }
-#endif
 
     std::memcpy(scale, scaleBytes.data(), scaleBytes.size() * sizeof(uint8_t));
 
@@ -290,7 +288,6 @@ std::vector<float> generateData(T                           dgen,
     }
 }
 
-#ifdef HIPBLASLT_USE_ROCROLLER
 /**
  * @brief Generate random data for OCP (MX) F8/F6/F4 types
  *
@@ -388,7 +385,7 @@ std::vector<float> generateMXInput(hipDataType                dataType,
                                                                   preSwizzleTile,
                                                                   preTile);
     }
-    else if(static_cast<hipDataType>(dataType) == HIP_R_6F_E2M3_EXT)
+    else if(static_cast<hipDataType>(dataType) == HIP_R_6F_E2M3)
     {
         DGen::DataGenerator<DGen::ocp_e2m3_mxfp6> dgen;
         return generateData<decltype(dgen), DGen::ocp_e2m3_mxfp6>(dgen,
@@ -404,7 +401,7 @@ std::vector<float> generateMXInput(hipDataType                dataType,
                                                                   preSwizzleTile,
                                                                   preTile);
     }
-    else if(static_cast<hipDataType>(dataType) == HIP_R_6F_E3M2_EXT)
+    else if(static_cast<hipDataType>(dataType) == HIP_R_6F_E3M2)
     {
         DGen::DataGenerator<DGen::ocp_e3m2_mxfp6> dgen;
         return generateData<decltype(dgen), DGen::ocp_e3m2_mxfp6>(dgen,
@@ -420,7 +417,7 @@ std::vector<float> generateMXInput(hipDataType                dataType,
                                                                   preSwizzleTile,
                                                                   preTile);
     }
-    else if(static_cast<hipDataType>(dataType) == HIP_R_4F_E2M1_EXT)
+    else if(static_cast<hipDataType>(dataType) == HIP_R_4F_E2M1)
     {
         DGen::DataGenerator<DGen::ocp_e2m1_mxfp4> dgen;
         return generateData<decltype(dgen), DGen::ocp_e2m1_mxfp4>(dgen,
@@ -441,4 +438,3 @@ std::vector<float> generateMXInput(hipDataType                dataType,
         throw std::runtime_error("Unsupported data types in MX data generation!");
     }
 }
-#endif

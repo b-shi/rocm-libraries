@@ -271,10 +271,10 @@ class GlobalWriteBatchWriter:
   ##############################################################################
   def _chooseAddForAtomic(self, kernel, dst, src0, src1, comment):
     module = Module("chooseAddForAtomic")
-    if kernel["ProblemType"]["DataType"].isBFloat16():
+    if kernel["ProblemType"]["MacDataTypeA"].isBFloat16():
       if kernel["_GlobalAccumulation"]:
         module.add(VAddF32(dst, src0, src1, comment=comment))
-    elif kernel["ProblemType"]["DataType"].isHalf():
+    elif kernel["ProblemType"]["MacDataTypeA"].isHalf():
       if kernel["_GlobalAccumulation"]:
         module.add(VAddF32(dst, src0, src1, comment=comment))
       elif kernel["ProblemType"]["HighPrecisionAccumulate"]:
@@ -286,11 +286,11 @@ class GlobalWriteBatchWriter:
           assert False, "No valid v_mad_mix_f32 equivalent"
       else:
         module.add(VAddPKF16(dst, src0, src1, comment))
-    elif kernel["ProblemType"]["DataType"].isInt8x4() or kernel["ProblemType"]["DataType"].isInt8():
+    elif kernel["ProblemType"]["MacDataTypeA"].isInt8x4() or kernel["ProblemType"]["MacDataTypeA"].isInt8():
       # assume v_add_i32 can be used in place of v_add_f32
       # need to add saturation directive to v_add_i32 instruction to clamp integer arithmetic
       module.add(VAddI32(dst, src0, src1, comment=comment))
-    elif kernel["ProblemType"]["DataType"].isSingle():
+    elif kernel["ProblemType"]["MacDataTypeA"].isSingle():
       module.add(VAddF32(dst, src0, src1, comment=comment))
     else:
        #support for double
@@ -860,8 +860,8 @@ class GlobalWriteBatchWriter:
       def applyScaleVec(vecModule, addressStr, dataScaleVec, factorDim, isGlobal=True):
         if not self.beta and not self.applyAlpha: # case for beta-0 and alpha == 1,(OptNLL)
           if (self.kernel["ProblemType"]["DestDataType"].isInt8() or self.kernel["ProblemType"]["DestDataType"].isInt32() or \
-              (self.kernel["ProblemType"]["DataType"].isInt8() and self.kernel["ProblemType"]["DestDataType"].isHalf()) or \
-              (self.kernel["ProblemType"]["DataType"].isInt8() and self.kernel["ProblemType"]["DestDataType"].isBFloat16())) and \
+              (self.kernel["ProblemType"]["MacDataTypeA"].isInt8() and self.kernel["ProblemType"]["DestDataType"].isHalf()) or \
+              (self.kernel["ProblemType"]["MacDataTypeA"].isInt8() and self.kernel["ProblemType"]["DestDataType"].isBFloat16())) and \
             self.kernel["ProblemType"]["ComputeDataType"].isSingle():
             module.add(convertData(self.gwvw, self.ss.elementSumIdx[elementIdx], cvtType=CvtType.CVT_I32_to_F32, \
                                         inputPrefix="ValuC+", prefixOffset=self.parentWriter.states.c.startVgprValu))
@@ -930,8 +930,8 @@ class GlobalWriteBatchWriter:
       elif ((self.parentWriter.states.useBias == DataDirection.READ) or self.kernel["ActivationFuncCall"]) and not self.applyAlpha \
         and not ( self.kernel["ProblemType"]["UseScaleAlphaVec"] and isSingleKernel): # case of alpha=1 and beta=0
         if (self.kernel["ProblemType"]["DestDataType"].isInt8() or self.kernel["ProblemType"]["DestDataType"].isInt32() or \
-            (self.kernel["ProblemType"]["DataType"].isInt8() and self.kernel["ProblemType"]["DestDataType"].isHalf()) or \
-            (self.kernel["ProblemType"]["DataType"].isInt8() and self.kernel["ProblemType"]["DestDataType"].isBFloat16())) and \
+            (self.kernel["ProblemType"]["MacDataTypeA"].isInt8() and self.kernel["ProblemType"]["DestDataType"].isHalf()) or \
+            (self.kernel["ProblemType"]["MacDataTypeA"].isInt8() and self.kernel["ProblemType"]["DestDataType"].isBFloat16())) and \
            self.kernel["ProblemType"]["ComputeDataType"].isSingle():
           module.add(convertData(self.gwvw, self.ss.elementSumIdx[elementIdx], cvtType=CvtType.CVT_I32_to_F32, \
                                       inputPrefix="ValuC+", prefixOffset=self.parentWriter.states.c.startVgprValu))
@@ -1531,7 +1531,7 @@ class GlobalWriteBatchWriter:
       if self.atomicW > self.gwvw:
         return False
 
-      if (self.kernel["ProblemType"]["DataType"].isHalf() or self.kernel["ProblemType"]["DataType"].isBFloat16()) \
+      if (self.kernel["ProblemType"]["MacDataTypeA"].isHalf() or self.kernel["ProblemType"]["MacDataTypeA"].isBFloat16()) \
         and not self.kernel["_GlobalAccumulation"]:
         return self.atomicW >= 2
     return True
@@ -1574,7 +1574,7 @@ class GlobalWriteBatchWriter:
         # (h,h,h,h,h,h) + HPA (will be converted to (h,h,h,h,s,s)), internal alpha is single
         elif kernel["ProblemType"]["ComputeDataType"].isSingle() or (kernel["ProblemType"]["ComputeDataType"].isHalf() and kernel["ProblemType"]["HighPrecisionAccumulate"]):
 
-          if kernel["ProblemType"]["DataType"].isInt8() and kernel["ProblemType"]["HighPrecisionAccumulate"]:
+          if kernel["ProblemType"]["MacDataTypeA"].isInt8() and kernel["ProblemType"]["HighPrecisionAccumulate"]:
             if usePK or gwvw > 1:
               if vi % 2 == 0:
                 module.add(VCvtI32toF32(dst=vgpr("ValuC+%u"%sumIdxV), src=vgpr("ValuC+%u"%sumIdxV), comment="convert to fp32" ))

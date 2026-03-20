@@ -551,7 +551,9 @@ namespace TensileLite
         }
 
         TensorDescriptor const& a          = problem.a();
+        TensorDescriptor const& mxsa       = problem.mxsa();
         TensorDescriptor const& b          = problem.b();
+        TensorDescriptor const& mxsb       = problem.mxsb();
         TensorDescriptor const& c          = problem.c();
         TensorDescriptor const& d          = problem.d();
         TensorDescriptor const& e          = problem.tensor(ContractionProblemGemm::TENSOR::E);
@@ -618,8 +620,12 @@ namespace TensileLite
         {
             args.template append<void const*>(
                 "a", problemType.sparse == 1 ? inputs.compressed : inputs.a);
+            if(problemType.mxBlockA)
+                args.template append<void const*>("mxsa", inputs.mxsa);
             args.template append<void const*>(
                 "b", problemType.sparse == 2 ? inputs.compressed : inputs.b);
+            if(problemType.mxBlockB)
+                args.template append<void const*>("mxsb", inputs.mxsb);
         }
         else
         {
@@ -684,11 +690,19 @@ namespace TensileLite
             args.template append<uint32_t>(concatenate_if<T_Debug>("strideA", i), stride_a);
         }
 
+        if(problemType.mxBlockA)
+            for(size_t i = startStrideAB; i < mxsa.dimensions(); i++)
+                args.template append<uint32_t>(concatenate_if<T_Debug>("strideMXSA", i), mxsa.strides()[i]);
+
         for(size_t i = startStrideAB; i < b.dimensions(); i++)
         {
             auto stride_b = problemType.sparse == 2 ? compressed.strides()[i] : b.strides()[i];
             args.template append<uint32_t>(concatenate_if<T_Debug>("strideB", i), stride_b);
         }
+
+        if(problemType.mxBlockB)
+            for(size_t i = startStrideAB; i < mxsb.dimensions(); i++)
+                args.template append<uint32_t>(concatenate_if<T_Debug>("strideMXSB", i), mxsb.strides()[i]);
 
         if(problemType.sparse)
         {
@@ -698,10 +712,14 @@ namespace TensileLite
         }
 
         args.append("alpha", inputs.alpha, problem.alphaType());
+        if(problem.alphaType() == rocisa::DataType::Half)
+            args.append("alpha_2", inputs.alpha, problem.alphaType());
 
         if(problemType.useBeta)
         {
             args.append("beta", inputs.beta, problem.betaType());
+            if(problem.betaType() == rocisa::DataType::Half)
+                args.append("beta_2", inputs.beta, problem.betaType());
         }
 
         if(sizeMapping.streamK != 0)
@@ -794,7 +812,9 @@ namespace TensileLite
                                           autoStaggerUStrideShift,
                                           autoGsuVal);
 
-        if(!problemType.useScaleAB.empty()) //kernel input data
+	// NOTE: an assumption here is A & B must be both MX data types or non-MX data types.
+	//       Mixing is not supported.
+        if(!problemType.useScaleAB.empty())
         {
             args.template append<void const*>("scaleA", inputs.scaleA);
             args.template append<void const*>("scaleB", inputs.scaleB);
@@ -2050,7 +2070,7 @@ namespace TensileLite
         if(sizeMapping.streamK > 0)
         {
             auto tiles = problem.getNumTiles(sizeMapping, 1);
-            gsu = (tiles > 0) ? (sk.grid / tiles) : 0;        
+            gsu        = sk.grid / tiles;
         }
 
         args.template append<uint32_t>(concatenate_if<T_Debug>("gsu"), gsu);
@@ -3046,26 +3066,35 @@ namespace TensileLite
         auto cInfo = DataTypeInfo::Get(problemType.cType);
         auto dInfo = DataTypeInfo::Get(problemType.dType);
 
-        spm.memReadBytesA = (NumBatches * M * N * K) / MT1 * aInfo.elementSize;
-        spm.memReadBytesB = (NumBatches * M * N * K) / MT0 * bInfo.elementSize;
-        spm.memReadBytesC = (NumBatches * M * N) * betaReads * cInfo.elementSize;
+        // TODO: For MX data types, their size is smaller than a bytes, so we can't use
+        // segmentSize which would be 0. This needs to be enhanaced.
+        assert( ((NumBatches * M * N * K) * aInfo.elementSize / aInfo.packing) % MT1 == 0);
+        assert( ((NumBatches * M * N * K) * bInfo.elementSize / bInfo.packing) % MT0 == 0);
+        spm.memReadBytesA = (NumBatches * M * N * K) * aInfo.elementSize / aInfo.packing / MT1;
+        spm.memReadBytesB = (NumBatches * M * N * K) * bInfo.elementSize / bInfo.packing / MT0;
+        spm.memReadBytesC = (NumBatches * M * N) * betaReads * cInfo.elementSize / cInfo.packing;
 
         if(GlobalSplitU == 1)
+        {
+            // Use segmentSize as D currently does not support MX data types.
             spm.memWriteBytesD = (NumBatches * M * N) * (1 + betaWrites) * dInfo.elementSize;
+        }
         else
         {
             bool   hardwareAtomic   = false; // TODO-model
             double atomicOperations = hardwareAtomic ? 2 : 3; // read-mod-write or cas  //TODO-model
             double atomicCollisions = 1.0; // TODO-could be based on K, GSU
+            // Use segmentSize as D currently does not support MX data types.
             spm.memWriteBytesD      = (NumBatches * M * N)
                                  * (betaWrites + atomicOperations * atomicCollisions)
-                                 * dInfo.elementSize;
+                                 * dInfo.segmentSize;
         }
         spm.memReadBytes   = spm.memReadBytesA + spm.memReadBytesB + spm.memReadBytesC;
-        spm.memGlobalReads = spm.memReadBytesA / aInfo.elementSize
-                             + spm.memReadBytesB / bInfo.elementSize
-                             + spm.memReadBytesC / cInfo.elementSize;
-        spm.memGlobalWrites = spm.memWriteBytesD / dInfo.elementSize;
+
+        spm.memGlobalReads = spm.memReadBytesA   * aInfo.packing / aInfo.elementSize
+                             + spm.memReadBytesB * bInfo.packing / bInfo.elementSize
+                             + spm.memReadBytesC * cInfo.packing / cInfo.elementSize;
+        spm.memGlobalWrites = spm.memWriteBytesD / dInfo.segmentSize;
 
         return spm;
     }
@@ -3210,7 +3239,9 @@ namespace TensileLite
         if(problemType.outputAmaxD)
         {
             auto numWGS = getNumWorkGroups(problem, sizeMapping);
-            size += problem.amaxd().elementBytes() * numWGS;
+            // Use elementBytes instead of segmentSize beceause D currently
+            // does not support sub-byte data types
+            size += numWGS * problem.amaxd().elementBytes();
         }
 
         return size;
@@ -3384,7 +3415,7 @@ namespace TensileLite
                 .batch    = batch,
                 .a_dtype  = datatypeToAnalyticalDatatype(problem.alphaType()),
                 .b_dtype  = datatypeToAnalyticalDatatype(problem.betaType()),
-                .mi_dtype = datatypeToAnalyticalDatatype(problem.computeInputType()),
+                .mi_dtype = datatypeToAnalyticalDatatype(problem.computeInputTypeA()),
             };
             origami::config_t origami_config = {
                 .mt                        = {static_cast<size_t>(sizeMapping.macroTile.x),
@@ -3648,7 +3679,7 @@ namespace TensileLite
 
     origami::data_type_t ContractionSolution::getOrigamiDatatype(Problem const& problem) const
     {
-        return datatypeToAnalyticalDatatype(problem.computeInputType());
+        return datatypeToAnalyticalDatatype(problem.computeInputTypeA());
     }
 
     std::ostream& operator<<(std::ostream&                                      stream,

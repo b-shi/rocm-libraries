@@ -16,6 +16,7 @@
 
 #include <hipdnn_backend/version.h>
 #include <hipdnn_data_sdk/utilities/StringUtil.hpp>
+#include <hipdnn_plugin_sdk/FunctionNameMacro.hpp>
 
 #include <cstring>
 
@@ -51,7 +52,8 @@ void throwIfNull(T* value)
     if(value == nullptr)
     {
         throw hipdnn_backend::HipdnnException(HIPDNN_STATUS_BAD_PARAM_NULL_POINTER,
-                                              std::string(typeid(T).name()) + " is nullptr");
+                                              "Null pointer provided to "
+                                                  + std::string(HIPDNN_FUNCTION_NAME));
     }
 }
 } // namespace
@@ -549,4 +551,9 @@ HIPDNN_BACKEND_EXPORT hipdnnStatus_t hipdnnGetVersion_ext(const char** version)
         throwIfNull(version);
         *version = HIPDNN_BACKEND_VERSION_STRING;
     });
+}
+
+HIPDNN_BACKEND_EXPORT const char* hipdnnVersionString_ext()
+{
+    return HIPDNN_BACKEND_VERSION_STRING;
 }

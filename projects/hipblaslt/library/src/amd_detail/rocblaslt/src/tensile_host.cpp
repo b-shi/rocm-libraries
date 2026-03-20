@@ -239,80 +239,51 @@ RocblasltContractionProblem::RocblasltContractionProblem(hipblasOperation_t     
     {
         this->aux_type = this->d_type;
     }
+
+    if(this->trans_a == HIPBLAS_OP_C)
+    {
+        if(rocblaslt_is_complex_datatype(this->a_type))
+            this->trans_a = HIPBLAS_OP_T;
+    }
+    if(this->trans_b == HIPBLAS_OP_C)
+    {
+        if(rocblaslt_is_complex_datatype(this->b_type))
+            this->trans_b = HIPBLAS_OP_T;
+    }
 }
 
 namespace
 {
-    template <typename T>
-    inline const T& read_scalar_from_ptr(const void* ptr)
-    {
-        return *(reinterpret_cast<const T*>(ptr));
-    }
-    static void assignAlphaBeta(rocisa::DataType computeType,
-                                rocisa::DataType typeA,
+    static void assignAlphaBeta(rocisa::DataType type,
                                 const void*      alphaPtr,
                                 const void*      betaPtr,
                                 double*          alpha,
                                 double*          beta)
     {
-
-        if(typeA == rocisa::DataType::ComplexFloat || typeA == rocisa::DataType::ComplexDouble)
+        switch(type)
         {
-            if(typeA == rocisa::DataType::ComplexDouble)
-            {
-                const std::complex<double> alpha_val
-                    = read_scalar_from_ptr<std::complex<double>>(alphaPtr);
-                const std::complex<double> beta_val
-                    = read_scalar_from_ptr<std::complex<double>>(betaPtr);
-                // Calculate magnitude and assign to double pointers
-                *alpha = std::abs(alpha_val);
-                *beta  = std::abs(beta_val);
-            }
-            else // typeA == rocisa::DataType::ComplexFloat
-            {
-                const std::complex<float> alpha_val
-                    = read_scalar_from_ptr<std::complex<float>>(alphaPtr);
-                const std::complex<float> beta_val
-                    = read_scalar_from_ptr<std::complex<float>>(betaPtr);
-                // Calculate magnitude and assign to double pointers
-                *alpha = std::abs(alpha_val);
-                *beta  = std::abs(beta_val);
-            }
-        }
-        else
-        {
-            switch(computeType)
-            {
-            case rocisa::DataType::Half:
-            case rocisa::DataType::Float:
-            case rocisa::DataType::XFloat32:
-            case rocisa::DataType::BFloat16:
-            case rocisa::DataType::Float8_fnuz:
-            case rocisa::DataType::BFloat8_fnuz:
-            case rocisa::DataType::Float8:
-            case rocisa::DataType::BFloat8:
-            {
-                *alpha = read_scalar_from_ptr<float>(alphaPtr);
-                *beta  = read_scalar_from_ptr<float>(betaPtr);
-                break;
-            }
-            case rocisa::DataType::Double:
-            {
-                *alpha = read_scalar_from_ptr<double>(alphaPtr);
-                *beta  = read_scalar_from_ptr<double>(betaPtr);
-                break;
-            }
-            case rocisa::DataType::Int32:
-            {
-                *alpha = read_scalar_from_ptr<int32_t>(alphaPtr);
-                *beta  = read_scalar_from_ptr<int32_t>(betaPtr);
-                break;
-            }
-            default:
-                throw std::runtime_error("Unsupported alpha/beta conversion type.");
-            }
+        case rocisa::DataType::Half:
+            *alpha = *(hipblasLtHalf*)alphaPtr;
+            *beta  = *(hipblasLtHalf*)betaPtr;
+            break;
+        case rocisa::DataType::Float:
+        case rocisa::DataType::XFloat32:
+            *alpha = *(float*)alphaPtr;
+            *beta  = *(float*)betaPtr;
+            break;
+        case rocisa::DataType::Double:
+            *alpha = *(double*)alphaPtr;
+            *beta  = *(double*)betaPtr;
+            break;
+        case rocisa::DataType::Int32:
+            *alpha = *(int32_t*)alphaPtr;
+            *beta  = *(int32_t*)betaPtr;
+            break;
+        default:
+            throw std::runtime_error("Unsupported alpha, beta type.");
         }
     }
+
     inline TensileLite::ActivationType getTensileActivationType(rocblaslt_epilogue epilogue)
     {
         switch(epilogue)
@@ -417,12 +388,12 @@ namespace
             return rocisa::DataType::Int8;
         case HIP_R_32I:
             return rocisa::DataType::Int32;
-        case HIP_R_6F_E2M3_EXT: // FIXME: fix this when tensile provide FP6 type
-            return rocisa::DataType::Float8;
-        case HIP_R_6F_E3M2_EXT: // FIXME: fix this when tensile provide BF6 type
-            return rocisa::DataType::Float8;
-        case HIP_R_4F_E2M1_EXT: // FIXME: fix this when tensile provide FP4 type
-            return rocisa::DataType::Float8;
+        case HIP_R_6F_E2M3_EXT:
+            return rocisa::DataType::Float6;
+        case HIP_R_6F_E3M2_EXT:
+            return rocisa::DataType::BFloat6;
+        case HIP_R_4F_E2M1_EXT:
+            return rocisa::DataType::Float4;
         case HIP_C_32F:
             return rocisa::DataType::ComplexFloat;
         case HIP_C_64F:
@@ -457,6 +428,12 @@ namespace
             return HIP_R_8I;
         case rocisa::DataType::Int32:
             return HIP_R_32I;
+        case rocisa::DataType::Float6:
+            return static_cast<hipDataType>(HIP_R_6F_E2M3_EXT);
+        case rocisa::DataType::BFloat6:
+            return static_cast<hipDataType>(HIP_R_6F_E3M2_EXT);
+        case rocisa::DataType::Float4:
+            return static_cast<hipDataType>(HIP_R_4F_E2M1_EXT);
         case rocisa::DataType::ComplexFloat:
             return HIP_C_32F;
         case rocisa::DataType::ComplexDouble:
@@ -497,9 +474,9 @@ namespace
     }
 
     inline const rocisa::DataType
-        roc2TensileComputeInputType(const rocisa::DataType&       typeA,
-                                    const rocisa::DataType&       typeB,
-                                    const rocblaslt_compute_type& typeCompute)
+        roc2TensileComputeInputTypeA(const rocisa::DataType&       typeA,
+                                     const rocisa::DataType&       typeB,
+                                     const rocblaslt_compute_type& typeCompute)
     {
         switch(typeCompute)
         {
@@ -512,36 +489,90 @@ namespace
         case rocblaslt_compute_f32_fast_bf8_fnuz:
             return rocisa::DataType::BFloat8_fnuz;
         case rocblaslt_compute_f32_fast_f8bf8_fnuz:
-            return rocisa::DataType::Float8BFloat8_fnuz;
+            return rocisa::DataType::Float8_fnuz;
         case rocblaslt_compute_f32_fast_bf8f8_fnuz:
-            return rocisa::DataType::BFloat8Float8_fnuz;
+            return rocisa::DataType::BFloat8_fnuz;
         case rocblaslt_compute_f32_fast_f8:
             return rocisa::DataType::Float8;
         case rocblaslt_compute_f32_fast_bf8:
             return rocisa::DataType::BFloat8;
         case rocblaslt_compute_f32_fast_f8bf8:
-            return rocisa::DataType::Float8BFloat8;
+            return rocisa::DataType::Float8;
         case rocblaslt_compute_f32_fast_bf8f8:
-            return rocisa::DataType::BFloat8Float8;
+            return rocisa::DataType::BFloat8;
         default:;
         }
 
         if(typeA == rocisa::DataType::Float8_fnuz && typeB == rocisa::DataType::BFloat8_fnuz)
         {
-            return rocisa::DataType::Float8BFloat8_fnuz;
+            return rocisa::DataType::Float8_fnuz;
         }
         else if(typeA == rocisa::DataType::BFloat8_fnuz && typeB == rocisa::DataType::Float8_fnuz)
         {
-            return rocisa::DataType::BFloat8Float8_fnuz;
+            return rocisa::DataType::BFloat8_fnuz;
         }
 
         if(typeA == rocisa::DataType::Float8 && typeB == rocisa::DataType::BFloat8)
         {
-            return rocisa::DataType::Float8BFloat8;
+            return rocisa::DataType::Float8;
         }
         else if(typeA == rocisa::DataType::BFloat8 && typeB == rocisa::DataType::Float8)
         {
-            return rocisa::DataType::BFloat8Float8;
+            return rocisa::DataType::BFloat8;
+        }
+
+        return TensileLite::DataTypeInfo::Get(typeA).elementSize
+                       <= TensileLite::DataTypeInfo::Get(typeB).elementSize
+                   ? typeA
+                   : typeB;
+    }
+	
+	inline const rocisa::DataType
+        roc2TensileComputeInputTypeB(const rocisa::DataType&       typeA,
+                                     const rocisa::DataType&       typeB,
+                                     const rocblaslt_compute_type& typeCompute)
+    {
+        switch(typeCompute)
+        {
+        case rocblaslt_compute_f32_fast_f16:
+            return rocisa::DataType::Half;
+        case rocblaslt_compute_f32_fast_bf16:
+            return rocisa::DataType::BFloat16;
+        case rocblaslt_compute_f32_fast_f8_fnuz:
+            return rocisa::DataType::Float8_fnuz;
+        case rocblaslt_compute_f32_fast_bf8_fnuz:
+            return rocisa::DataType::BFloat8_fnuz;
+        case rocblaslt_compute_f32_fast_f8bf8_fnuz:
+            return rocisa::DataType::BFloat8_fnuz;
+        case rocblaslt_compute_f32_fast_bf8f8_fnuz:
+            return rocisa::DataType::Float8_fnuz;
+        case rocblaslt_compute_f32_fast_f8:
+            return rocisa::DataType::Float8;
+        case rocblaslt_compute_f32_fast_bf8:
+            return rocisa::DataType::BFloat8;
+        case rocblaslt_compute_f32_fast_f8bf8:
+            return rocisa::DataType::BFloat8;
+        case rocblaslt_compute_f32_fast_bf8f8:
+            return rocisa::DataType::Float8;
+        default:;
+        }
+
+        if(typeA == rocisa::DataType::Float8_fnuz && typeB == rocisa::DataType::BFloat8_fnuz)
+        {
+            return rocisa::DataType::BFloat8_fnuz;
+        }
+        else if(typeA == rocisa::DataType::BFloat8_fnuz && typeB == rocisa::DataType::Float8_fnuz)
+        {
+            return rocisa::DataType::Float8_fnuz;
+        }
+
+        if(typeA == rocisa::DataType::Float8 && typeB == rocisa::DataType::BFloat8)
+        {
+            return rocisa::DataType::BFloat8;
+        }
+        else if(typeA == rocisa::DataType::BFloat8 && typeB == rocisa::DataType::Float8)
+        {
+            return rocisa::DataType::Float8;
         }
 
         return TensileLite::DataTypeInfo::Get(typeA).elementSize
@@ -604,7 +635,8 @@ namespace
             hip2TensileType(typeD),
             alphaBetaType,
             alphaBetaType,
-            roc2TensileComputeInputType(typeATensile, typeBTensile, typeCompute),
+            roc2TensileComputeInputTypeA(typeATensile, typeBTensile, typeCompute),
+            roc2TensileComputeInputTypeB(typeATensile, typeBTensile, typeCompute),
             roc2TensileType(typeCompute),
             alpha,
             beta,
@@ -613,16 +645,13 @@ namespace
             biasDataTypeWhiteList,
             biasSrcWhiteList,
             isGroupedGemm,
-            maxWorkspaceBytes,
-            aOps,
-            bOps,
-            cOps,
-            dOps);
+            maxWorkspaceBytes);
     }
 
     const char* tensileComputeInputType_to_bench_string(rocisa::DataType typeCompute,
                                                         rocisa::DataType F32XdlMathOp,
-                                                        rocisa::DataType typeComputeInput,
+                                                        rocisa::DataType typeComputeInputA,
+                                                        rocisa::DataType typeComputeInputB,
                                                         rocisa::DataType typeA,
                                                         rocisa::DataType typeB)
     {
@@ -636,12 +665,6 @@ namespace
         case rocisa::DataType::Int32:
             return "i32_r";
             break;
-        case rocisa::DataType::ComplexFloat:
-            return "f32_r";
-            break;
-        case rocisa::DataType::ComplexDouble:
-            return "f64_r";
-            break;       
         default:
             throw std::runtime_error("Unsupported type.");
         }
@@ -650,13 +673,14 @@ namespace
         {
             return "xf32_r";
         }
-        else if(typeComputeInput == rocisa::DataType::BFloat16
-                && (typeA == rocisa::DataType::Half && typeB == rocisa::DataType::Half
-                    || typeA == rocisa::DataType::Float && typeB == rocisa::DataType::Float))
+        else if(typeComputeInputA == rocisa::DataType::BFloat16
+                && typeComputeInputB == rocisa::DataType::BFloat16 && typeA == rocisa::DataType::Half
+                && typeB == rocisa::DataType::Half)
         {
             return "f32_bf16_r";
         }
-        else if(typeComputeInput == rocisa::DataType::Half
+        else if(typeComputeInputA == rocisa::DataType::Half
+                && typeComputeInputB == rocisa::DataType::Half
                 && (typeA == rocisa::DataType::Float8_fnuz && typeB == rocisa::DataType::Half
                     || typeA == rocisa::DataType::Half && typeB == rocisa::DataType::Float8_fnuz))
         {
@@ -670,7 +694,8 @@ namespace
 
     const char* tensileComputeInputType_to_profile_string(rocisa::DataType typeCompute,
                                                           rocisa::DataType F32XdlMathOp,
-                                                          rocisa::DataType typeComputeInput,
+                                                          rocisa::DataType typeComputeInputA,
+                                                          rocisa::DataType typeComputeInputB,
                                                           rocisa::DataType typeA,
                                                           rocisa::DataType typeB)
     {
@@ -684,12 +709,6 @@ namespace
         case rocisa::DataType::Int32:
             return "c_i32_r";
             break;
-        case rocisa::DataType::ComplexFloat:
-            return "c_f32_r";
-            break;
-        case rocisa::DataType::ComplexDouble:
-            return "c_f64_r";
-            break;    
         default:
             throw std::runtime_error("Unsupported type.");
         }
@@ -698,13 +717,14 @@ namespace
         {
             return "c_xf32_r";
         }
-        else if(typeComputeInput == rocisa::DataType::BFloat16
-                && (typeA == rocisa::DataType::Half && typeB == rocisa::DataType::Half
-                    || typeA == rocisa::DataType::Float && typeB == rocisa::DataType::Float))
+        else if(typeComputeInputA == rocisa::DataType::BFloat16
+                && typeComputeInputB == rocisa::DataType::BFloat16 && typeA == rocisa::DataType::Half
+                && typeB == rocisa::DataType::Half)
         {
             return "c_f32_fast_bf16_r";
         }
-        else if(typeComputeInput == rocisa::DataType::Half
+        else if(typeComputeInputA == rocisa::DataType::Half
+                && typeComputeInputB == rocisa::DataType::Half
                 && (typeA == rocisa::DataType::Float8_fnuz && typeB == rocisa::DataType::Half
                     || typeA == rocisa::DataType::Half && typeB == rocisa::DataType::Float8_fnuz))
         {
@@ -740,43 +760,6 @@ namespace
         }
     }
 
-    inline std::string getAlphaRealAsString(const TensileLite::ContractionInputs& inputs, bool isComplex)
-    {
-        return isComplex 
-            ?  (std::holds_alternative<std::complex<float>>(inputs.alpha)
-                ?  std::to_string(std::get<std::complex<float>>(inputs.alpha).real())
-                : std::to_string(std::get<std::complex<double>>(inputs.alpha).real()))
-            : ToString(inputs.alpha);
-    }
-
-    inline std::string getAlphaImagAsString(const TensileLite::ContractionInputs& inputs, bool isComplex)
-    {
-        return isComplex
-            ?  (std::holds_alternative<std::complex<float>>(inputs.alpha)
-                ?  std::to_string(std::get<std::complex<float>>(inputs.alpha).imag())
-                : std::to_string(std::get<std::complex<double>>(inputs.alpha).imag()))
-            : std::to_string(0.0);
-    }
-
-    inline std::string getBetaRealAsString(const TensileLite::ContractionInputs& inputs, bool isComplex)
-    {
-        return isComplex
-            ?  (std::holds_alternative<std::complex<float>>(inputs.beta)
-                ?  std::to_string(std::get<std::complex<float>>(inputs.beta).real())
-                : std::to_string(std::get<std::complex<double>>(inputs.beta).real()))
-            : ToString(inputs.beta);
-    }
-
-    inline std::string getBetaImagAsString(const TensileLite::ContractionInputs& inputs, bool isComplex)
-    {
-        return isComplex
-            ?  (std::holds_alternative<std::complex<float>>(inputs.beta)
-                ?  std::to_string(std::get<std::complex<float>>(inputs.beta).imag())
-                : std::to_string(std::get<std::complex<double>>(inputs.beta).imag()))
-            : std::to_string(0.0f);
-    }
-
-
     inline void logBenchFromTensileDataGemm(const TensileLite::ContractionProblemGemm& problem,
                                             const TensileLite::ContractionInputs&      inputs,
                                             const int&     solutionIndex,
@@ -786,8 +769,6 @@ namespace
                                             const int32_t& hotIterations,
                                             bool           isCpp)
     {
-        bool isComplexInput = (problem.a().dataType() == rocisa::DataType::ComplexFloat
-                               || problem.a().dataType() == rocisa::DataType::ComplexDouble);
         auto s = log_str(
             __func__,
             "--api_method",
@@ -829,13 +810,9 @@ namespace
                       problem.tensor(TensileLite::ContractionProblemGemm::TENSOR::E).strides()[2])
                 : "",
             "--alpha",
-            getAlphaRealAsString(inputs, isComplexInput),
-            "--alphai",
-            getAlphaImagAsString(inputs, isComplexInput),
+            ToString(inputs.alpha),
             "--beta",
-            getBetaRealAsString(inputs, isComplexInput),
-            "--betai",
-            getBetaImagAsString(inputs, isComplexInput),
+            ToString(inputs.beta),
             "--transA",
             problem.transA() ? "T" : "N",
             "--transB",
@@ -878,7 +855,8 @@ namespace
             "--compute_type",
             tensileComputeInputType_to_bench_string(problem.computeType(),
                                                     problem.f32XdlMathOp(),
-                                                    problem.computeInputType(),
+                                                    problem.computeInputTypeA(),
+                                                    problem.computeInputTypeB(),
                                                     problem.a().dataType(),
                                                     problem.b().dataType()),
             "--algo_method",
@@ -919,9 +897,6 @@ namespace
                                               const int32_t& hotIterations,
                                               bool           isCpp)
     {
-        bool isComplexInput = (problem.a().dataType() == rocisa::DataType::ComplexFloat
-                               || problem.a().dataType() == rocisa::DataType::ComplexDouble);
-
         log_profile("matmul",
                     "M",
                     problem.c().sizes()[0],
@@ -946,13 +921,9 @@ namespace
                     "stride_d",
                     problem.d().strides()[2],
                     "alpha",
-                    getAlphaRealAsString(inputs, isComplexInput),
-                    "alphai",
-                    getAlphaImagAsString(inputs, isComplexInput),
+                    ToString(inputs.alpha),
                     "beta",
-                    getBetaRealAsString(inputs, isComplexInput),
-                    "betai",
-                    getBetaImagAsString(inputs, isComplexInput),
+                    ToString(inputs.beta),
                     "transA",
                     problem.transA() ? "T" : "N",
                     "transB",
@@ -998,7 +969,8 @@ namespace
                     "compute_type",
                     tensileComputeInputType_to_profile_string(problem.computeType(),
                                                               problem.f32XdlMathOp(),
-                                                              problem.computeInputType(),
+                                                              problem.computeInputTypeA(),
+                                                              problem.computeInputTypeB(),
                                                               problem.a().dataType(),
                                                               problem.b().dataType()),
                     "algo_method",
@@ -1031,9 +1003,6 @@ namespace
                                               const int32_t&     hotIterations,
                                               bool               isCpp)
     {
-        bool isComplexInput = (problem.a().dataType() == rocisa::DataType::ComplexFloat
-                               || problem.a().dataType() == rocisa::DataType::ComplexDouble);
-                               
         log_profile("matmul",
                     "M",
                     problem.c().sizes()[0],
@@ -1058,13 +1027,9 @@ namespace
                     "stride_d",
                     problem.d().strides()[2],
                     "alpha",
-                    getAlphaRealAsString(inputs, isComplexInput),
-                    "alphai",
-                    getAlphaImagAsString(inputs, isComplexInput),
+                    ToString(inputs.alpha),
                     "beta",
-                    getBetaRealAsString(inputs, isComplexInput),
-                    "betai",
-                    getBetaImagAsString(inputs, isComplexInput),
+                    ToString(inputs.beta),
                     "transA",
                     problem.transA() ? "T" : "N",
                     "transB",
@@ -1110,7 +1075,8 @@ namespace
                     "compute_type",
                     tensileComputeInputType_to_profile_string(problem.computeType(),
                                                               problem.f32XdlMathOp(),
-                                                              problem.computeInputType(),
+                                                              problem.computeInputTypeA(),
+                                                              problem.computeInputTypeB(),
                                                               problem.a().dataType(),
                                                               problem.b().dataType()),
                     "activation_type",
@@ -1239,7 +1205,8 @@ namespace
             "--compute_type",
             tensileComputeInputType_to_bench_string(problem.gemms[0].computeType(),
                                                     problem.gemms[0].f32XdlMathOp(),
-                                                    problem.gemms[0].computeInputType(),
+                                                    problem.gemms[0].computeInputTypeA(),
+                                                    problem.gemms[0].computeInputTypeB(),
                                                     problem.gemms[0].a().dataType(),
                                                     problem.gemms[0].b().dataType()),
             "--algo_method",
@@ -1398,7 +1365,8 @@ namespace
             "compute_type",
             tensileComputeInputType_to_profile_string(problem.gemms[0].computeType(),
                                                       problem.gemms[0].f32XdlMathOp(),
-                                                      problem.gemms[0].computeInputType(),
+                                                      problem.gemms[0].computeInputTypeA(),
+                                                      problem.gemms[0].computeInputTypeB(),
                                                       problem.gemms[0].a().dataType(),
                                                       problem.gemms[0].b().dataType()),
             "algo_method",
@@ -1547,7 +1515,8 @@ namespace
             "compute_type",
             tensileComputeInputType_to_profile_string(problem.gemms[0].computeType(),
                                                       problem.gemms[0].f32XdlMathOp(),
-                                                      problem.gemms[0].computeInputType(),
+                                                      problem.gemms[0].computeInputTypeA(),
+                                                      problem.gemms[0].computeInputTypeB(),
                                                       problem.gemms[0].a().dataType(),
                                                       problem.gemms[0].b().dataType()),
             "activation_type",
@@ -1601,7 +1570,7 @@ namespace
         // inputs. It optimizes all problems with alpha==0 into K=0 and alpha=(don't
         // care)
         double alpha = 0, beta = 0;
-        assignAlphaBeta(compute_type, a_type, prob.alpha, prob.beta, &alpha, &beta);
+        assignAlphaBeta(compute_type, prob.alpha, prob.beta, &alpha, &beta);
         auto k = prob.k && alpha ? prob.k : 0;
 
         // fallback to f32 for f16 compute type after alpha/beta assignment
@@ -1702,8 +1671,10 @@ namespace
                                                            value_category(beta),
                                                            prob.workspaceSize};
 
-        tensileProblem.setComputeInputType(
-            roc2TensileComputeInputType(a_type, b_type, prob.compute_type));
+        tensileProblem.setComputeInputTypeA(
+            roc2TensileComputeInputTypeA(a_type, b_type, prob.compute_type));
+        tensileProblem.setComputeInputTypeB(
+            roc2TensileComputeInputTypeB(a_type, b_type, prob.compute_type));
 
         bool isComplexInput = (a_type == rocisa::DataType::ComplexFloat
                                || a_type == rocisa::DataType::ComplexDouble);
@@ -1759,12 +1730,27 @@ namespace
         tensileProblem.setParams().setBiasEnum(
             tensileUseBias(prob.epilogue) ? biasType : rocisa::DataType::None);
 
-        tensileProblem.setUseScaleAB(
-            (prob.scaleA == nullptr && prob.scaleB == nullptr)
-                ? ""
-                : ((prob.scaleAType == RocblasltContractionProblem::ScalingFormat::Vector)
-                       ? "Vector"
-                       : "Scalar"));
+	// NOTE: for MX data types, Tensile sets useScaleAB field in yaml to be empty.
+	if((prob.scaleA == nullptr && prob.scaleB == nullptr) or
+		prob.scaleAType == RocblasltContractionProblem::ScalingFormat::Block_32_UE8M0 or
+		prob.scaleAType == RocblasltContractionProblem::ScalingFormat::Block_32_UE8M0_32_8_EXT)
+	{
+	    // Currently A & B must both be MX data types or non-MX data types. Mixing is not supported.
+	    assert( prob.scaleBType == RocblasltContractionProblem::ScalingFormat::Block_32_UE8M0 or
+		    prob.scaleBType == RocblasltContractionProblem::ScalingFormat::Block_32_UE8M0_32_8_EXT);
+	    tensileProblem.setUseScaleAB("");
+	}
+	else
+	{
+	    // Currently A & B must both be MX data types or non-MX data types. Mixing is not supported.
+	    assert( prob.scaleBType != RocblasltContractionProblem::ScalingFormat::Block_32_UE8M0 and
+		    prob.scaleBType != RocblasltContractionProblem::ScalingFormat::Block_32_UE8M0_32_8_EXT);
+	    tensileProblem.setUseScaleAB(
+		    (prob.scaleAType == RocblasltContractionProblem::ScalingFormat::Vector)
+			? "Vector"
+			: "Scalar");
+	}
+
         tensileProblem.setUseScaleCD(prob.scaleC != nullptr || prob.scaleD != nullptr);
         tensileProblem.setUseScaleAlphaVec(prob.scaleAlphaVec != nullptr);
         tensileProblem.setScaleAlphaVec(compute_type, d.sizes()[0]);
@@ -1877,14 +1863,8 @@ namespace
                                    {prob.m, prob.n, prob.batch_count},
                                    {prob.row_stride_d, prob.col_stride_d, prob.batch_stride_d});
 
-        if(prob.trans_a == HIPBLAS_OP_C)
-            tensileProblem.setAOps({TensileLite::TensorOp::ComplexConjugate()});
-
-        if(prob.trans_b == HIPBLAS_OP_C)
-            tensileProblem.setBOps({TensileLite::TensorOp::ComplexConjugate()});
-
         double alpha = 0, beta = 0;
-        assignAlphaBeta(compute_type, a_type, prob.alpha, prob.beta, &alpha, &beta);
+        assignAlphaBeta(compute_type, prob.alpha, prob.beta, &alpha, &beta);
 
         // fallback to f32 for f16 compute type after alpha/beta assignment
         if(prob.compute_type == rocblaslt_compute_f16)
@@ -1894,8 +1874,10 @@ namespace
 
         tensileProblem.updateProblem(freeIndex, batchIndex, boundIndex, beta, prob.workspaceSize);
 
-        tensileProblem.setComputeInputType(
-            roc2TensileComputeInputType(a_type, b_type, prob.compute_type));
+        tensileProblem.setComputeInputTypeA(
+            roc2TensileComputeInputTypeA(a_type, b_type, prob.compute_type));
+        tensileProblem.setComputeInputTypeB(
+            roc2TensileComputeInputTypeB(a_type, b_type, prob.compute_type));
 
         bool isComplexInput = (a_type == rocisa::DataType::ComplexFloat
                                || a_type == rocisa::DataType::ComplexDouble);
@@ -1918,57 +1900,14 @@ namespace
         else
             tensileProblem.setUseDeviceUserArguments(false);
 
-        auto get_scalar_value_from_void_ptr
-            = [](const void* ptr, hipDataType type) -> TensileLite::ScalarValue {
-            if(!ptr)
-                return TensileLite::ScalarValue::Any; // Safety check
-
-            if(type == HIP_C_64F)
-            {
-                auto val = *(reinterpret_cast<const std::complex<double>*>(ptr));
-                return TensileLite::toScalarValueEnum(val);
-            }
-            else if(type == HIP_C_32F)
-            {
-                auto val = *(reinterpret_cast<const std::complex<float>*>(ptr));
-                return TensileLite::toScalarValueEnum(val);
-            }
-            else if(type == HIP_R_64F)
-            {
-                auto val = *(reinterpret_cast<const double*>(ptr));
-                return TensileLite::toScalarValueEnum(val);
-            }
-            else if(type == HIP_R_32I)
-            {
-                auto val = *(reinterpret_cast<const int32_t*>(ptr));
-                return TensileLite::toScalarValueEnum(val);
-            }
-            else
-            {
-                auto val = *(reinterpret_cast<const float*>(ptr));
-                return TensileLite::toScalarValueEnum(val);
-            }
-        };
-
         // alpha and beta are stored by value in TensileLite::TypedContractionInputs
         // alpha and beta are copied from host to TensileLite::TypedContractionInputs
         // If k==0, we do not need to dereference prob.alpha and can set
         // tensileAlpha=0 Not positive if this is necessary here as well
-        if(prob.k == 0)
-        {
-            // If K=0, A*B is zero. Alpha doesn't matter.
-            tensileProblem.setAlphaRestriction(TensileLite::toScalarValueEnum(0.0));
-        }
-        else
-        {
-            // Read directly from prob.alpha using the matrix type
-            auto alpha_restriction = get_scalar_value_from_void_ptr(prob.alpha, prob.a_type);
-            tensileProblem.setAlphaRestriction(alpha_restriction);
-        }
-
-        //set beta restrictions
-        auto beta_restriction = get_scalar_value_from_void_ptr(prob.beta, prob.d_type);
-        tensileProblem.setBetaRestriction(beta_restriction);
+        double alphaRestriction = 0;
+        if(prob.k)
+            alphaRestriction = alpha;
+        tensileProblem.setAlphaRestriction(TensileLite::toScalarValueEnum(alphaRestriction));
 
         // Add problem predicates for CEqualsD
         tensileProblem.setCEqualsD(prob.C == prob.D);
@@ -1987,12 +1926,27 @@ namespace
         tensileProblem.setParams().setBiasEnum(
             tensileUseBias(prob.epilogue) ? biasType : rocisa::DataType::None);
 
-        tensileProblem.setUseScaleAB(
-            (prob.scaleA == nullptr && prob.scaleB == nullptr)
-                ? ""
-                : ((prob.scaleAType == RocblasltContractionProblem::ScalingFormat::Vector)
-                       ? "Vector"
-                       : "Scalar"));
+        // NOTE: for MX data types, Tensile sets useScaleAB field in yaml to be empty.
+	if((prob.scaleA == nullptr && prob.scaleB == nullptr) or
+		prob.scaleAType == RocblasltContractionProblem::ScalingFormat::Block_32_UE8M0 or
+		prob.scaleAType == RocblasltContractionProblem::ScalingFormat::Block_32_UE8M0_32_8_EXT)
+	{
+	    // Currently A & B must both be MX data types or non-MX data types. Mixing is not supported.
+	    assert( prob.scaleBType == RocblasltContractionProblem::ScalingFormat::Block_32_UE8M0 or
+		    prob.scaleBType == RocblasltContractionProblem::ScalingFormat::Block_32_UE8M0_32_8_EXT);
+	    tensileProblem.setUseScaleAB("");
+	}
+	else
+	{
+	    // Currently A & B must both be MX data types or non-MX data types. Mixing is not supported.
+	    assert( prob.scaleBType != RocblasltContractionProblem::ScalingFormat::Block_32_UE8M0 and
+		    prob.scaleBType != RocblasltContractionProblem::ScalingFormat::Block_32_UE8M0_32_8_EXT);
+	    tensileProblem.setUseScaleAB(
+		    (prob.scaleAType == RocblasltContractionProblem::ScalingFormat::Vector)
+			? "Vector"
+			: "Scalar");
+	}
+
         tensileProblem.setUseScaleCD(prob.scaleC != nullptr || prob.scaleD != nullptr);
         tensileProblem.setUseScaleAlphaVec(prob.scaleAlphaVec != nullptr);
         tensileProblem.setScaleAlphaVec(compute_type, d.sizes()[0]);
@@ -2034,43 +1988,13 @@ namespace
 
         tensileProblem.setSwizzleTensorA(prob.swizzleA);
         tensileProblem.setSwizzleTensorB(prob.swizzleB);
-    }
 
-    rocisa::DataType computeTypeToRocisaDataType(rocblaslt_compute_type compute_type)
-    {
-        switch(compute_type)
-        {
-        case rocblaslt_compute_f16:
-            return rocisa::DataType::Half;
-
-        case rocblaslt_compute_f32:
-            // Case f32 is often the base type for f32_r compute
-            return rocisa::DataType::Float;
-
-        case rocblaslt_compute_f32_fast_xf32:
-            return rocisa::DataType::XFloat32;
-
-        case rocblaslt_compute_f64:
-            return rocisa::DataType::Double;
-
-        case rocblaslt_compute_i32:
-            return rocisa::DataType::Int32;
-
-        case rocblaslt_compute_f32_fast_f16:
-        case rocblaslt_compute_f32_fast_bf16:
-        case rocblaslt_compute_f32_fast_f8_fnuz:
-        case rocblaslt_compute_f32_fast_bf8_fnuz:
-        case rocblaslt_compute_f32_fast_f8bf8_fnuz:
-        case rocblaslt_compute_f32_fast_bf8f8_fnuz:
-        case rocblaslt_compute_f32_fast_f8:
-        case rocblaslt_compute_f32_fast_bf8:
-        case rocblaslt_compute_f32_fast_f8bf8:
-        case rocblaslt_compute_f32_fast_bf8f8:
-            return rocisa::DataType::Float;
-
-        default:
-            return rocisa::DataType::None;
-        }
+	if(prob.scaleAType == RocblasltContractionProblem::ScalingFormat::Block_32_UE8M0 or
+   	   prob.scaleAType == RocblasltContractionProblem::ScalingFormat::Block_32_UE8M0_32_8_EXT)
+	    tensileProblem.setMXScaleA(32);
+	if(prob.scaleBType == RocblasltContractionProblem::ScalingFormat::Block_32_UE8M0 or
+   	   prob.scaleBType == RocblasltContractionProblem::ScalingFormat::Block_32_UE8M0_32_8_EXT)
+	    tensileProblem.setMXScaleB(32);
     }
 
     /***************************************************************
@@ -2106,8 +2030,29 @@ namespace
             inputs.bias = reinterpret_cast<const void*>(prob.bias);
         else
             inputs.bias = nullptr;
-        inputs.scaleA        = reinterpret_cast<const void*>(prob.scaleA);
-        inputs.scaleB        = reinterpret_cast<const void*>(prob.scaleB);
+
+	if(prob.scaleAType == RocblasltContractionProblem::ScalingFormat::Block_32_UE8M0 or
+           prob.scaleAType == RocblasltContractionProblem::ScalingFormat::Block_32_UE8M0_32_8_EXT)
+	{
+	    // Currently A & B must both be MX data types or non-MX data types. Mixing is not supported.
+	    assert( prob.scaleBType == RocblasltContractionProblem::ScalingFormat::Block_32_UE8M0 or
+		    prob.scaleBType == RocblasltContractionProblem::ScalingFormat::Block_32_UE8M0_32_8_EXT);
+	    inputs.scaleA        = nullptr;
+	    inputs.scaleB        = nullptr;
+	    inputs.mxsa        = reinterpret_cast<const void*>(prob.scaleA);
+	    inputs.mxsb        = reinterpret_cast<const void*>(prob.scaleB);
+	}
+	else
+	{
+	    // Currently A & B must both be MX data types or non-MX data types. Mixing is not supported.
+	    assert( prob.scaleBType != RocblasltContractionProblem::ScalingFormat::Block_32_UE8M0 and
+		    prob.scaleBType != RocblasltContractionProblem::ScalingFormat::Block_32_UE8M0_32_8_EXT);
+	    inputs.scaleA      = reinterpret_cast<const void*>(prob.scaleA);
+	    inputs.scaleB      = reinterpret_cast<const void*>(prob.scaleB);
+	    inputs.mxsa        = nullptr;
+	    inputs.mxsb        = nullptr;
+	}
+
         inputs.scaleC        = reinterpret_cast<const void*>(prob.scaleC);
         inputs.scaleD        = reinterpret_cast<const void*>(prob.scaleD);
         inputs.scaleAlphaVec = reinterpret_cast<const void*>(prob.scaleAlphaVec);
@@ -2127,74 +2072,34 @@ namespace
             throw std::runtime_error("[GetTensileInputs] unsupported compute type.");
         }
 
-        {
-            const rocisa::DataType complex_check_type
-                = (prob.a_type == HIP_C_64F)   ? rocisa::DataType::ComplexDouble
-                  : (prob.a_type == HIP_C_32F) ? rocisa::DataType::ComplexFloat
-                                               : rocisa::DataType::None;
-
-            TensileLite::ConstantVariant visitable_alpha_beta_arg;
-
-            // If the matrix type is complex, manually inject the complex zero variant.
-            if(complex_check_type != rocisa::DataType::None)
-            {
-                if(complex_check_type == rocisa::DataType::ComplexDouble)
+        // push 2 activation arguments
+        std::visit(
+            [&inputs, &prob](auto val) {
+                using ValType = decltype(val);
+                if constexpr (std::is_constructible_v<ValType, float>)
                 {
-                    visitable_alpha_beta_arg = std::complex<double>(0.0, 0.0);
+                    inputs.activationArgs.push_back(static_cast<ValType>(prob.act0));
+                    inputs.activationArgs.push_back(static_cast<ValType>(prob.act1));
                 }
                 else
                 {
-                    visitable_alpha_beta_arg = std::complex<float>(0.0f, 0.0f);
+                    inputs.activationArgs.push_back(prob.act0);
+                    inputs.activationArgs.push_back(prob.act1);
                 }
-            }
-            else
-            {
-                // If not complex, fall back to the compute type map.
-                rocisa::DataType key_type = computeTypeToRocisaDataType(prob.compute_type);
+                if(prob.k)
+                    inputs.alpha = *(ValType*)(prob.alpha);
+                else
+                    inputs.alpha = val;
+                inputs.beta = *(ValType*)(prob.beta);
+            },
+            argument_vals.at(compute_type));
 
-                auto it = argument_vals.find(key_type);
-                if(it == argument_vals.end())
-                {
-                    // Handle error/default case for unsupported compute types here
-                    log_error(__func__, "Unsupported compute type in argument_vals map.");
-                    throw std::runtime_error("[GetTensileInputs] unsupported compute type.");
-                }
-                visitable_alpha_beta_arg = it->second;
-            }
-
-            // Now run the visit with the correctly type-resolved variant
-            std::visit(
-                [&inputs, &prob](auto val) {
-                    using T = decltype(val);
-                    if(prob.k)
-                        inputs.alpha = *(decltype(val)*)(prob.alpha);
-                    else
-                        inputs.alpha = val;
-                    inputs.beta = *(decltype(val)*)(prob.beta);
-                },
-                visitable_alpha_beta_arg);
-        }
-
+        // convert alpha and beta to float if compute type is half
+        if(prob.compute_type == rocblaslt_compute_f16)
         {
-            rocisa::DataType key_type = computeTypeToRocisaDataType(prob.compute_type);
-
-            auto it = argument_vals.find(key_type);
-
-            if(it == argument_vals.end())
-            {
-                // Handle error as before
-                log_error(__func__, "Unsupported compute type for activation args");
-                throw std::runtime_error("[GetTensileInputs] unsupported compute type.");
-            }
-
-            std::visit(
-                [&inputs, &prob](auto val) {
-                    using T_compute = decltype(val);
-
-                    inputs.activationArgs.push_back(T_compute(prob.act0));
-                    inputs.activationArgs.push_back(T_compute(prob.act1));
-                },
-                it->second);
+            inputs.activationArgs = {prob.act0, prob.act1};
+            inputs.alpha          = static_cast<float>(std::get<hipblasLtHalf>(inputs.alpha));
+            inputs.beta           = static_cast<float>(std::get<hipblasLtHalf>(inputs.beta));
         }
 
         return inputs;
@@ -2692,7 +2597,7 @@ TensileLite::ProblemOverride TensileDataGemm2ProblemOverride(std::shared_ptr<voi
 {
     std::shared_ptr<TensileDataGemm> data = std::static_pointer_cast<TensileDataGemm>(gemmData);
     rocisa::DataType                 computeType      = rocisa::DataType::None;
-    rocisa::DataType                 computeInputType = data->problem.computeInputType();
+    rocisa::DataType                 computeInputType = data->problem.computeInputTypeA();
 
     if(data->problem.f32XdlMathOp() == rocisa::DataType::XFloat32)
     {
@@ -2831,12 +2736,6 @@ rocblaslt_status runContractionProblem(rocblaslt_handle                   handle
 
         std::shared_ptr<TensileDataGemm> data = std::static_pointer_cast<TensileDataGemm>(gemmData);
         rocblaslt_matmul_heuristic_result heuristicResult;
-
-        if(prob.trans_a == HIPBLAS_OP_C)
-            data->problem.setAOps({TensileLite::TensorOp::ComplexConjugate()});
-        if(prob.trans_b == HIPBLAS_OP_C)
-            data->problem.setBOps({TensileLite::TensorOp::ComplexConjugate()});
-
         if(algo == nullptr)
         {
             int returnAlgoCount;
@@ -3983,7 +3882,7 @@ rocblaslt_status getAllSolutions(MyProblem&                                     
 
     heuristicResults.resize(solutions.size());
 
-    int i                 = 0;
+    int i = 0;
     int duplicated_counts = 0;
     for(auto solution : solutions)
     {

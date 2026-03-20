@@ -513,6 +513,10 @@ def createLibraryLogic(schedulePrefix, architectureName, deviceNames, libraryTyp
     problemTypeState = problemType.state
     problemTypeState["DataType"] = \
             problemTypeState["DataType"].value
+    problemTypeState["MacDataTypeA"] = \
+            problemTypeState["MacDataTypeA"].value
+    problemTypeState["MacDataTypeB"] = \
+            problemTypeState["MacDataTypeB"].value
     problemTypeState["DataTypeA"] = \
             problemTypeState["DataTypeA"].value
     problemTypeState["DataTypeB"] = \

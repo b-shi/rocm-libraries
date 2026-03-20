@@ -73,7 +73,16 @@ namespace rocisa
             return "F8B8N";
         case rocisa::DataType::BFloat8Float8_fnuz:
             return "B8F8N";
-        case rocisa::DataType::Count:;
+        case rocisa::DataType::Float6:
+            return "F6";
+        case rocisa::DataType::BFloat6:
+            return "B6";
+        case rocisa::DataType::Float4:
+            return "F4";
+        case rocisa::DataType::MXScale:
+            return "MX";
+        case rocisa::DataType::Count:
+            return "Invalid";
         }
         return "Invalid";
     }
@@ -120,7 +129,25 @@ namespace rocisa
             return TensileLite::TypeInfo<Float8BFloat8_fnuz>::ElementSize;
         case rocisa::DataType::BFloat8Float8_fnuz:
             return TensileLite::TypeInfo<BFloat8Float8_fnuz>::ElementSize;
-        case rocisa::DataType::Count:;
+#ifdef _WIN32
+        case rocisa::DataType::Float6:
+            return TensileLite::TypeInfo<TensileLite::Float6>::ElementSize;
+        case rocisa::DataType::BFloat6:
+            return TensileLite::TypeInfo<TensileLite::BFloat6>::ElementSize;
+        case rocisa::DataType::Float4:
+            return TensileLite::TypeInfo<TensileLite::Float4>::ElementSize;
+#else // _WIN32
+        case rocisa::DataType::Float6:
+            return TensileLite::TypeInfo<TensileLite::Float6x32>::ElementSize;
+        case rocisa::DataType::BFloat6:
+            return TensileLite::TypeInfo<TensileLite::BFloat6x32>::ElementSize;
+        case rocisa::DataType::Float4:
+            return TensileLite::TypeInfo<TensileLite::Float4x2>::ElementSize;
+#endif // _WIN32
+        case rocisa::DataType::MXScale:
+            return TensileLite::TypeInfo<TensileLite::MXScale>::ElementSize;
+        case rocisa::DataType::Count:
+            return 1;
         }
         return 1;
     }
@@ -239,6 +266,16 @@ namespace TensileLite
         registerTypeInfo<BFloat8Float8>();
         registerTypeInfo<Float8BFloat8_fnuz>();
         registerTypeInfo<BFloat8Float8_fnuz>();
+#ifdef _WIN32
+        registerTypeInfo<Float6>();
+        registerTypeInfo<BFloat6>();
+        registerTypeInfo<Float4>();
+#else // _WIN32
+        registerTypeInfo<Float6x32>();
+        registerTypeInfo<BFloat6x32>();
+        registerTypeInfo<Float4x2>();
+#endif // _WIN32
+        registerTypeInfo<MXScale>();
     }
 
     void DataTypeInfo::registerAllTypeInfoOnce()
@@ -293,8 +330,9 @@ namespace TensileLite
         return std::visit(
             [](const auto& cv) {
                 using T = std::decay_t<decltype(cv)>;
-                if constexpr(std::is_same_v<T, std::complex<float>>
-                             || std::is_same_v<T, std::complex<double>>)
+                if constexpr(std::is_same_v<
+                                 T,
+                                 std::complex<float>> || std::is_same_v<T, std::complex<double>>)
                     return "(" + std::to_string(cv.real()) + ", " + std::to_string(cv.imag()) + ")";
                 else
                     return std::to_string(cv);

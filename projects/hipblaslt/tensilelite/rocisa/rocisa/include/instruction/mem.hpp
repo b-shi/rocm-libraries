@@ -987,6 +987,29 @@ namespace rocisa
         }
     };
 
+    struct BufferLoadB192 : public MUBUFReadInstruction
+    {
+        BufferLoadB192(const std::shared_ptr<RegisterContainer>& dst,
+                       const std::shared_ptr<RegisterContainer>& vaddr,
+                       const std::shared_ptr<RegisterContainer>& saddr,
+                       const InstructionInput&                   soffset,
+                       std::optional<MUBUFModifiers>             mubuf   = std::nullopt,
+                       const std::string&                        comment = "")
+            : MUBUFReadInstruction(InstType::INST_B192, dst, vaddr, saddr, soffset, mubuf, comment)
+        {
+        }
+
+        BufferLoadB192(const BufferLoadB192& other)
+            : MUBUFReadInstruction(other)
+        {
+        }
+
+        std::shared_ptr<Item> clone() const override
+        {
+            return std::make_shared<BufferLoadB192>(*this);
+        }
+    };
+
     struct FlatLoadD16HIU8 : public FLATReadInstruction
     {
         FlatLoadD16HIU8(const std::shared_ptr<RegisterContainer>& dst,
@@ -1134,13 +1157,34 @@ namespace rocisa
         }
     };
 
+    struct FlatLoadB192 : public FLATReadInstruction
+    {
+        FlatLoadB192(const std::shared_ptr<RegisterContainer>& dst,
+                     const std::shared_ptr<RegisterContainer>& vaddr,
+                     std::optional<FLATModifiers>              flat    = std::nullopt,
+                     const std::string&                        comment = "")
+            : FLATReadInstruction(InstType::INST_B192, dst, vaddr, flat, comment)
+        {
+        }
+
+        FlatLoadB192(const FlatLoadB192& other)
+            : FLATReadInstruction(other)
+        {
+        }
+
+        std::shared_ptr<Item> clone() const override
+        {
+            return std::make_shared<FlatLoadB192>(*this);
+        }
+    };
+
     struct GlobalLoadTR8B64 : public GLOBALLoadInstruction
     {
         GlobalLoadTR8B64(const std::shared_ptr<RegisterContainer>& dst,
-                              const std::shared_ptr<RegisterContainer>& vaddr,
-                              const std::shared_ptr<RegisterContainer>& saddr,
-                              std::optional<GLOBALModifiers>            modifier  = std::nullopt,
-                              const std::string&                        comment = "")
+                         const std::shared_ptr<RegisterContainer>& vaddr,
+                         const std::shared_ptr<RegisterContainer>& saddr,
+                         std::optional<GLOBALModifiers>            modifier = std::nullopt,
+                         const std::string&                        comment  = "")
             : GLOBALLoadInstruction(InstType::INST_TR8_B64, dst, vaddr, saddr, modifier, comment)
         {
         }
@@ -1856,6 +1900,75 @@ namespace rocisa
         }
     };
 
+    // Hack unofficial compound instruction: 192-bit DS load (128 + 64)
+    struct DSLoadB192 : public DSLoadInstruction
+    {
+        DSLoadB192(const std::shared_ptr<RegisterContainer>& dst,
+                   const std::shared_ptr<RegisterContainer>& src,
+                   std::optional<DSModifiers>                ds      = std::nullopt,
+                   const std::string&                        comment = "")
+            : DSLoadInstruction(InstType::INST_B192, dst, src, ds, comment)
+        {
+            if(ds)
+                ds->na = 1;
+            setInst("ds_load_b192");
+        }
+
+        DSLoadB192(const DSLoadB192& other)
+            : DSLoadInstruction(other)
+        {
+        }
+
+        std::shared_ptr<Item> clone() const override
+        {
+            return std::make_shared<DSLoadB192>(*this);
+        }
+
+        static int issueLatency()
+        {
+            return 3;
+        }
+
+        int getIssueLatency() const override
+        {
+            return issueLatency();
+        }
+
+        std::string toString() const override
+        {
+            // Compound instruction: ds_load_b128 + ds_load_b64
+            auto        isaVersion  = rocIsa::getInstance().getKernel().isaVersion;
+            std::string loadInst128 = isaVersion[0] < 11 ? "ds_read_b128" : "ds_load_b128";
+            std::string loadInst64  = isaVersion[0] < 11 ? "ds_read_b64" : "ds_load_b64";
+
+            auto dstReg = std::dynamic_pointer_cast<RegisterContainer>(dst);
+            if(!dstReg)
+                throw std::runtime_error("DSLoadB192: dst must be RegisterContainer");
+
+            // First 4 dwords
+            auto dst128      = dstReg->clone2();
+            dst128->regNum   = 4;
+            std::string kStr = loadInst128 + " " + dst128->toString() + ", " + srcs->toString();
+            if(ds)
+                kStr += ds->toString();
+            kStr = formatWithComment(kStr);
+
+            // Upper 2 dwords at offset +16
+            auto dst64        = dstReg->clone2();
+            dst64->regIdx     = dstReg->regIdx + 4;
+            dst64->regNum     = 2;
+            std::string kStr2 = loadInst64 + " " + dst64->toString() + ", " + srcs->toString();
+            DSModifiers ds2;
+            if(ds)
+                ds2 = *ds;
+            ds2.offset += 16;
+            kStr2 += ds2.toString();
+            kStr2 = formatWithComment(kStr2);
+
+            return kStr + kStr2;
+        }
+    };
+
     struct DSLoad2B32 : public DSLoadInstruction
     {
         DSLoad2B32(const std::shared_ptr<RegisterContainer>& dst,
@@ -2133,6 +2246,75 @@ namespace rocisa
         int getIssueLatency() const override
         {
             return issueLatency();
+        }
+    };
+
+    // Hack unofficial compound instruction: 192-bit DS store (128 + 64)
+    struct DSStoreB192 : public DSStoreInstruction
+    {
+        DSStoreB192(const std::shared_ptr<RegisterContainer>& dstAddr,
+                    const std::shared_ptr<RegisterContainer>& src,
+                    std::optional<DSModifiers>                ds      = std::nullopt,
+                    const std::string&                        comment = "")
+            : DSStoreInstruction(InstType::INST_B192, dstAddr, src, nullptr, ds, comment)
+        {
+            if(ds)
+                ds->na = 1;
+            setInst("ds_store_b192");
+        }
+
+        DSStoreB192(const DSStoreB192& other)
+            : DSStoreInstruction(other)
+        {
+        }
+
+        std::shared_ptr<Item> clone() const override
+        {
+            return std::make_shared<DSStoreB192>(*this);
+        }
+
+        static int issueLatency()
+        {
+            return 10;
+        }
+
+        int getIssueLatency() const override
+        {
+            return issueLatency();
+        }
+
+        std::string toString() const override
+        {
+            // Compound instruction: ds_store_b128 + ds_store_b64
+            auto        isaVersion   = rocIsa::getInstance().getKernel().isaVersion;
+            std::string storeInst128 = isaVersion[0] < 11 ? "ds_write_b128" : "ds_store_b128";
+            std::string storeInst64  = isaVersion[0] < 11 ? "ds_write_b64" : "ds_store_b64";
+
+            auto srcReg = std::dynamic_pointer_cast<RegisterContainer>(src0);
+            if(!srcReg)
+                throw std::runtime_error("DSStoreB192: src0 must be RegisterContainer");
+
+            // First 4 dwords
+            auto src128      = srcReg->clone2();
+            src128->regNum   = 4;
+            std::string kStr = storeInst128 + " " + dstAddr->toString() + ", " + src128->toString();
+            if(ds)
+                kStr += ds->toString();
+            kStr = formatWithComment(kStr);
+
+            // Upper 2 dwords at offset +16
+            auto src64        = srcReg->clone2();
+            src64->regIdx     = srcReg->regIdx + 4;
+            src64->regNum     = 2;
+            std::string kStr2 = storeInst64 + " " + dstAddr->toString() + ", " + src64->toString();
+            DSModifiers ds2;
+            if(ds)
+                ds2 = *ds;
+            ds2.offset += 16;
+            kStr2 += ds2.toString();
+            kStr2 = formatWithComment(kStr2);
+
+            return kStr + kStr2;
         }
     };
 

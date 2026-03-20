@@ -26,10 +26,11 @@
 
 #pragma once
 
-#include <hipblaslt/hipblaslt.h>
-#include <stdint.h>
+#include <hip/hip_runtime.h>
 
-#ifdef HIPBLASLT_USE_ROCROLLER
+#include <vector>
+
+#if HIPBLASLT_ENABLE_MXDATAGENERATOR
 std::vector<float> generateMXInput(hipDataType                dataType,
                                    void*                      data,
                                    void*                      scale,

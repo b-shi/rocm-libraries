@@ -88,10 +88,10 @@ def makeValidWMMA():
 @lru_cache
 def makeValidMFMA():
     validMFMA = {}
-    validMFMA["H"] = [[32, 32, 16, 1], [32, 32, 4, 2], [32, 32, 8, 1], [16, 16, 32, 1], [16, 16, 4, 4], [16, 16, 16, 1], [4, 4, 4, 16]]
-    validMFMA["S"] = [[32, 32, 1, 2], [32, 32, 2, 1], [16, 16, 1, 4], [16, 16, 4, 1], [4, 4, 1, 16], [16, 16, 32, 1], [32, 32, 16, 1]]
-    validMFMA["B"] = [[32, 32, 16, 1], [32, 32, 2, 2], [32, 32, 4, 1], [16, 16, 32, 1], [16, 16, 2, 4], [16, 16, 8, 1], [4, 4, 2, 16]]
-    validMFMA["4xi8"] = [
+    validMFMA["HH"] = [[32, 32, 16, 1], [32, 32, 4, 2], [32, 32, 8, 1], [16, 16, 32, 1], [16, 16, 4, 4], [16, 16, 16, 1], [4, 4, 4, 16]]
+    validMFMA["SS"] = [[32, 32, 1, 2], [32, 32, 2, 1], [16, 16, 1, 4], [16, 16, 4, 1], [4, 4, 1, 16], [16, 16, 32, 1], [32, 32, 16, 1]]
+    validMFMA["BB"] = [[32, 32, 16, 1], [32, 32, 2, 2], [32, 32, 4, 1], [16, 16, 32, 1], [16, 16, 2, 4], [16, 16, 8, 1], [4, 4, 2, 16]]
+    validMFMA["4xi84xi8"] = [
         [32, 32, 4, 2],
         [32, 32, 8, 1],
         [16, 16, 4, 4],
@@ -100,37 +100,48 @@ def makeValidMFMA():
         [32, 32, 16, 1],
         [16, 16, 32, 1],
     ]
-    validMFMA["D"] = [[16, 16, 4, 1], [4, 4, 4, 4]]
+    validMFMA["DD"] = [[16, 16, 4, 1], [4, 4, 4, 4]]
     validMFMA["B1k"] = [[32, 32, 4, 2], [32, 32, 8, 1], [16, 16, 4, 4], [16, 16, 16, 1], [4, 4, 4, 16]]
-    validMFMA["C"] = validMFMA["S"]
-    validMFMA["Z"] = validMFMA["D"]
-    validMFMA["I8"] = [
+    validMFMA["CC"] = validMFMA["SS"]
+    validMFMA["ZZ"] = validMFMA["DD"]
+    validMFMA["I8I8"] = [
         [32, 32, 4, 2],
         [32, 32, 8, 1],
         [16, 16, 4, 4],
         [16, 16, 16, 1],
         [4, 4, 4, 16],
     ] + [[32, 32, 16, 1], [16, 16, 32, 1],] + [[16, 16, 64, 1],[32, 32, 32, 1]]
-    validMFMA["X"] = [[32, 32, 4, 1], [16, 16, 8, 1], [16, 16, 16, 1], [16, 16, 32, 1], [32, 32, 16, 1]]
-    validMFMA["F8"] = [[32, 32, 16, 1], [16, 16, 32, 1], [32, 32, 64, 1], [16, 16, 128, 1]]
-    validMFMA["B8"] = validMFMA["F8"]
-    validMFMA["F8B8"] = validMFMA["F8"]
-    validMFMA["B8F8"] = validMFMA["F8"]
-    validMFMA["F8N"] = [[32, 32, 16, 1], [16, 16, 32, 1]]
-    validMFMA["B8N"] = validMFMA["F8N"]
-    validMFMA["F8B8N"] = validMFMA["F8N"]
-    validMFMA["B8F8N"] = validMFMA["F8N"]
-    validMFMA["F4"] = [[32, 32, 64, 1], [16, 16, 128, 1]]
+    validMFMA["XX"] = [[32, 32, 4, 1], [16, 16, 8, 1], [16, 16, 16, 1], [16, 16, 32, 1], [32, 32, 16, 1]]
+    validMFMA["F8F8"] = [[32, 32, 16, 1], [16, 16, 32, 1], [32, 32, 64, 1], [16, 16, 128, 1]]
+    validMFMA["B8B8"] = validMFMA["F8F8"]
+    validMFMA["F8B8"] = validMFMA["F8F8"]
+    validMFMA["B8F8"] = validMFMA["F8F8"]
+    validMFMA["F8NF8N"] = [[32, 32, 16, 1], [16, 16, 32, 1]]
+    validMFMA["B8NB8N"] = validMFMA["F8NF8N"]
+    validMFMA["F8NB8N"] = validMFMA["F8NF8N"]
+    validMFMA["B8NF8N"] = validMFMA["F8NF8N"]
+    validMFMA["F6F6"] = [[16,16,128,1], [32,32,64,1]]
+    validMFMA["B6B6"] = [[16,16,128,1], [32,32,64,1]]
+    validMFMA["F6B6"] = [[16,16,128,1], [32,32,64,1]]
+    validMFMA["B6F6"] = [[16,16,128,1], [32,32,64,1]]
+    validMFMA["F8F6"] = [[16,16,128,1], [32,32,64,1]]
+    validMFMA["F6F8"] = [[16,16,128,1], [32,32,64,1]]
+    validMFMA["F8F4"] = [[16,16,128,1], [32,32,64,1]]
+    validMFMA["F4F8"] = [[16,16,128,1], [32,32,64,1]]
+    validMFMA["F6F4"] = [[16,16,128,1], [32,32,64,1]]
+    validMFMA["F4F6"] = [[16,16,128,1], [32,32,64,1]]
+    validMFMA["B6F4"] = [[16,16,128,1], [32,32,64,1]]
+    validMFMA["F4B6"] = [[16,16,128,1], [32,32,64,1]]
+    validMFMA["F4F4"] = [[16,16,128,1], [32,32,64,1]]
     validMFMA["_format9"] = []
 
     for MFMA in [
-        validMFMA["H"],
-        validMFMA["S"],
-        validMFMA["B"],
-        validMFMA["D"],
-        validMFMA["X"],
-        validMFMA["F8N"],
-        validMFMA["F4"],
+        validMFMA["HH"],
+        validMFMA["SS"],
+        validMFMA["BB"],
+        validMFMA["DD"],
+        validMFMA["XX"],
+        validMFMA["F8F8"],
         makeValidWMMA(),
     ]:
         for MI in MFMA:
@@ -147,20 +158,20 @@ def makeValidMFMA():
 @lru_cache
 def makeValidSMFMA():
     validSMFMA = {}
-    validSMFMA["H"] = [[32, 32, 16, 1], [16, 16, 32, 1], [16, 16, 64, 1], [32, 32, 32, 1]]
-    validSMFMA["B"] = [[32, 32, 16, 1], [16, 16, 32, 1], [16, 16, 64, 1], [32, 32, 32, 1]]
-    validSMFMA["4xi8"] = [[32, 32, 32, 1], [16, 16, 64, 1], [16, 16, 128, 1], [32, 32, 64, 1]]
-    validSMFMA["I8"] = validSMFMA["4xi8"]
-    validSMFMA["F8"] = [[32, 32, 32, 1], [16, 16, 64, 1], [16, 16, 128, 1], [32, 32, 64, 1]]
-    validSMFMA["B8"] = validSMFMA["F8"]
-    validSMFMA["F8B8"] = validSMFMA["F8"]
-    validSMFMA["B8F8"] = validSMFMA["F8"]
-    validSMFMA["F8N"] = validSMFMA["F8"]
-    validSMFMA["B8N"] = validSMFMA["F8"]
-    validSMFMA["F8B8N"] = validSMFMA["F8N"]
-    validSMFMA["B8F8N"] = validSMFMA["F8N"]
+    validSMFMA["HH"] = [[32, 32, 16, 1], [16, 16, 32, 1], [16, 16, 64, 1], [32, 32, 32, 1]]
+    validSMFMA["BB"] = [[32, 32, 16, 1], [16, 16, 32, 1], [16, 16, 64, 1], [32, 32, 32, 1]]
+    validSMFMA["4xi84xi8"] = [[32, 32, 32, 1], [16, 16, 64, 1], [16, 16, 128, 1], [32, 32, 64, 1]]
+    validSMFMA["I8I8"] = validSMFMA["4xi84xi8"]
+    validSMFMA["F8F8"] = [[32, 32, 32, 1], [16, 16, 64, 1], [16, 16, 128, 1], [32, 32, 64, 1]]
+    validSMFMA["B8B8"] = validSMFMA["F8F8"]
+    validSMFMA["F8B8"] = validSMFMA["F8F8"]
+    validSMFMA["B8F8"] = validSMFMA["F8F8"]
+    validSMFMA["F8NF8N"] = validSMFMA["F8F8"]
+    validSMFMA["B8NB8N"] = validSMFMA["F8F8"]
+    validSMFMA["F8NB8N"] = validSMFMA["F8NF8N"]
+    validSMFMA["B8NF8N"] = validSMFMA["F8NF8N"]
     validSMFMA["_format9"] = []
-    for SMFMA in [validSMFMA["H"], validSMFMA["B"], validSMFMA["4xi8"], validSMFMA["F8N"]]:
+    for SMFMA in [validSMFMA["HH"], validSMFMA["BB"], validSMFMA["4xi84xi8"], validSMFMA["F8NF8N"]]:
         for MI in SMFMA:
             for bm in range(int(math.log(MI[3], 2)) + 1):
                 for tt0 in range(1, validTT + 1):
@@ -178,15 +189,15 @@ def makeValidMatrixInstructions():
     smfma = makeValidSMFMA()
     validMatrixInstructions = (
         [[], [-1]]
-        + mfma["H"]
-        + mfma["S"]
-        + mfma["B"]
-        + mfma["D"]
+        + mfma["HH"]
+        + mfma["SS"]
+        + mfma["BB"]
+        + mfma["DD"]
         + mfma["B1k"]
-        + mfma["X"]
-        + smfma["H"]
-        + smfma["B"]
-        + smfma["4xi8"]
+        + mfma["XX"]
+        + smfma["HH"]
+        + smfma["BB"]
+        + smfma["4xi84xi8"]
     )
     return validMatrixInstructions + mfma["_format9"] + smfma["_format9"]
 
@@ -418,6 +429,8 @@ validParameters = { # we need to make sure this matches develop
     "UseSgprForGRO": [-1, 0, 1],
     # Use a 64-bit shadow limit register to allow buffers larger than 2^32 bytes
     "Use64bShadowLimit": [True, False],
+    # Use a 64-bit shadow limit register for MXSA/B to allow buffers larger than 2^32 bytes
+    "Use64bShadowLimitMX": [True, False],
     # Assertion properties
     # These provide information or assertions that the problem size meets certain requirements
     # for sizes or alignments.  The kernel generator can use this information to produce
@@ -775,6 +788,8 @@ validParameters = { # we need to make sure this matches develop
     #                 bpe=16, max LRVW is 8  (to fit ds_read_b128) (FP16)
     #                 bpe=8,  max LRVW is 16 (to fit ds_read_b128) (INT8)
     "LocalReadVectorWidth": [-1, 1, 2, 4, 8, 16, 32],
+    "LocalReadVectorWidthA": [-1, 1, 2, 4, 8, 16, 32],
+    "LocalReadVectorWidthB": [-1, 1, 2, 4, 8, 16, 32],
     # threads should read/write/operate on this many contiguous elements from the C matrix.
     # If VW=4 then thread0 will process 4 consec C elements, then thread1 next 4, etc.
     # If the ThreadTile is > VectorWidth then thread0 will next operate on the 4 elements in C at (4*NumThreads)
@@ -821,14 +836,18 @@ validParameters = { # we need to make sure this matches develop
     # -1 means use same padding as the VectorWidth if TLU=0 else 0.  (Padding only helps when transpose is required)
     # With MatrixInstruciton: -1 means max(GRVW,MIInput) if TLU=0
     "LdsPadA": [-1, 0, 1, 2, 3, 4, 8, 16, 32, 48, 64],
+    "LdsPadMXSA": [ -1, 0, 1, 2, 3, 4, 8, 16, 32, 48, 64],
     "LdsPadB": [-1, 0, 1, 2, 3, 4, 8, 16, 32, 48, 64],
+    "LdsPadMXSB": [ -1, 0, 1, 2, 3, 4, 8, 16, 32, 48, 64],
     "LdsPadMetadata": [-1, 0, 1, 2, 3, 4, 8],
     # Padding boundary for LDS. defines block-size for pad insertion. for every 'LdsBlockSizePerPad' bytes, LDS padding (pad value from LdsPad parameter)
     # is added (readOffset aware of the pad and adjusts offset value based on this parameter value).
     # Only support LdsBlockSizePerPad >= unrollDepth * BPE
     # 0 means disable LdsBlockSizePerPad
     "LdsBlockSizePerPadA": [-1, 0, 64, 128, 256, 512, 1024, 2048],
+    "LdsBlockSizePerPadMXSA": [-1, 0, 64, 128, 256, 512, 1024, 2048],
     "LdsBlockSizePerPadB": [-1, 0, 64, 128, 256, 512, 1024, 2048],
+    "LdsBlockSizePerPadMXSB": [-1, 0, 64, 128, 256, 512, 1024, 2048],
     "LdsBlockSizePerPadMetadata": [-1, 0, 64, 128, 256, 512, 1024, 2048],
     # Transpose LDS format. Local store in coalesced dimension , same as optimized global fetch dimension . applicable only in TLU=0 case for miSIMD(s)
     # -1 : keep LDS layout same as global fetch dimension for both A and B
@@ -847,7 +866,9 @@ validParameters = { # we need to make sure this matches develop
     "NonTemporalD": list(range(0, 8)),
     "NonTemporalC": list(range(0, 8)),
     "NonTemporalA": list(range(0, 8)),
+    "NonTemporalMXSA": list(range(0,8)),
     "NonTemporalB": list(range(0, 8)),
+    "NonTemporalMXSB": list(range(0,8)),
     "NonTemporalWS": list(range(0, 8)),
     "NonTemporalMetadata": list(range(0, 8)),
     "NonTemporal": list(range(-1, 8)),

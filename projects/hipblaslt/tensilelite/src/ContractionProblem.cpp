@@ -114,7 +114,7 @@ namespace TensileLite
         TensorDescriptor scaleD("scaleD");
         TensorDescriptor scaleAlphaVec("scaleAlphaVec");
 
-        TensorOps nop;
+		TensorOps nop;
 
         ContractionProblemGemm problem(a,
                                        b,
@@ -131,10 +131,10 @@ namespace TensileLite
                                        batch,
                                        bound,
                                        beta,
-                                       nop,
-                                       nop,
-                                       nop,
-                                       nop);
+									   nop,
+									   nop,
+									   nop,
+									   nop);
 
         return problem;
     }
@@ -178,13 +178,13 @@ namespace TensileLite
     ContractionProblemGemm ContractionProblemGemm::GEMM(bool                    transA,
                                                         bool                    transB,
                                                         TensorDescriptor const& a,
-                                                        TensorOps const&        aOps,
+														TensorOps const&        aOps,
                                                         TensorDescriptor const& b,
-                                                        TensorOps const&        bOps,
+														TensorOps const&        bOps,
                                                         TensorDescriptor const& c,
-                                                        TensorOps const&        cOps,
+														TensorOps const&        cOps,
                                                         TensorDescriptor const& d,
-                                                        TensorOps const&        dOps,
+														TensorOps const&        dOps,
                                                         double                  beta)
     {
         TensileLite::ContractionProblemGemm::FreeIndices free(2);
@@ -247,9 +247,9 @@ namespace TensileLite
                                       boundIndices,
                                       beta,
                                       aOps,
-                                      bOps,
-                                      cOps,
-                                      dOps);
+									  bOps,
+									  cOps,
+									  dOps);
     }
 
     void ContractionProblemGemm::IdentifierToIndices(std::string const& identifier,
@@ -257,9 +257,9 @@ namespace TensileLite
                                                      BatchIndices&      batchIndices,
                                                      BoundIndices&      boundIndices,
                                                      TensorOps&         aOps,
-                                                     TensorOps&         bOps,
-                                                     TensorOps&         cOps,
-                                                     TensorOps&         dOps)
+                                                	 TensorOps&         bOps,
+                                                	 TensorOps&         cOps,
+                                                	 TensorOps&         dOps)
     {
         FreeIndices  free;
         BatchIndices batch;
@@ -415,13 +415,14 @@ namespace TensileLite
                                                std::vector<size_t> const& dStrides,
                                                double                     beta)
     {
-        FreeIndices  freeIndices;
-        BatchIndices batchIndices;
-        BoundIndices boundIndices;
-        TensorOps    aOps, bOps, cOps, dOps;
+        FreeIndices       freeIndices;
+        BatchIndices      batchIndices;
+        BoundIndices      boundIndices;
+        TensorOps aOps, bOps, cOps, dOps;
 
         IdentifierToIndices(
             operationIdentifier, freeIndices, batchIndices, boundIndices, aOps, bOps, cOps, dOps);
+
 
         return FromIndexSizes(freeIndices,
                               batchIndices,
@@ -429,16 +430,16 @@ namespace TensileLite
                               indexSizes,
                               aType,
                               aStrides,
-                              aOps,
+							  aOps,
                               bType,
                               bStrides,
-                              bOps,
+							  bOps,
                               cType,
                               cStrides,
-                              cOps,
+							  cOps,
                               dType,
                               dStrides,
-                              dOps,
+							  dOps,
                               beta);
     }
 
@@ -449,16 +450,16 @@ namespace TensileLite
                                                std::vector<size_t> const& indexSizes,
                                                rocisa::DataType           aType,
                                                std::vector<size_t> const& aStrides,
-                                               TensorOps const&           aOps,
+											   TensorOps const&           aOps,
                                                rocisa::DataType           bType,
                                                std::vector<size_t> const& bStrides,
-                                               TensorOps const&           bOps,
+											   TensorOps const&           bOps,
                                                rocisa::DataType           cType,
                                                std::vector<size_t> const& cStrides,
-                                               TensorOps const&           cOps,
+											   TensorOps const&           cOps,
                                                rocisa::DataType           dType,
                                                std::vector<size_t> const& dStrides,
-                                               TensorOps const&           dOps,
+											   TensorOps const&           dOps,
                                                double                     beta)
     {
         size_t maxA = 0;
@@ -560,9 +561,9 @@ namespace TensileLite
                                       boundIndices,
                                       beta,
                                       aOps,
-                                      bOps,
-                                      cOps,
-                                      dOps);
+									  bOps,
+									  cOps,
+									  dOps);
     }
 
     ContractionProblemGemm ContractionProblemGemm::GetDummy()
@@ -582,6 +583,8 @@ namespace TensileLite
             = TensorDescriptor("scaleAlphaVec");
         gemm.m_tensors[ContractionProblemGemm::TENSOR::METADATA]   = TensorDescriptor("metadata");
         gemm.m_tensors[ContractionProblemGemm::TENSOR::AMAXD]      = TensorDescriptor("amaxD");
+        gemm.m_tensors[ContractionProblemGemm::TENSOR::MXSA]     = TensorDescriptor("mxScaleA");
+        gemm.m_tensors[ContractionProblemGemm::TENSOR::MXSB]     = TensorDescriptor("mxScaleB");
         gemm.m_tensors[ContractionProblemGemm::TENSOR::COMPRESSED] = TensorDescriptor("compressed");
         return gemm;
     }
@@ -601,7 +604,8 @@ namespace TensileLite
                                                    BatchIndices const&     batchIndices,
                                                    BoundIndices const&     boundIndices,
                                                    double                  beta,
-                                                   size_t                  workspaceSize)
+                                                   size_t                  workspaceSize
+                                                   )
         : ContractionProblem(ContractionProblemGemm::TENSOR::TENSOR_COUNT)
         , m_freeIndices(freeIndices)
         , m_batchIndices(batchIndices)
@@ -646,11 +650,12 @@ namespace TensileLite
                                                    BatchIndices const&     batchIndices,
                                                    BoundIndices const&     boundIndices,
                                                    double                  beta,
-                                                   TensorOps const&        aOps,
+												   TensorOps const&        aOps,
                                                    TensorOps const&        bOps,
                                                    TensorOps const&        cOps,
                                                    TensorOps const&        dOps,
-                                                   size_t                  workspaceSize)
+                                                   size_t                  workspaceSize
+                                                   )
         : ContractionProblem(ContractionProblemGemm::TENSOR::TENSOR_COUNT)
         , m_freeIndices(freeIndices)
         , m_batchIndices(batchIndices)
@@ -680,7 +685,32 @@ namespace TensileLite
         normalize();
         calcArithmeticIntensity();
     }
+	
+    void ContractionProblemGemm::setMXScaleA(int mxBlockA, std::vector<size_t> saStride)
+    {
+        m_mxBlockA = mxBlockA;
 
+        if (mxBlockA)
+        {
+            std::vector<size_t> saSizes = m_tensors[ContractionProblemGemm::TENSOR::A].sizes();
+            saSizes[m_boundIndices[0].a] = saSizes[m_boundIndices[0].a] / mxBlockA;
+            TensorDescriptor mxsa("mxScaleA", rocisa::DataType::MXScale, saSizes.begin(), saSizes.end(), saStride.begin(), saStride.end());
+            m_tensors[ContractionProblemGemm::TENSOR::MXSA] = mxsa;
+        }
+    }
+
+    void ContractionProblemGemm::setMXScaleB(int mxBlockB, std::vector<size_t> sbStride)
+    {
+        m_mxBlockB = mxBlockB;
+
+        if (mxBlockB)
+        {
+            std::vector<size_t> sbSizes = m_tensors[ContractionProblemGemm::TENSOR::B].sizes();
+            sbSizes[m_boundIndices[0].b] = sbSizes[m_boundIndices[0].b] / mxBlockB;
+            TensorDescriptor mxsb("mxScaleB", rocisa::DataType::MXScale, sbSizes.begin(), sbSizes.end(), sbStride.begin(), sbStride.end());
+            m_tensors[ContractionProblemGemm::TENSOR::MXSB] = mxsb;
+        }
+    }
     size_t ContractionProblemGemm::toAPos(size_t idx) const
     {
         if(idx >= d().dimensions())
@@ -1005,11 +1035,11 @@ namespace TensileLite
             }
             m_tensors[ContractionProblemGemm::TENSOR::COMPRESSED]
                 = TensorDescriptor("compressed",
-                                   m_sparse != 2 ? aTensor.dataType() : bTensor.dataType(),
-                                   compressed_sizes.begin(),
-                                   compressed_sizes.end(),
-                                   compressed_strides.begin(),
-                                   compressed_strides.end());
+                                    m_sparse != 2 ? aTensor.dataType() : bTensor.dataType(),
+                                    compressed_sizes.begin(),
+                                    compressed_sizes.end(),
+                                    compressed_strides.begin(),
+                                    compressed_strides.end());
 
             m_tensors[ContractionProblemGemm::TENSOR::METADATA]
                 = TensorDescriptor("metadata",
@@ -1031,8 +1061,7 @@ namespace TensileLite
                 if(!isBatch)
                     m_allocatedElementsNonBatchCompressed
                         += m_tensors[ContractionProblemGemm::TENSOR::COMPRESSED].strides()[idx]
-                           * (m_tensors[ContractionProblemGemm::TENSOR::COMPRESSED].sizes()[idx]
-                              - 1);
+                           * (m_tensors[ContractionProblemGemm::TENSOR::COMPRESSED].sizes()[idx] - 1);
             }
         }
         else
@@ -1136,46 +1165,22 @@ namespace TensileLite
             TENSILE_ASSERT_EXC(cUse == 1);
         for(int dUse : dUseCount)
             TENSILE_ASSERT_EXC(dUse == 1);
-
-        for(auto& a_op : m_aOps)
-        {
-            auto& op = const_cast<TensileLite::TensorOp&>(a_op);
+		
+		for(auto const& op : m_aOps)
             if(op.type == TensorOp::Type::ComplexConjugate)
-            {
-                if(!(DataTypeInfo::Get(aTensor.dataType()).isComplex))
-                    op.type = TensorOp::Type::None;
-            }
-        }
+                TENSILE_ASSERT_EXC(DataTypeInfo::Get(aTensor.dataType()).isComplex);
 
-        for(auto& b_op : m_bOps)
-        {
-            auto& op = const_cast<TensileLite::TensorOp&>(b_op);
+        for(auto const& op : m_bOps)
             if(op.type == TensorOp::Type::ComplexConjugate)
-            {
-                if(!(DataTypeInfo::Get(bTensor.dataType()).isComplex))
-                    op.type = TensorOp::Type::None;
-            }
-        }
+                TENSILE_ASSERT_EXC(DataTypeInfo::Get(bTensor.dataType()).isComplex);
 
-        for(auto& c_op : m_cOps)
-        {
-            auto& op = const_cast<TensileLite::TensorOp&>(c_op);
+        for(auto const& op : m_cOps)
             if(op.type == TensorOp::Type::ComplexConjugate)
-            {
-                if(!(DataTypeInfo::Get(cTensor.dataType()).isComplex))
-                    op.type = TensorOp::Type::None;
-            }
-        }
+                TENSILE_ASSERT_EXC(DataTypeInfo::Get(cTensor.dataType()).isComplex);
 
-        for(auto& d_op : m_dOps)
-        {
-            auto& op = const_cast<TensileLite::TensorOp&>(d_op);
+        for(auto const& op : m_dOps)
             if(op.type == TensorOp::Type::ComplexConjugate)
-            {
-                if(!(DataTypeInfo::Get(dTensor.dataType()).isComplex))
-                    op.type = TensorOp::Type::None;
-            }
-        }
+                TENSILE_ASSERT_EXC(DataTypeInfo::Get(dTensor.dataType()).isComplex);
     }
 
     void ContractionProblemGemm::calcArithmeticIntensity()
@@ -1207,8 +1212,16 @@ namespace TensileLite
             gflop += 2 * cSize * 1e-9; // Include (+ beta * C) in gflops
             cSize *= 2; // Include read C and write D in gbytes
         }
+        // TODO: for MX data types, the size is smaller than a byte
+        // so we need to use (elementSize/packing) to derive the actual
+        // byte size of a segment.
+        auto infoA = DataTypeInfo::Get(a().dataType());
+        auto infoB = DataTypeInfo::Get(b().dataType());
+        auto infoC = DataTypeInfo::Get(c().dataType());
         double gbyte
-            = (aSize * a().elementBytes() + bSize * b().elementBytes() + cSize * c().elementBytes())
+            = ((aSize * infoA.elementSize / infoA.packing) +
+               (bSize * infoB.elementSize / infoB.packing) +
+               (cSize * infoC.elementSize / infoC.packing))
               * 1e-9;
 
         m_arithmeticIntensity = gflop / gbyte;
@@ -1406,6 +1419,7 @@ namespace TensileLite
            << "B: " << bTensor << ",\n"
            << "C: " << cTensor << ",\n"
            << "D: " << dTensor << "\n";
+
         return rv.str();
     }
 
@@ -1418,7 +1432,8 @@ namespace TensileLite
         rocisa::DataType               typeD,
         rocisa::DataType               typeAlpha,
         rocisa::DataType               typeBeta,
-        rocisa::DataType               typeComputeInput,
+        rocisa::DataType               typeComputeInputA,
+		rocisa::DataType               typeComputeInputB,
         rocisa::DataType               typeCompute,
         double                         alpha,
         double                         beta,
@@ -1427,13 +1442,9 @@ namespace TensileLite
         std::vector<rocisa::DataType>& biasDataTypeWhiteList,
         std::vector<int>&              biasSrcWhiteList,
         bool                           isGroupedGemm,
-        size_t                         maxWorkspaceBytes,
-        TensorOps const&               aOps,
-        TensorOps const&               bOps,
-        TensorOps const&               cOps,
-        TensorOps const&               dOps)
+        size_t                         maxWorkspaceBytes)
     {
-
+        assert(typeBeta == typeCompute);
         // Tensor descriptors for a, b
         TensorDescriptor a, b;
 
@@ -1516,16 +1527,32 @@ namespace TensileLite
         TensileLite::TensorDescriptor scaleC("scaleC");
         TensileLite::TensorDescriptor scaleD("scaleD");
         TensileLite::TensorDescriptor scaleAlpha{"scaleAlpha"};
-        TensorOps                     nop;
+		TensorOps nop;
 
         // The ContractionProblemGemm
-        TensileLite::ContractionProblemGemm problem{
-            a,          b,         c,          d,          e,
-            bias,       scaleA,    scaleB,     scaleC,     scaleD,
-            scaleAlpha, freeIndex, batchIndex, boundIndex, beta,
-            aOps,       bOps,      cOps,       dOps,       maxWorkspaceBytes};
+        TensileLite::ContractionProblemGemm problem{a,
+                                                    b,
+                                                    c,
+                                                    d,
+                                                    e,
+                                                    bias,
+                                                    scaleA,
+                                                    scaleB,
+                                                    scaleC,
+                                                    scaleD,
+                                                    scaleAlpha,
+                                                    freeIndex,
+                                                    batchIndex,
+                                                    boundIndex,
+                                                    beta,
+													nop,
+													nop,
+													nop,
+													nop,
+                                                    maxWorkspaceBytes};
 
-        problem.setComputeInputType(typeComputeInput);
+        problem.setComputeInputTypeA(typeComputeInputA);
+        problem.setComputeInputTypeB(typeComputeInputB);
         problem.setAlphaType(typeAlpha);
         problem.setBetaType(typeBeta);
 
@@ -1550,6 +1577,7 @@ namespace TensileLite
             problem.setBias(biasType, 1, 0, useGradient, biasSrc);
             problem.setParams().setBiasEnum(rocisa::DataType::None);
         }
+
         // Add problem predicates for CEqualsD
         problem.setCEqualsD(false);
         return problem;
@@ -1621,6 +1649,8 @@ namespace TensileLite
                                          void*                _ws,
                                          void*                _Synchronizer,
                                          unsigned char const* _metadata,
+										 void const*          _mxsa,
+                                         void const*          _mxsb,
                                          void const*          _compressed)
         : a(_a)
         , b(_b)
@@ -1641,6 +1671,8 @@ namespace TensileLite
         , ws(_ws)
         , Synchronizer(_Synchronizer)
         , metadata(_metadata)
+		, mxsa(_mxsa)
+        , mxsb(_mxsb)
         , compressed(_compressed)
     {
     }

@@ -25,6 +25,7 @@
 from rocisa.enum import DataTypeEnum
 from functools import lru_cache
 import functools
+import platform
 
 @lru_cache
 def _is8bitFloat(value):
@@ -150,7 +151,7 @@ class DataType:
         {   # NANOO E4M3
             'enum': DataTypeEnum.Float8_fnuz,
             'char': 'F8N',
-            'nameAbbrev': 'fp8_fp8',               # to match v_mfma inst
+            'nameAbbrev': 'fp8',               # to match v_mfma inst
             'miOutTypeNameAbbrev': 'f32',
             'reg': 0.25,
             'hip': 'tensile_float8_fnuz',
@@ -159,7 +160,7 @@ class DataType:
         {   # NANOO E5M2
             'enum': DataTypeEnum.BFloat8_fnuz,
             'char': 'B8N',
-            'nameAbbrev': 'bf8_bf8',               # to match v_mfma inst
+            'nameAbbrev': 'bf8',               # to match v_mfma inst
             'miOutTypeNameAbbrev': 'f32',
             'reg': 0.25,
             'hip': 'tensile_bfloat8_fnuz',
@@ -186,7 +187,7 @@ class DataType:
         {   # OCP E4M3
             'enum': DataTypeEnum.Float8,
             'char': 'F8',
-            'nameAbbrev': 'fp8_fp8',               # to match v_mfma inst
+            'nameAbbrev': 'fp8',               # to match v_mfma inst
             'miOutTypeNameAbbrev': 'f32',
             'reg': 0.25,
             'hip': 'tensile_float8',
@@ -195,7 +196,7 @@ class DataType:
         {   # OCP E5M2
             'enum': DataTypeEnum.BFloat8,
             'char': 'B8',
-            'nameAbbrev': 'bf8_bf8',               # to match v_mfma inst
+            'nameAbbrev': 'bf8',               # to match v_mfma inst
             'miOutTypeNameAbbrev': 'f32',
             'reg': 0.25,
             'hip': 'tensile_bfloat8',
@@ -219,7 +220,27 @@ class DataType:
             'hip': 'ERROR',
             'isComplex': False,
         },
-        {   # MX FP4 (E2M1)
+        {
+            'enum': DataTypeEnum.Float6,
+            'char': 'F6',
+            'nameAbbrev': 'fp6',
+            'miOutTypeNameAbbrev': 'f32',
+            'reg': 0.1875,
+            'hip': 'ERROR' if platform.system() == 'Windows' else 'tensile_float6x32',
+            'isComplex': False,
+            'packing': 1 if platform.system() == 'Windows' else 32,
+        },
+        {
+            'enum': DataTypeEnum.BFloat6,
+            'char': 'B6',
+            'nameAbbrev': 'bf6',
+            'miOutTypeNameAbbrev': 'f32',
+            'reg': 0.1875,
+            'hip': 'ERROR' if platform.system() == 'Windows' else 'tensile_bfloat6x32',
+            'isComplex': False,
+            'packing': 1 if platform.system() == 'Windows' else 32,
+        },
+        {
             'enum': DataTypeEnum.Float4,
             'char': 'F4',
             'nameAbbrev': 'fp4',
@@ -227,6 +248,9 @@ class DataType:
             'reg': 0.125,
             'hip': 'ERROR',
             'isComplex': False,
+            'hip': 'ERROR' if platform.system() == 'Windows' else 'tensile_float4x2',
+            'isComplex': False,
+            'packing': 1 if platform.system() == 'Windows' else 2,
         },
     ]
     lookup = {}
@@ -390,13 +414,22 @@ class DataType:
                 or self.value == DataTypeEnum.Float8BFloat8.value \
                 or self.value == DataTypeEnum.BFloat8_fnuz.value \
                 or self.value == DataTypeEnum.Float8BFloat8_fnuz.value)
+    def is6bitFloat(self):
+        return (self.value == DataTypeEnum.Float6.value \
+                or self.value == DataTypeEnum.BFloat6.value)
+    def isFloat6(self):
+        return self.value == DataTypeEnum.Float6.value
+    def isBFloat6(self):
+        return self.value == DataTypeEnum.BFloat6.value
+    def isFloat4(self):
+        return self.value == DataTypeEnum.Float4.value
     def isNone(self):
         return self.value == None
 
     def numRegisters(self):
         return self.properties['reg']
     def numBytes(self):
-        return int(self.numRegisters() * 4)
+        return self.numRegisters() * 4
     def MIOutputTypeNameAbbrev(self):
         return self.properties['miOutTypeNameAbbrev']
     def flopsPerMac(self):

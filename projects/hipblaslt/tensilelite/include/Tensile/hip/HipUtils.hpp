@@ -146,7 +146,7 @@ namespace TensileLite
                               sizes.end());
 
                 auto     beginOffset = desc.index(coord);
-                auto     bytesOffset = desc.elementBytes() * beginOffset;
+                size_t   bytesOffset = beginOffset * desc.elementBytes();
                 uint8_t* dstBytes    = (uint8_t*)dst + bytesOffset;
                 uint8_t* srcBytes    = (uint8_t*)dst + bytesOffset;
 
