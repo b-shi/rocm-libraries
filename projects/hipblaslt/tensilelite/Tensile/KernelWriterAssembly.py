@@ -8584,7 +8584,7 @@ class KernelWriterAssembly(KernelWriter):
                       comment="incUpper <- ?"))
           imod.add(self.incrementSrd(tP, sgpr(incLower), sgpr(incUpper)))
 
-          if "MX" in tP:
+          if tP.get("MX"):
             # TODO: DirectToVgpr
             tc = tP["MX"]["tensorChar"]
             imod.addComment1("global read inc %s loop%s"%(tc, loopChar))
@@ -8638,7 +8638,7 @@ class KernelWriterAssembly(KernelWriter):
               srcGRInc = "GlobalReadIncs%s"%tc
           imod.add(self.incrementSrd(tP, srcGRInc, hex(incUpper)))
 
-        if "MX" in tP:
+        if tP.get("MX"):
           tc = tP["MX"]["tensorChar"]
           imod.addComment1("global read inc %s loop%s"%(tc, loopChar))
           if loopIdx != self.states.unrollIdx or (tc in ('MXSA', 'MXSB') and kernel["ProblemType"]["IndicesSummation"][self.states.unrollIdx] in kernel["ProblemType"]["MirrorDims%s"%tc]):
@@ -9960,7 +9960,7 @@ class KernelWriterAssembly(KernelWriter):
     if kernel["ProblemType"]["Sparse"] and not kernel["DirectToVgprSparseMetadata"] and tP["is_sparse"]:
         globalReadBody(tP["tpsMetadata"])
 
-    if "MX" in tP:
+    if tP.get("MX"):
         globalReadBody(tP["MX"])
 
     if self.db["ConservativeWaitCnt"] & 0x1:
@@ -10052,7 +10052,7 @@ class KernelWriterAssembly(KernelWriter):
       if internalPointerSwap and not kernel["StoreSwapAddr"]:
         tP["localWriteSwapByteOffset"] = 0 if tP["localWriteSwapByteOffset"] else kernel["LdsOffsetA_Blk"]
         module.addComment1("(EPS=1) local write swap internal offset -> %u" % tP["localWriteSwapByteOffset"])
-        if "MX" in tP:
+        if tP.get("MX"):
           tP["MX"]["localWriteSwapByteOffset"] = 0 if tP["MX"]["localWriteSwapByteOffset"] else kernel["LdsOffsetA_Blk"]
           module.addComment1("(EPS=1) local write swap internal offset -> %u" % tP["MX"]["localWriteSwapByteOffset"])
       elif self.states.IncLdsBufSwitch:
@@ -10067,7 +10067,7 @@ class KernelWriterAssembly(KernelWriter):
         src0Val = getSrc0Val(tc)
         numLwa = self.states.a.numVgprLocalWriteAddr if tP["isA"] else self.states.b.numVgprLocalWriteAddr
         localWriteSwapXOR(tc, src0Val, numLwa)
-        if "MX" in tP:
+        if tP.get("MX"):
           tc = tP["MX"]["tensorChar"]
           src0Val = getSrc0Val(tc)
           numLwa = self.states.mxsa.numVgprLocalWriteAddr if tP["MX"]["isMXSA"] else self.states.mxsb.numVgprLocalWriteAddr
@@ -11014,7 +11014,7 @@ class KernelWriterAssembly(KernelWriter):
       if kernel["ProblemType"]["Sparse"] and not kernel["DirectToVgprSparseMetadata"]:
         if tP["is_sparse"]:
           localWriteBody(tP["tpsMetadata"])
-    if "MX" in tP:
+    if tP.get("MX"):
       tcmx = tP["MX"]["tensorChar"]
       if ((not kernel["DirectToLds%s"%tcmx]) and (not kernel["DirectToVgpr%s"%tcmx])) or \
          (((tcmx == "MXSA" and kernel["NonDTLTailLoopMXSA"]) or \
