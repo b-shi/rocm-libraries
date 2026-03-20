@@ -373,6 +373,12 @@ namespace TensileLite
                                        reinterpret_cast<std::complex<double> const*>(data),
                                        tensor,
                                        reinterpret_cast<std::complex<double> const*>(ptrVal));
+                    else if(tensor.dataType() == rocisa::DataType::MXScale)
+                        logTensorTyped(level,
+                                       name,
+                                       reinterpret_cast<MXScale const*>(data),
+                                       tensor,
+                                       reinterpret_cast<MXScale const*>(ptrVal));
                     else
                         throw std::runtime_error(
                             concatenate("Can't log tensor of type ", tensor.dataType()));
