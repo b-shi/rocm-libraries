@@ -744,6 +744,7 @@ def _grScaleComputeOffset(module, writer, tileInfo, col_id, row_id):
   if scaleBpe > 1:
     module.add(VLShiftLeftB32(dst=vgpr(tmpVgpr), shiftHex=hex(scaleBpe.bit_length()-1), src=vgpr(tmpVgpr), comment="scale%s: * scaleBpe"%tc))
   module.add(VAddU32(dst=vgpr(tileInfo.sharedVgprGROffset[0]), src0=vgpr(col_id), src1=vgpr(tmpVgpr), comment="scale%s: GR offset"%tc))
+  writer.vgprPool.checkIn(tmpVgpr)
 
 # Compute wave partition offset for a single tile (A or B)
 #
@@ -857,10 +858,8 @@ def _grSwizzleColIds(module, writer, tileInfoA, tileInfoB, blockSize, numRowsPer
 def graTileAssignment(writer, kernel, useSwizzling=True):
   module = Module()
   module.addComment0("GR Offset Calculation for Subtile Based Tiling")
-  
   tileInfoA = writer.states.a.tileInfo
   tileInfoB = writer.states.b.tileInfo
-  
   # Input Parameters.
   depthUBytes = tileInfoA.depthUBytes
   wavesize = kernel["WavefrontSize"]
@@ -1145,7 +1144,6 @@ def lraTileAssignmentScaleSwizzled(writer, kernel):
     
   return module
 
-
 ##################################################
 # Subroutine to generate GR load code
 #
@@ -1408,6 +1406,7 @@ def mainLoopImpl(writer, kernel, isNLL = False):
     module.add(SWaitCnt(dscnt=-1, vlcnt=0, vscnt=-1, comment="Wait for all subtile GRs to complete"))
     module.add(SBarrier(comment=""))
  
+
 
   module.add(localReadDoSubtile('A', writer, kernel))
   module.add(localReadDoSubtile('B', writer, kernel))
