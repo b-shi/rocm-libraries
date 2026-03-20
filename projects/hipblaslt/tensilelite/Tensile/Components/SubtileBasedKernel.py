@@ -851,15 +851,19 @@ def _grSwizzleColIds(module, writer, tileInfoA, tileInfoB, blockSize, numRowsPer
 
   module.add(VAndB32(dst=vgpr(colIdA), src0=vgpr(colIdA), src1=hex(blockSize-1), comment="(col + offset) % block_size"))
   module.add(VAndB32(dst=vgpr(colIdB), src0=vgpr(colIdB), src1=hex(blockSize-1), comment="(col + offset) % block_size"))
+  
   writer.vgprPool.checkIn(tmpVgpr)
 
+##################################################
 # Subroutine to generate GR offset calculation code
 #
 def graTileAssignment(writer, kernel, useSwizzling=True):
   module = Module()
   module.addComment0("GR Offset Calculation for Subtile Based Tiling")
+
   tileInfoA = writer.states.a.tileInfo
   tileInfoB = writer.states.b.tileInfo
+
   # Input Parameters.
   depthUBytes = tileInfoA.depthUBytes
   wavesize = kernel["WavefrontSize"]
@@ -909,6 +913,7 @@ def graTileAssignment(writer, kernel, useSwizzling=True):
   _grComputeSubtileOffsets(writer, module, tileInfoB)
 
   return module
+
 
 ##################################################
 # Generate GR offset calculation for scaleA/B (DTL).
@@ -1405,7 +1410,7 @@ def mainLoopImpl(writer, kernel, isNLL = False):
     module.add(globalReadDoSubtile('B', writer, kernel))
     module.add(SWaitCnt(dscnt=-1, vlcnt=0, vscnt=-1, comment="Wait for all subtile GRs to complete"))
     module.add(SBarrier(comment=""))
- 
+
 
 
   module.add(localReadDoSubtile('A', writer, kernel))
