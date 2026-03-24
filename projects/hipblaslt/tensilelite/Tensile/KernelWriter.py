@@ -3841,6 +3841,9 @@ class KernelWriter(metaclass=abc.ABCMeta):
     self.states.a.tileInfo.allocVgprTileRegisters(self, kernel)
     self.states.b.tileInfo.allocVgprTileRegisters(self, kernel)
     self.states.d.tileInfo.allocVgprTileRegisters(self, kernel)
+    # Allocate scale VGPR tiles for MFMA scale inputs
+    self.states.a.tileInfo.allocScaleVgprTiles(self, kernel)
+    self.states.b.tileInfo.allocScaleVgprTiles(self, kernel)
     module.add(initVgprTilesToZero(self, kernel,self.states.d.tileInfo))
 
     self.states.scheduleInfo = ScheduleInfo(self.states.a.tileInfo, self.states.b.tileInfo)
@@ -3875,6 +3878,9 @@ class KernelWriter(metaclass=abc.ABCMeta):
     # Deallocate registers used for GR/LR offsets
     self.states.a.tileInfo.deallocOffsetRegisters(self, kernel)
     self.states.b.tileInfo.deallocOffsetRegisters(self, kernel)
+    # Deallocate scale VGPR tiles
+    self.states.a.tileInfo.deallocScaleVgprTiles(self, kernel)
+    self.states.b.tileInfo.deallocScaleVgprTiles(self, kernel)
     # Deallocate registers used for VGPR A/Btiles
     self.states.a.tileInfo.deallocVgprTileRegisters(self, kernel)
     self.states.b.tileInfo.deallocVgprTileRegisters(self, kernel)
@@ -4961,7 +4967,22 @@ class KernelWriter(metaclass=abc.ABCMeta):
       sizeB = ((numBSubtiles * bTileInfo.subtileSize + readSize-1) // readSize) * readSize
       self.ldsStartOffsetB = sizeA
       self.ldsTotalSize = sizeA + sizeB
-      kernel["LdsNumBytes"] = int((sizeA + sizeB) * kernel["NumLdsBlk"])
+
+      # Add scale LDS regions (only when scale GR/LR will actually execute)
+      scaleSize = 0
+      wavesize = kernel["WavefrontSize"]
+      numWaves = kernel["MIWaveGroup"][0] * kernel["MIWaveGroup"][1]
+      if aTileInfo.mxBlock > 0 and aTileInfo.localSubtileGrid[1] > 0:
+        MT0A = aTileInfo.globalMMATileGrid[0] * aTileInfo.mmaTileShape[0]
+        MT0B = bTileInfo.globalMMATileGrid[0] * bTileInfo.mmaTileShape[0]
+        scaleALdsRaw = MT0A * aTileInfo.scaleDepthU * aTileInfo.scaleBpe
+        ldsAlignment = wavesize * numWaves * aTileInfo.scaleLoadWidth
+        scaleALdsSize = math.ceil(scaleALdsRaw / ldsAlignment) * ldsAlignment
+        scaleBLdsRaw = MT0B * bTileInfo.scaleDepthU * bTileInfo.scaleBpe if bTileInfo.mxBlock > 0 else 0
+        scaleBLdsSize = math.ceil(scaleBLdsRaw / ldsAlignment) * ldsAlignment if scaleBLdsRaw > 0 else 0
+        scaleSize = scaleALdsSize + scaleBLdsSize
+
+      kernel["LdsNumBytes"] = max(1, int((sizeA + sizeB) * kernel["NumLdsBlk"] + scaleSize))
 
 
     #print(self.states.a.tileInfo.getLocalSubtileId(1,0))
