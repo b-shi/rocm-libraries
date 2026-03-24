@@ -3827,6 +3827,8 @@ class KernelWriter(metaclass=abc.ABCMeta):
     module.add(graTileAssignment(self, kernel))
     module.add(lraTileAssignment(self, kernel))
 
+    module.add(localReadDTLInitCommonSwapVgpr(self, kernel))
+
     module.add(graTileAssignmentScaleSwizzled(self, kernel))
     module.add(lraTileAssignmentScaleSwizzled(self, kernel))
 
@@ -4964,6 +4966,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
       sizeA = ((numASubtiles * aTileInfo.subtileSize + readSize-1) // readSize) * readSize
       sizeB = ((numBSubtiles * bTileInfo.subtileSize + readSize-1) // readSize) * readSize
       self.ldsStartOffsetB = sizeA
+      self.ldsTotalSize = sizeA + sizeB
 
       # Add scale LDS regions (only when scale GR/LR will actually execute)
       scaleSize = 0
@@ -4981,7 +4984,6 @@ class KernelWriter(metaclass=abc.ABCMeta):
 
       kernel["LdsNumBytes"] = max(1, int((sizeA + sizeB) * kernel["NumLdsBlk"] + scaleSize))
       
-
     #print(self.states.a.tileInfo.getLocalSubtileId(1,0))
 
     #exit(1)
@@ -7031,8 +7033,8 @@ class KernelWriter(metaclass=abc.ABCMeta):
     else:
       self.defineSgpr("LocalWriteBaseAddrA", 1)
       self.defineSgpr("LocalWriteBaseAddrB", 1)
-      self.defineSgpr("LocalWriteDTLOffsetA", 1)
-      self.defineSgpr("LocalWriteDTLOffsetB", 1)
+      self.defineSgpr("LocalWriteSwapA", 1)
+      self.defineSgpr("LocalWriteSwapB", 1)
 
     # Allocate registers to swap between lds buffers
     if self.states.useCommonSgprSwap:
