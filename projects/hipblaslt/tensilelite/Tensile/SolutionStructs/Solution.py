@@ -614,6 +614,7 @@ class Solution(collections.abc.Mapping):
     if state["UseSubtileImpl"]:
       state["VectorWidthA"] = 1
       state["VectorWidthB"] = 1
+      state["SourceSwap"] = False
     
     # done
     state["AssignedProblemIndependentDerivedParameters"] = True
@@ -2431,7 +2432,7 @@ class Solution(collections.abc.Mapping):
           if state["LocalReadVectorWidth"] == -1:
             autoLRVW = 1
             if state["TransposeLDS"] or (state["MIInputPerThread"] * state["ProblemType"]["DataType"].numBytes() > 16):
-              state["LocalReadVectorWidth"] = 16 // state["ProblemType"]["DataType"].numBytes()
+              state["LocalReadVectorWidth"] = int(16 // state["ProblemType"]["DataType"].numBytes())
             else:
               state["LocalReadVectorWidth"] = state["MIInputPerThread"]
           else:
@@ -2942,7 +2943,7 @@ class Solution(collections.abc.Mapping):
         else:
           state["StoreVectorWidth"] = state["VectorWidthA"]
 
-    if state["EnableMatrixInstruction"]:
+    if state["EnableMatrixInstruction"] and not state["UseSubtileImpl"]:
       if state["SourceSwap"]:
         if ((state["VectorWidthA"] % state["StoreVectorWidth"]) != 0):
           reject(state, printRejectionReason, "MFMA SourceSwap mode doesn't support vwA(%u) with svw(%u)" % (state["VectorWidthA"], state["StoreVectorWidth"]))
