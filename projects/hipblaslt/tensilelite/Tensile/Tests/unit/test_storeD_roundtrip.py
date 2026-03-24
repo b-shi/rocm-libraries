@@ -77,7 +77,7 @@ CONFIGS = [
 #   mt_a=96  → MIWaveTile[0]=3 (odd) — last d0 element has no sba=1 partner
 #   mt_a=160 → MIWaveTile[0]=5 (odd) — same
 #
-# These configs specifically target _emitBF16SubtileScalarStore, which handles
+# These configs specifically target _emit16bitSubtileScalarStore, which handles
 # the orphan (unpaired) subtile when MIWaveTile[0] is odd.
 # ---------------------------------------------------------------------------
 BF16_ODD_MIWT_CONFIGS = [
@@ -1379,7 +1379,7 @@ def test_storeD_bf16_odd_miwt(cfg, tmp_path):
     """BF16 store-D roundtrip for configs where MIWaveTile[0] is odd.
 
     When MIWaveTile[0] is odd the last (even) tt0 element has no sba=1 partner
-    and is handled by _emitBF16SubtileScalarStore (the "orphan" store path).
+    and is handled by _emit16bitSubtileScalarStore (the "orphan" store path).
     This test specifically targets that code path, which is not exercised by
     CONFIGS (all of which produce even MIWaveTile[0] values).
 

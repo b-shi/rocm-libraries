@@ -13191,17 +13191,20 @@ class KernelWriterAssembly(KernelWriter):
 
       cvtVgprStruct  = None
       cvtVgpr        = None
-      if kernel["ProblemType"]["DestDataType"].isBFloat16() and kernel["ProblemType"]["HighPrecisionAccumulate"]:
-        # For UseSubtileImpl, allocate 6 vgprs with 2-alignment (64-bit aligned) so
-        # that the first 4 (reused as pack scratch for the paired bf16 store) satisfy
+      is16bitHPA = (kernel["ProblemType"]["DestDataType"].isBFloat16() or
+                    kernel["ProblemType"]["DestDataType"].isHalf()) and \
+                   kernel["ProblemType"]["HighPrecisionAccumulate"]
+      if is16bitHPA:
+        # For UseSubtileImpl, allocate 7 vgprs with 2-alignment (64-bit aligned) so
+        # that the first 4 (reused as pack scratch for the paired 16bit store) satisfy
         # the buffer_store_dwordx4 alignment requirement.  Any pool vgpr skipped for
         # alignment becomes a hole that subsequent element-address checkouts fill, so
         # pool.size() (= startVgprValu) stays within budget for large macro-tiles.
         # If a very large tile causes accvgpr staging to exceed 256 vgprs despite the
         # alignment overhead, reduce the batch via NumElementsPerBatchStore.
-        #   +0..+3: scratch for VCvtPkF32toBF16 output + ds_bpermute + v_permlane32_swap
+        #   +0..+3: scratch for pack output + ds_bpermute + v_permlane32_swap
         #           (reuses vgprBf16Temp/Mask/Nan/Inc slots; constants written at batch
-        #           start are overwritten by the packed bf16 values before the store)
+        #           start are overwritten by the packed 16bit values before the store)
         #   +4: vgprPermAddr       — ds_permute partner-lane byte address
         #   +5: vgprLaneGroupDelta — lane_group*8, pre-computed once per batch
         #   +6: vgprAddrScratch    — per-store adjusted D address; avoids modifying addrDVgpr
@@ -13400,15 +13403,8 @@ class KernelWriterAssembly(KernelWriter):
       # only do an even number of halves - since these share hi/lo pieces of some registers?
       if numElementsPerBatch > 1:
         numElementsPerBatch = int(numElementsPerBatch/2)*2
-        # UseSubtileImpl BF16 paired-store: ensure batch boundary never splits a
-        # (tt0=even, tt0=odd) pair.  Elements per d1-row = MIWaveTile[0], so
-        # round down numElementsPerBatch to the nearest multiple of MIWaveTile[0].
-        if (kernel.get("UseSubtileImpl") and
-            kernel["ProblemType"]["DestDataType"].isBFloat16() and
-            kernel["ProblemType"]["HighPrecisionAccumulate"] and
-            kernel.get("MIWaveTile") and kernel["MIWaveTile"][0] > 1):
-          miwt0 = kernel["MIWaveTile"][0]
-          numElementsPerBatch = max(miwt0, (numElementsPerBatch // miwt0) * miwt0)
+        # UseSubtileImpl paired-store: pairs are always consecutive (elementIdx % 2),
+        # so an even batch boundary is sufficient — guaranteed by the /2*2 rounding above.
       # dot2: no this constraint
       elif not kernel["EnableMatrixInstruction"] and not kernel["UseDotInstruction"]:
         # The globalWriteBatch routine below can't handle odd elements per batch
