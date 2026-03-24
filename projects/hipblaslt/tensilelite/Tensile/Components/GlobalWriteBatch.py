@@ -34,7 +34,7 @@ from rocisa.instruction import BufferAtomicAddF32, BufferAtomicCmpswapB32, \
   SSwapPCB64, SWaitCnt, SWaitAlu, VAShiftRightI32, VAddCCOU32, VAddCOU32, VAddF32, VAddF64, \
   VAddI32, VAddPKF16, VAddPKF32, VAddU32, VBfeI32, VCmpEQU32, VCmpGEI32, VCmpGtU32, \
   VCmpNeU32, VCmpNeU64, VCndMaskB32, VCvtBF8toF32, VCvtF16toF32, VCvtF32toF16, VCvtF32toI32, \
-  VCvtFP8toF32, VCvtI32toF32, VCvtPkBF8toF32, VCvtPkF32toBF16, VCvtPkFP8toF32, \
+  VCvtFP8toF32, VCvtI32toF32, VCvtPkBF8toF32, VCvtPkF32toBF16, VCvtPkF32toFP16, VCvtPkFP8toF32, \
   VFmaF64, VFmaMixF32, VAndB32, VLShiftLeftB32, VPermlane16SwapB32, VPermlane32SwapB32, \
   VLShiftRightB32, VMacF32, VMadMixF32, VMaxF32, VMovB32, VMovB64, VMulF32, VMulF64, \
   VMulLOU32, VMulPKF16, VMulPKF32, VPackF16toB32, VReadfirstlaneB32, VRndneF32, VCvtBF16toFP32, VSubU32
@@ -1477,6 +1477,7 @@ class GlobalWriteBatchWriter:
     addrDVgpr    = addrCalc.addrDVgpr
 
     typeStr = "fp16" if isFp16 else "bf16"
+    VCvtPkF32to16 = VCvtPkF32toFP16 if isFp16 else VCvtPkF32toBF16
     module.addComment1(f"{typeStr} paired dwordx4 store tt0={tt0} (sba=0+sba=1): pack 8 f32 accvgprs -> 4 {typeStr} dwords")
 
     # Pack sba=0 subtile: ValuC+sumIdx0+{0,1} → vPack+0; ValuC+sumIdx0+{2,3} → vPack+1
@@ -1487,17 +1488,7 @@ class GlobalWriteBatchWriter:
 
     def packF32pair(dst, src0, src1, comment):
       """Pack two f32 VGPRs into one dword of two 16bit values."""
-      if isFp16:
-        # fp16: VCvtF32toF16 needs a scratch register for the high-half before VPackF16toB32.
-        # Using dst+1 as scratch would clobber vPermAddr (vPack+2) when dst=vPack+1, and go
-        # out-of-range when dst=vPack+3.  Allocate a dedicated temp vgpr for the high-half.
-        vTmp = self.parentWriter.vgprPool.checkOut(1, "fp16 cvt high-half temp")
-        module.add(VCvtF32toF16(dst=vgpr(dst),  src=src0, comment=f"{comment} cvt low"))
-        module.add(VCvtF32toF16(dst=vgpr(vTmp), src=src1, comment=f"{comment} cvt high"))
-        module.add(VPackF16toB32(dst=vgpr(dst), src0=vgpr(dst), src1=vgpr(vTmp), comment=f"{comment} pack"))
-        self.parentWriter.vgprPool.checkIn(vTmp)
-      else:
-        module.add(VCvtPkF32toBF16(dst=vgpr(dst), src0=src0, src1=src1, comment=f"{comment} -> bf16"))
+      module.add(VCvtPkF32to16(dst=vgpr(dst), src0=src0, src1=src1, comment=f"{comment} -> {typeStr}"))
 
     packF32pair(vPack+0, vc(sumIdx0, 0), vc(sumIdx0, 1), f"sba=0 tt0={tt0}[0:1]")
     packF32pair(vPack+1, vc(sumIdx0, 2), vc(sumIdx0, 3), f"sba=0 tt0={tt0}[2:3]")
@@ -1607,6 +1598,7 @@ class GlobalWriteBatchWriter:
     matN   = self.kernel["MatrixInstN"]
 
     typeStr = "fp16" if isFp16 else "bf16"
+    VCvtPkF32to16 = VCvtPkF32toFP16 if isFp16 else VCvtPkF32toBF16
     module.addComment1(f"{typeStr} orphan subtile tt0={tt0}: pack 4 M-rows (vc=0..3) at fixed N-col, store as 2x dwordx2")
 
     # Build per-lane vaddr:
@@ -1686,22 +1678,10 @@ class GlobalWriteBatchWriter:
     # vc=0 → M-row+0 (lo16 of dword0), vc=1 → M-row+1 (hi16 of dword0)
     # vc=2 → M-row+2 (lo16 of dword1), vc=3 → M-row+3 (hi16 of dword1)
     #
-    # For fp16, VCvtF32toF16 needs a scratch register for the high half before VPackF16toB32.
-    # vPack+0..1 are the output dwords; vPack+2 is the vaddr (must survive); vPack+3 is free.
-    # Use vPack+3 as the high-half scratch for both pairs to avoid clobbering vPack+2 (vaddr).
-    if isFp16:
-      module.add(VCvtF32toF16(dst=vgpr(vPack+0), src=vc(0), comment="M-row+0/+1 cvt low"))
-      module.add(VCvtF32toF16(dst=vgpr(vPack+3), src=vc(1), comment="M-row+0/+1 cvt high"))
-      module.add(VPackF16toB32(dst=vgpr(vPack+0), src0=vgpr(vPack+0), src1=vgpr(vPack+3), comment="M-row+0/+1 pack"))
-      module.add(VCvtF32toF16(dst=vgpr(vPack+1), src=vc(2), comment="M-row+2/+3 cvt low"))
-      module.add(VCvtF32toF16(dst=vgpr(vPack+3), src=vc(3), comment="M-row+2/+3 cvt high"))
-      module.add(VPackF16toB32(dst=vgpr(vPack+1), src0=vgpr(vPack+1), src1=vgpr(vPack+3), comment="M-row+2/+3 pack"))
-    else:
-      module.add(VCvtPkF32toBF16(dst=vgpr(vPack+0), src0=vc(0), src1=vc(1), comment="M-row+0/+1 -> bf16"))
-      module.add(VCvtPkF32toBF16(dst=vgpr(vPack+1), src0=vc(2), src1=vc(3), comment="M-row+2/+3 -> bf16"))
-      module.add(SNop(waitState=0, comment="delay after pk_bf16"))
-    typeStr2 = "fp16" if isFp16 else "bf16"
-    module.addComment1(f"buffer_store_b64: write 4 {typeStr2} M-rows at fixed N-col (orphan subtile)")
+    module.add(VCvtPkF32to16(dst=vgpr(vPack+0), src0=vc(0), src1=vc(1), comment=f"M-row+0/+1 -> {typeStr}"))
+    module.add(VCvtPkF32to16(dst=vgpr(vPack+1), src0=vc(2), src1=vc(3), comment=f"M-row+2/+3 -> {typeStr}"))
+    module.add(SNop(waitState=0, comment=f"delay after pk_{typeStr}"))
+    module.addComment1(f"buffer_store_b64: write 4 {typeStr} M-rows at fixed N-col (orphan subtile)")
     module.add(BufferStoreB64(
       src=vgpr(vPack+0, 2),
       vaddr=vgpr(vPack+2),

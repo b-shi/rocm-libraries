@@ -988,6 +988,9 @@ class Solution(collections.abc.Mapping):
     numBytes = state["ProblemType"]["MacDataTypeA"].numBytes()
     isa = state["ISA"]
 
+    if state["UseSubtileImpl"]:
+      return True
+
     # x4 support for directToLds
     canDTLx4 = isaInfoMap[isa].asmCaps["HasDirectToLdsx4"]
 
