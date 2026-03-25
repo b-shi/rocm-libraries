@@ -3857,15 +3857,23 @@ class KernelWriter(metaclass=abc.ABCMeta):
     module.add(self.calculateLoopNumIter(kernel, tensorParametersA, tensorParametersB, self.states.unrollIdx))
 
     # Allocate registers for VGPR tiles
-    for tileInfo in [atileInfo, btileInfo, dtileInfo]:
-      tileInfo.allocVgprTileRegisters(self, kernel)
+    pgr = kernel["PrefetchGlobalRead"]
+    if pgr != 2:
+      # PGR=2: A/B vgprTiles are allocated by SubtileBasedScheduler in mainLoop
+      # TMP HACK to still use legacy path for PGR=0
+      for tileInfo in [atileInfo, btileInfo, dtileInfo]:
+        tileInfo.allocVgprTileRegisters(self, kernel)
+
+    for tileInfo in [dtileInfo]:
+        tileInfo.allocVgprTileRegisters(self, kernel)
 
     for tileInfo in [mxsatileInfo, mxsbtileInfo]:
       if tileInfo:
         tileInfo.allocVgprTileRegisters(self, kernel)
     module.add(initVgprTilesToZero(self, kernel, dtileInfo))
 
-    self.states.scheduleInfo = ScheduleInfo(atileInfo, btileInfo)
+    if pgr != 2:
+      self.states.scheduleInfo = ScheduleInfo(atileInfo, btileInfo)
 
     for tileInfo in [atileInfo, btileInfo, mxsatileInfo, mxsbtileInfo, dtileInfo]:
       if tileInfo:
