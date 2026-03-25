@@ -608,9 +608,14 @@ class Solution(collections.abc.Mapping):
       state["UseMFMAF32XEmulation"] = True # enable MFMA version by default
 
     state["MfmaInitCVgprs"] = False
+    # TODOBS: This is currently hardcoded, will need to add logic to enable this
+    # selectively.
     #state["UseSubtileImpl"] = False
     state["UseSubtileImpl"] = True
 
+    # Only enable for GFX950 for now.
+    state["UseSubtileImpl"] = state["UseSubtileImpl"] and state["ISA"] == IsaVersion(9,5,0)
+    
     if state["UseSubtileImpl"]:
       state["VectorWidthA"] = 1
       state["VectorWidthB"] = 1
@@ -2093,7 +2098,7 @@ class Solution(collections.abc.Mapping):
             if readRegsB == 4 or readRegsB == 1:
               optPadB *= 2
         if ldsPadA == -1:
-          if isMX and state["ProblemType"]["DataTypeA"].is6bitFloat():
+          if isMX and (state["ProblemType"]["DataTypeA"].is6bitFloat() or state["ProblemType"]["DataTypeA"].isFloat4()):
             ldsPadA = 0
           else:
             if not state["UnrollMajorLDSA"]:
@@ -2126,7 +2131,7 @@ class Solution(collections.abc.Mapping):
           assert(ldsPadA >= 0)
 
         if ldsPadB == -1:
-          if isMX and state["ProblemType"]["DataTypeB"].is6bitFloat():
+          if isMX and (state["ProblemType"]["DataTypeB"].is6bitFloat() or state["ProblemType"]["DataTypeB"].isFloat4()):
             ldsPadB = 0
           else:
             if not state["UnrollMajorLDSB"]:
