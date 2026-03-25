@@ -3894,11 +3894,15 @@ class KernelWriter(metaclass=abc.ABCMeta):
       self.states.serializedStore = True
 
 
+      # SrdWS must be removed from the free pool before endSummation so that
+      # defineSgpr() calls within endSummation don't see it as Available while
+      # defineMultiSgprIndex (checkOutMulti) may have grabbed those registers.
+      if not self.states.doShadowInit:
+        self.removeSgprVarFromPool("SrdWS")
       module.add(self.endSummation(kernel, tensorParametersA, tensorParametersB))
       if not self.states.doShadowInit:
         self.removeSgprVarFromPool("SrdD")
         self.removeSgprVarFromPool("SrdC")
-        self.removeSgprVarFromPool("SrdWS")
         module.add(self.globalWriteWorkGroupInit(kernel))
 
       ####################################
@@ -6606,7 +6610,10 @@ class KernelWriter(metaclass=abc.ABCMeta):
       vgprIdx += numVgprAddressDbg
 
       # for cgemm or zgemm + MIAV case, allocate 2 or 4 vgpr for alpha calculation (cannot use tmp vgpr in write batch)
-      if kernel["ProblemType"]["MacDataTypeA"].isComplex() and kernel["MIArchVgpr"]:
+      if kernel["ProblemType"]["MacDataTypeA"].isComplex() \
+        and kernel["MIArchVgpr"] \
+        and (kernel["_GlobalAccumulation"] == 'SingleBuffer' or kernel["_GlobalAccumulation"] == None):
+
         # need proper alignment
         vgprIdx = ((vgprIdx+2 - 1)//2)*2
         self.states.startVgprAlphaTmp = vgprIdx

@@ -1257,8 +1257,7 @@ namespace TensileLite
 
     size_t ContractionProblemGemm::flopsPerMac() const
     {
-        auto& aTensor = m_tensors[ContractionProblemGemm::TENSOR::A];
-        return 2 * DataTypeInfo::Get(aTensor.dataType()).packing;
+        return 2;
     }
 
     size_t ContractionProblemGemm::flopCount() const
