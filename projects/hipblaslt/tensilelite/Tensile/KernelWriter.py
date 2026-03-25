@@ -3894,11 +3894,15 @@ class KernelWriter(metaclass=abc.ABCMeta):
       self.states.serializedStore = True
 
 
+      # SrdWS must be removed from the free pool before endSummation so that
+      # defineSgpr() calls within endSummation don't see it as Available while
+      # defineMultiSgprIndex (checkOutMulti) may have grabbed those registers.
+      if not self.states.doShadowInit:
+        self.removeSgprVarFromPool("SrdWS")
       module.add(self.endSummation(kernel, tensorParametersA, tensorParametersB))
       if not self.states.doShadowInit:
         self.removeSgprVarFromPool("SrdD")
         self.removeSgprVarFromPool("SrdC")
-        self.removeSgprVarFromPool("SrdWS")
         module.add(self.globalWriteWorkGroupInit(kernel))
 
       ####################################
