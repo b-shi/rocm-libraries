@@ -1007,11 +1007,9 @@ def _computeScaleLROffset(module, kernel, tileInfo, colOffset, rowOffset):
   dst = tileInfo.sharedVgprLROffset[0]
 
   # Base offset = colOffset * lrReadWidth + rowOffset
-  if scaleLRReadWidth > 1:
-    module.add(VLShiftLeftAddU32(dst=vgpr(dst), shiftHex=hex(scaleLRReadWidth.bit_length()-1),
-               src0=vgpr(colOffset), src1=vgpr(rowOffset), comment="scale%s: col*lrReadWidth + row"%tc))
-  else:
-    module.add(VAddU32(dst=vgpr(dst), src0=vgpr(colOffset), src1=vgpr(rowOffset), comment="scale%s: row + col"%tc))
+  assert scaleLRReadWidth == 4, "scaleLRReadWidth must be 4 (ds_read_b32), got %d" % scaleLRReadWidth
+  module.add(VLShiftLeftAddU32(dst=vgpr(dst), shiftHex=hex(scaleLRReadWidth.bit_length()-1),
+             src0=vgpr(colOffset), src1=vgpr(rowOffset), comment="scale%s: col*lrReadWidth + row"%tc))
 
 
 ##################################################
