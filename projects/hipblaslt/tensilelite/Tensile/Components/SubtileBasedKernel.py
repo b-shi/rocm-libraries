@@ -290,8 +290,10 @@ class TileInfo:
         self.scaleBpe = 1  # UE8M0 = 1 byte
         self.scaleMMATileK = mmaTileShape1 // self.mxBlock
         self.scaleDepthU = depthU // self.mxBlock
-        self.scaleLoadWidth = self.scaleBpe  # 1 byte per load (DSLoadU8)
-        self.scaleBlockSize = (self.scaleDepthU * self.scaleBpe) // self.scaleLoadWidth
+        scaleDepthUBytes = self.scaleDepthU * self.scaleBpe
+        # Use 4-byte loads when scale row has >= 4 bytes, else fall back to 1-byte
+        self.scaleLoadWidth = 4 if scaleDepthUBytes >= 4 else self.scaleBpe
+        self.scaleBlockSize = scaleDepthUBytes // self.scaleLoadWidth
         assert self.scaleBlockSize > 0 and (self.scaleBlockSize & (self.scaleBlockSize - 1)) == 0, \
           "scaleBlockSize must be power of 2, got %d" % self.scaleBlockSize
         self.numLRScalePerSubtile = 1  # 1 VGPR; MMA tile selection via ds_offset at emit time
@@ -1195,13 +1197,11 @@ def lraTileAssignmentScaleSwizzled(writer, kernel):
 ##################################################
 # Scale GR: Load scale bytes from global memory to LDS (non-DTL).
 #
-# Each thread loads 1 scale byte via BufferLoadU8 from the scale SRD,
-# then writes it to LDS via DSStoreB8. The GR offset (sharedVgprGROffset[0])
-# indexes into global memory; the LDS write uses scaleLdsBase + serial as
-# a packed sequential layout.
+# When scaleLoadWidth==4: BufferLoadB32 + DSStoreB32, addr = scaleLdsBase + serial*4
+# When scaleLoadWidth==1: BufferLoadU8  + DSStoreB8,  addr = scaleLdsBase + serial
 #
-# OOB threads (serial >= numScaleElements) load 0 via SRD bounds and
-# write to padding bytes in LDS (harmless).
+# The GR offset (sharedVgprGROffset[0]) is the byte offset into the scale SRD.
+# OOB threads load 0 via SRD bounds and write to LDS padding (harmless).
 #
 def globalReadDoScaleSubtile(tc, writer, kernel):
   module = Module()
@@ -1210,32 +1210,54 @@ def globalReadDoScaleSubtile(tc, writer, kernel):
   if tileInfo.mxBlock == 0:
     return module
 
-  module.addComment0("Scale GR: %s (non-DTL: BufferLoadU8 -> DSStoreB8)" % tc)
+  assert tileInfo.scaleLoadWidth in (1, 4), "Scale GR expects scaleLoadWidth 1 or 4, got %u" % tileInfo.scaleLoadWidth
+  assert len(tileInfo.sharedVgprGROffset) > 0, "Scale GR requires at least 1 GR offset VGPR"
+
+  loadWidth = tileInfo.scaleLoadWidth
+  useB32 = (loadWidth == 4)
+
+  module.addComment0("Scale GR: %s (non-DTL: BufferLoad%s -> DSStore%s)" % (tc, "B32" if useB32 else "U8", "B32" if useB32 else "B8"))
 
   tmpVgpr = writer.vgprPool.checkOut(1)
   ldsWriteVgpr = writer.vgprPool.checkOut(1)
 
-  # Load 1 byte from global scale buffer
+  # Load from global scale buffer
   mubuf = MUBUFModifiers(offen=True, offset12=0, glc=False, slc=False, nt=False, lds=False)
-  module.add(BufferLoadU8(dst=vgpr(tmpVgpr), vaddr=vgpr(tileInfo.sharedVgprGROffset[0]),
-                          saddr=sgpr("SrdMXS%s" % tc, 4), soffset=0, mubuf=mubuf,
-                          comment="scale%s: load 1B from global" % tc))
+  if useB32:
+    module.add(BufferLoadB32(dst=vgpr(tmpVgpr), vaddr=vgpr(tileInfo.sharedVgprGROffset[0]),
+                             saddr=sgpr("SrdMXS%s" % tc, 4), soffset=0, mubuf=mubuf,
+                             comment="scale%s: load 4B from global" % tc))
+  else:
+    module.add(BufferLoadU8(dst=vgpr(tmpVgpr), vaddr=vgpr(tileInfo.sharedVgprGROffset[0]),
+                            saddr=sgpr("SrdMXS%s" % tc, 4), soffset=0, mubuf=mubuf,
+                            comment="scale%s: load 1B from global" % tc))
 
-  # Compute LDS write offset: scaleLdsBase + serial (packed sequential)
+  # Compute LDS write offset: scaleLdsBase + serial * loadWidth
   scaleLdsBase = tileInfo.scaleLdsBase
   tmpSgpr = writer.sgprPool.checkOut(1)
   module.add(SMovB32(dst=sgpr(tmpSgpr), src=hex(scaleLdsBase), comment="scale%s: LDS base" % tc))
-  module.add(VAddU32(dst=vgpr(ldsWriteVgpr), src0=vgpr("Serial"), src1=sgpr(tmpSgpr),
-                     comment="scale%s: LDS write addr = base + serial" % tc))
+  if useB32:
+    module.add(VLShiftLeftB32(dst=vgpr(ldsWriteVgpr), shiftHex=hex(2), src=vgpr("Serial"),
+                              comment="scale%s: serial * 4" % tc))
+    module.add(VAddU32(dst=vgpr(ldsWriteVgpr), src0=vgpr(ldsWriteVgpr), src1=sgpr(tmpSgpr),
+                       comment="scale%s: LDS write addr = base + serial*4" % tc))
+  else:
+    module.add(VAddU32(dst=vgpr(ldsWriteVgpr), src0=vgpr("Serial"), src1=sgpr(tmpSgpr),
+                       comment="scale%s: LDS write addr = base + serial" % tc))
   writer.sgprPool.checkIn(tmpSgpr)
 
   # Wait for global load
   module.add(SWaitCnt(dscnt=-1, vlcnt=0, vscnt=-1, comment="scale%s: wait for GR" % tc))
 
-  # Write 1 byte to LDS
-  module.add(DSStoreB8(vgpr(ldsWriteVgpr), vgpr(tmpVgpr),
-                       ds=DSModifiers(offset=0),
-                       comment="scale%s: store 1B to LDS" % tc))
+  # Write to LDS
+  if useB32:
+    module.add(DSStoreB32(vgpr(ldsWriteVgpr), vgpr(tmpVgpr),
+                          ds=DSModifiers(offset=0),
+                          comment="scale%s: store 4B to LDS" % tc))
+  else:
+    module.add(DSStoreB8(vgpr(ldsWriteVgpr), vgpr(tmpVgpr),
+                         ds=DSModifiers(offset=0),
+                         comment="scale%s: store 1B to LDS" % tc))
 
   writer.vgprPool.checkIn(tmpVgpr)
   writer.vgprPool.checkIn(ldsWriteVgpr)
