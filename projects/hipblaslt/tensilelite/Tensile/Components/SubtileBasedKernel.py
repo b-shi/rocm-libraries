@@ -295,8 +295,8 @@ class TileInfo:
         self.scaleLRReadWidth = 4    # LR: ds_read_b32
         # scaleBlockSize: LR lane mapping decomposition (based on LR read width, not GR load width)
         self.scaleBlockSize = scaleDepthUBytes // self.scaleLRReadWidth if scaleDepthUBytes >= self.scaleLRReadWidth else 1
-        # Thread divisibility: total scale bytes must be a multiple of the GR load width
         MT0 = self.globalMMATileGrid[0] * mmaTileShape0
+        # Thread divisibility: total scale bytes must be a multiple of the GR load width
         totalScaleBytes = MT0 * self.scaleDepthU * self.scaleBpe
         assert totalScaleBytes % self.scaleLoadWidth == 0, \
           "Scale bytes (%d) must be divisible by scaleLoadWidth (%d)" % (totalScaleBytes, self.scaleLoadWidth)
@@ -761,31 +761,6 @@ def _grComputeSubtileOffsets(writer, module, tileInfo):
         module.add(SMulI32(dst=sgpr(stmp), src0=hex(s_stride * regId), src1=sgpr(strideRef), comment="%s: %u rows offset, stride %u, %u"%(tc, rowOffset, s_stride, regId)))
         module.add(VAddU32(dst=vgpr(reg), src0=vgpr(tileInfo.sharedVgprGROffset[idx]), src1=sgpr(stmp)))
         writer.sgprPool.checkIn(stmp)
-
-##################################################
-# Compute scale GR offset for a single matrix (A or B).
-#
-# Contiguous access: offset = row * scaleStride * scaleBpe + col
-# scaleStride = dataStride / mxBlock
-#
-# Result stored in sharedVgprGROffset[0] (reuses data GR offset VGPR).
-#
-def _grScaleComputeOffset(module, writer, tileInfo, col_id, row_id):
-  tc = tileInfo.tc
-  scaleBpe = tileInfo.scaleBpe
-  mxBlock = tileInfo.mxBlock
-  mxBlockShift = mxBlock.bit_length() - 1
-  strideRef = "StrideA0I" if tc == 'A' else "StrideB1J"
-
-  tmpVgpr = writer.vgprPool.checkOut(1)
-
-  # offset = row * dataStride / mxBlock * scaleBpe + col
-  module.add(VMulLOU32(dst=vgpr(tmpVgpr), src0=sgpr(strideRef), src1=vgpr(row_id), comment="scale%s: row_id * dataStride"%tc))
-  module.add(VLShiftRightB32(dst=vgpr(tmpVgpr), shiftHex=hex(mxBlockShift), src=vgpr(tmpVgpr), comment="scale%s: / mxBlock (data->scale stride)"%tc))
-  if scaleBpe > 1:
-    module.add(VLShiftLeftB32(dst=vgpr(tmpVgpr), shiftHex=hex(scaleBpe.bit_length()-1), src=vgpr(tmpVgpr), comment="scale%s: * scaleBpe"%tc))
-  module.add(VAddU32(dst=vgpr(tileInfo.sharedVgprGROffset[0]), src0=vgpr(col_id), src1=vgpr(tmpVgpr), comment="scale%s: GR offset"%tc))
-  writer.vgprPool.checkIn(tmpVgpr)
 
 # Compute wave partition offset for a single tile (A or B)
 #

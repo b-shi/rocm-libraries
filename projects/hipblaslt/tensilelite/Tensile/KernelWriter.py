@@ -4972,11 +4972,11 @@ class KernelWriter(metaclass=abc.ABCMeta):
       self.ldsStartOffsetB = sizeA
       self.ldsTotalSize = sizeA + sizeB
 
-      # Add scale LDS regions (only when scale GR/LR will actually execute)
+      # Add scale LDS regions when MX scaling is enabled
       scaleSize = 0
       wavesize = kernel["WavefrontSize"]
       numWaves = kernel["MIWaveGroup"][0] * kernel["MIWaveGroup"][1]
-      if aTileInfo.mxBlock > 0 and aTileInfo.localSubtileGrid[1] > 0:
+      if aTileInfo.mxBlock > 0:
         MT0A = aTileInfo.globalMMATileGrid[0] * aTileInfo.mmaTileShape[0]
         MT0B = bTileInfo.globalMMATileGrid[0] * bTileInfo.mmaTileShape[0]
         scaleALdsRaw = MT0A * aTileInfo.scaleDepthU * aTileInfo.scaleBpe
