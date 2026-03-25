@@ -1632,7 +1632,7 @@ def mainLoopImpl(writer, kernel):
   loopBegin = Label("LoopBeginL", "")
   module.add(loopBegin)
 
-  if pgr >= 2:
+  if pgr == 2:
     # PGR=2 pipeline: MFMA uses vgprs from *previous* LR (preloop's LR on first iter)
     # 1. MFMA (consume previous LR data)
     module.add(emitMfmaCode(writer, kernel))
@@ -1773,8 +1773,11 @@ def preLoop(writer, kernel):
 def mainLoop(writer, kernel):
   module = Module()
   pgr = kernel["PrefetchGlobalRead"]
+  assert pgr in (0, 2), "SubtileBasedKernel only supports PGR=0 and PGR=2, got PGR=%d" % pgr
 
-  if pgr >= 2:
+  if pgr == 2:
+    module.add(preLoop(writer, kernel))
+
     skipToNLL    = Label("SkipToNLL", "")
     skipToNGLL   = Label("SkipToNGLL", "")
     skipMainloop = Label("SkipMainloop", "")
@@ -1795,7 +1798,7 @@ def mainLoop(writer, kernel):
   module.add(mainLoopImpl(writer, kernel))
   module.addComment("")
 
-  if pgr >= 2:
+  if pgr == 2:
     module.add(skipMainloop)
     module.addComment0("NGLL")
     module.add(noGlobalLoadLoop(writer, kernel))
