@@ -24,7 +24,7 @@ from rocisa.container import RegisterContainer, replaceHolder, HWRegContainer, V
 from rocisa.label import LabelManager
 from rocisa.asmpass import rocIsaPass, rocIsaPassOption
 from rocisa.instruction import BufferLoadB128, BufferLoadB32, BufferLoadB64, \
-  BufferLoadD16B16, BufferLoadD16U8, BufferLoadU8, DSLoad2B32, DSLoad2B64, DSLoadB128, \
+  BufferLoadD16B16, BufferLoadD16U8, DSLoad2B32, DSLoad2B64, DSLoadB128, \
   DSLoadB32, DSLoadB64, DSLoadB64TrB16, DSLoadInstruction, DSLoadU16, \
   DSLoadU8, DSStore2B32, DSStore2B64, DSStoreB128, DSStoreB16, DSStoreB256, \
   DSStoreB32, DSStoreB64, DSStoreB8, DSStoreInstruction, FlatLoadB128, FlatLoadB32, \
