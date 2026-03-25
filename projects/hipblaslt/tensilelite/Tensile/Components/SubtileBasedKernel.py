@@ -1508,10 +1508,10 @@ def emitMfmaInstruction(writer, kernel, vgprTileA, vgprTileB, vgprTileC, vgprTil
     if scaleAVgpr >= 0 and scaleBVgpr >= 0:
       # Use actual loaded scale VGPRs
       module.add(MXMFMAInstruction(instType=InstType.INST_F4, accType=InstType.INST_F32, variant=[16,16,miK,1], \
-                                   acc=accvgprAlias(vgprDStart,opDSize), \
+                                   acc=dAccAlias(vgprDStart,opDSize), \
                                    a=aOperand, \
                                    b=bOperand, \
-                                   acc2=accvgprAlias(vgprCStart,opCSize), \
+                                   acc2=cAccAlias(vgprCStart,opCSize), \
                                    mxsa=vgpr(scaleAVgpr), mxsb=vgpr(scaleBVgpr), \
                                    comment=comment))
     else:
@@ -1519,7 +1519,7 @@ def emitMfmaInstruction(writer, kernel, vgprTileA, vgprTileB, vgprTileC, vgprTil
       tmpVgprScale = writer.vgprPool.checkOut(1)
       module.add(VMovB32(dst=vgpr(tmpVgprScale), src=hex(0x80), comment="hardcoded scale 0x80"))
       module.add(MXMFMAInstruction(instType=InstType.INST_F4, accType=InstType.INST_F32, variant=[16,16,miK,1], \
-                                   acc=accvgprAlias(vgprDStart,opDSize), \
+                                   acc=dAccAlias(vgprDStart,opDSize), \
                                    a=aOperand, \
                                    b=bOperand, \
                                    acc2=cAccAlias(vgprCStart,opCSize), \
