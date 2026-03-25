@@ -3844,9 +3844,6 @@ class KernelWriter(metaclass=abc.ABCMeta):
     # Allocate scale VGPR tiles for MFMA scale inputs
     self.states.a.tileInfo.allocScaleVgprTiles(self, kernel)
     self.states.b.tileInfo.allocScaleVgprTiles(self, kernel)
-    # Allocate scale VGPR tiles for MFMA scale inputs
-    self.states.a.tileInfo.allocScaleVgprTiles(self, kernel)
-    self.states.b.tileInfo.allocScaleVgprTiles(self, kernel)
     module.add(initVgprTilesToZero(self, kernel,self.states.d.tileInfo))
 
     self.states.scheduleInfo = ScheduleInfo(self.states.a.tileInfo, self.states.b.tileInfo)
