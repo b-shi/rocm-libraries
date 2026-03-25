@@ -4985,7 +4985,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
         scaleBLdsSize = math.ceil(scaleBLdsRaw / ldsAlignment) * ldsAlignment if scaleBLdsRaw > 0 else 0
         scaleSize = scaleALdsSize + scaleBLdsSize
 
-      kernel["LdsNumBytes"] = max(1, int((sizeA + sizeB) * kernel["NumLdsBlk"] + scaleSize))
+      kernel["LdsNumBytes"] = max(1, int((sizeA + sizeB + scaleSize) * kernel["NumLdsBlk"]))
 
 
     #print(self.states.a.tileInfo.getLocalSubtileId(1,0))
