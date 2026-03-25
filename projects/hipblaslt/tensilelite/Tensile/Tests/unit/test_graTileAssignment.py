@@ -278,29 +278,9 @@ def generate_gra_scale_asm(cfg):
 
 
 def compute_expected_scale_gr_offset(thread_id, cfg, tileInfo):
-    """Python reference for scale GR offset (contiguous access, no swizzle/split)."""
-    stride = cfg.stride_a if tileInfo.tc == 'A' else cfg.stride_b
-    scaleBpe = tileInfo.scaleBpe
-    scaleBlockSize = tileInfo.scaleBlockSize
-    scaleLoadWidth = tileInfo.scaleLoadWidth
-    mxBlock = tileInfo.mxBlock
-    scaleStride = stride // mxBlock
-
-    # Simple col/row from serial (contiguous access)
-    if scaleBlockSize > 1:
-        col = thread_id % scaleBlockSize
-        row = thread_id // scaleBlockSize
-    else:
-        col = 0
-        row = thread_id
-
-    col *= scaleLoadWidth
-
-    # offset = row * scaleStride * scaleBpe + col
-    base = (row * scaleStride) << max(0, scaleBpe.bit_length() - 1)
-    base += col
-
-    return [base]
+    """Python reference for scale GR offset (DTL linear access)."""
+    # DTL: grOffset = serial * scaleLoadWidth
+    return [thread_id * tileInfo.scaleLoadWidth]
 
 
 SCALE_GR_TILE_CONFIGS = [

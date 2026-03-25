@@ -8,10 +8,10 @@
 #
 # Flow per matrix (A or B):
 #   1. Compute GR + LR offsets (production code)
-#   2. flat_load_ubyte from global scale buffer at GR offset
-#   3. ds_write_b8 to LDS at position = serial
+#   2. flat_load_dwordx4 from global scale buffer at GR offset (16 bytes)
+#   3. ds_write_b128 to LDS at GR offset (DTL pattern: contiguous copy)
 #   4. s_barrier
-#   5. ds_read_u8 from LDS at (LR offset - dataLdsSize)
+#   5. ds_read_u8 from LDS at (LR offset - scaleBase)
 #   6. Export result
 #
 # Usage:
@@ -85,12 +85,12 @@ def compute_lds_sizes(cfg, tileInfoA, tileInfoB, kernel):
 
 
 def compute_input_size(cfg, tileInfo):
-    """Max GR offset + 1 across all threads."""
+    """Max GR offset + scaleLoadWidth across all threads (DTL B128 loads 16 bytes)."""
     max_off = 0
     for tid in range(NUM_THREADS):
         offsets = compute_expected_scale_gr_offset(tid, cfg, tileInfo)
         max_off = max(max_off, offsets[0])
-    return max_off + 1
+    return max_off + tileInfo.scaleLoadWidth
 
 
 def generate_input_data(size):
@@ -134,20 +134,20 @@ def generate_roundtrip_kernel(cfg, tc):
 
     # Allocate temp registers for roundtrip
     vAddr = writer.vgprPool.checkOutAligned(2, 2, "addr", preventOverflow=False)
-    vData = writer.vgprPool.checkOut(1, "data", preventOverflow=False)
+    vData = writer.vgprPool.checkOutAligned(4, 4, "data", preventOverflow=False)
     vLrAdj = writer.vgprPool.checkOut(1, "lr_adj", preventOverflow=False)
     vByteOff = writer.vgprPool.checkOut(1, "byte_off", preventOverflow=False)
     sTmp = writer.sgprPool.checkOut(1, "tmp", preventOverflow=False)
 
     roundtrip_asm = f"""\
-  // ---- Roundtrip for scale {tc} ----
+  // ---- Roundtrip for scale {tc} (DTL pattern: 16-byte load/write) ----
   v_mov_b32 v{vAddr}, s{ptrLo}
   v_mov_b32 v{vAddr+1}, s{ptrHi}
   v_add_co_u32 v{vAddr}, vcc, v{vAddr}, v{grOffReg}
   v_addc_co_u32 v{vAddr+1}, vcc, v{vAddr+1}, 0, vcc
-  flat_load_ubyte v{vData}, v[{vAddr}:{vAddr+1}]
+  flat_load_dwordx4 v[{vData}:{vData+3}], v[{vAddr}:{vAddr+1}]
   s_waitcnt vmcnt(0) lgkmcnt(0)
-  ds_write_b8 v0, v{vData}
+  ds_write_b128 v{grOffReg}, v[{vData}:{vData+3}]
   s_waitcnt lgkmcnt(0)
   s_barrier
   s_mov_b32 s{sTmp}, {scaleBase}
@@ -188,30 +188,28 @@ def generate_roundtrip_kernel(cfg, tc):
 def compute_expected_roundtrip(cfg, tileInfoA, tileInfoB, input_data, tc, kernel):
     """Compute expected scale byte for each thread after the roundtrip.
 
-    Data path: thread T reads LDS[lrOff(T) - scaleBase]. That position
-    was written by thread writer=lrOff(T)-scaleBase, who loaded
-    input[grOff(writer)].
+    DTL pattern: GR writes input[0..N*16-1] contiguously to LDS[0..N*16-1].
+    Thread T reads LDS[lrOff(T) - scaleBase], so expected = input[lrOff(T) - scaleBase].
     """
     tileInfo = tileInfoA if tc == 'A' else tileInfoB
     otherTileInfo = tileInfoB if tc == 'A' else tileInfoA
 
-    dataLdsSize, scaleALdsSize, _ = compute_lds_sizes(cfg, tileInfoA, tileInfoB, kernel)
+    dataLdsSize, scaleALdsSize, scaleBLdsSize = compute_lds_sizes(cfg, tileInfoA, tileInfoB, kernel)
     scaleBase = dataLdsSize if tc == 'A' else (dataLdsSize + scaleALdsSize)
+    scaleLdsSize = scaleALdsSize if tc == 'A' else scaleBLdsSize
 
     expected = [0] * NUM_THREADS
     for T in range(NUM_THREADS):
         lr_offset = compute_expected_scale_lr_offset(T, cfg, tileInfo, otherTileInfo)[0]
-        writer = lr_offset - scaleBase
+        lds_pos = lr_offset - scaleBase
 
-        assert 0 <= writer < NUM_THREADS, \
-            f"Thread {T}: LR offset {lr_offset} - scaleBase {scaleBase} = {writer} out of range"
+        assert 0 <= lds_pos < scaleLdsSize, \
+            f"Thread {T}: LDS pos {lds_pos} (lr={lr_offset}, base={scaleBase}) out of range [0, {scaleLdsSize})"
 
-        gr_offset = compute_expected_scale_gr_offset(writer, cfg, tileInfo)[0]
+        assert lds_pos < len(input_data), \
+            f"Thread {T}: LDS pos {lds_pos} >= input size {len(input_data)}"
 
-        assert 0 <= gr_offset < len(input_data), \
-            f"Writer thread {writer}: GR offset {gr_offset} >= input size {len(input_data)}"
-
-        expected[T] = int(input_data[gr_offset])
+        expected[T] = int(input_data[lds_pos])
 
     return expected
 
