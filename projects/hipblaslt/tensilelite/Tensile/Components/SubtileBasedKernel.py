@@ -32,7 +32,7 @@ from rocisa.instruction import BufferLoadB128, BufferLoadB32, BufferLoadB64, \
   MFMAInstruction, MXMFMAInstruction, SAddU32, SAddCU32, SBarrier, SBranch, SCBranchSCC0, SCBranchSCC1, SCBranchVCCNZ, SCmpEQU32, SCmpLeU32, \
   SMFMAInstruction, SNop, SSetPrior, SSetRegIMM32B32, SSubU32, SSubBU32, SWaitCnt, SWaitAlu, SXorB32, \
   SLongBranchPositive, VAccvgprWrite, VFmaMixF32, VMadMixF32, VMovB32, VAndB32, VCmpXEqU32, VCndMaskB32, VReadfirstlaneB32, \
-  VMovB64, VLShiftRightB32, VLShiftLeftB32, VLShiftLeftAddU32, VMulLOU32, VAddU32, VAddCOU32, VAddCCOU32, VXorB32, \
+  VMovB64, VLShiftRightB32, VLShiftLeftB32, VMulLOU32, VAddU32, VAddCOU32, VAddCCOU32, VXorB32, \
   SMovB32, SMulI32, FlatStoreB32, SWaitCnt, SMovB64, VSubU32, VPermlane16SwapB32, MFMAInstruction, \
   VCmpLtU32, SAndSaveExecB64
 from rocisa.register import RegisterPool
@@ -1007,33 +1007,11 @@ def graTileAssignmentScaleSwizzled(writer, kernel):
 
 
 ##################################################
-# Compute scale LR base offset (1-VGPR model).
-#
-# Uses a single VGPR for the per-lane base offset within the scale
-# LDS block. MMA tile and subtile selection is deferred to emit time
-# via the constant ds_offset parameter of ds_read_b32:
-#   ds_offset = (subId * numSubtile1 + subtileIdx1) * 256
-#
-# The base offset encodes the column + row:
-#   offset = colOffset * scaleLRReadWidth + lane16 * scaleDepthUBytes
-#
-def _computeScaleLROffset(module, kernel, dataTileInfo, scaleTileInfo, colOffset, rowOffset):
-  tc = dataTileInfo.tc
-  scaleLRReadWidth = dataTileInfo.scaleLRReadWidth
-  dst = scaleTileInfo.sharedVgprLROffset[0]
-
-  # Base offset = colOffset * lrReadWidth + rowOffset
-  assert scaleLRReadWidth == 4, "scaleLRReadWidth must be 4 (ds_read_b32), got %d" % scaleLRReadWidth
-  module.add(VLShiftLeftAddU32(dst=vgpr(dst), shiftHex=hex(scaleLRReadWidth.bit_length()-1),
-             src0=vgpr(colOffset), src1=vgpr(rowOffset), comment="scale%s: col*lrReadWidth + row"%tc))
-
-
-##################################################
 # Apply wave partition offset for scale LR.
 #
 # Maps waves to scale LDS regions based on the wave group layout:
-#   loadRatioGR == 2.0: No partitioning (each half-wave covers its subtile).
-#   loadRatioGR == 1.0 (2x2): A partitions by waveId%2, B by waveId/2.
+#   loadRatioGR == 2.0: No partitioning.
+#   loadRatioGR == 1.0 (2x2): A partitions by waveId/2, B by waveId%2.
 #   loadRatioGR == 0.5 (1x4/4x1): Two-level partitioning.
 #
 def _applyScaleWavePartitionLROffset(module, writer, kernel, dataTileInfo, scaleTileInfo, waveId):
@@ -1042,9 +1020,12 @@ def _applyScaleWavePartitionLROffset(module, writer, kernel, dataTileInfo, scale
   if dataTileInfo.loadRatioGR >= 2.0:
     return
 
-  wavesize = kernel["WavefrontSize"]
-  scaleLoadWidth = dataTileInfo.scaleLoadWidth
-  bytes_loaded = wavesize * scaleLoadWidth
+  # Partition stride is based on actual scale data size, not GR load capacity.
+  # Mirrors data tile partition (_applyWavePartitionLROffset) which uses
+  # MT * depthUBytes // numPartitions.
+  scaleDepthUBytes = dataTileInfo.scaleDepthU * dataTileInfo.scaleBpe
+  MT0 = dataTileInfo.globalMMATileGrid[0] * dataTileInfo.mmaTileShape[0]
+  totalScaleBytes = MT0 * scaleDepthUBytes
 
   tmpSgpr = writer.sgprPool.checkOut(1)
   tmp = writer.vgprPool.checkOut(2)
@@ -1052,20 +1033,18 @@ def _applyScaleWavePartitionLROffset(module, writer, kernel, dataTileInfo, scale
 
   if dataTileInfo.loadRatioGR == 1.0:
     if tc == 'A':
-      module.add(VAndB32(dst=vgpr(tmp), src0=hex(1), src1=vgpr(waveId), comment="scale%s: waveId %% 2"%tc))
-    else:
       module.add(VLShiftRightB32(dst=vgpr(tmp), shiftHex=hex(1), src=vgpr(waveId), comment="scale%s: waveId / 2"%tc))
-    module.add(SMovB32(dst=sgpr(tmpSgpr), src=bytes_loaded // 2, comment="scale%s: bytes_loaded/2"%tc))
+    else:
+      module.add(VAndB32(dst=vgpr(tmp), src0=hex(1), src1=vgpr(waveId), comment="scale%s: waveId %% 2"%tc))
+    module.add(SMovB32(dst=sgpr(tmpSgpr), src=totalScaleBytes // 2, comment="scale%s: half scale region"%tc))
     module.add(VMulLOU32(dst=vgpr(tmp), src0=sgpr(tmpSgpr), src1=vgpr(tmp), comment="scale%s: partition offset"%tc))
     module.add(VAddU32(dst=vgpr(scaleTileInfo.sharedVgprLROffset[0]), src0=vgpr(scaleTileInfo.sharedVgprLROffset[0]), src1=vgpr(tmp), comment="scale%s: wave partition"%tc))
 
   elif dataTileInfo.loadRatioGR == 0.5:
-    scaleDepthUBytes = dataTileInfo.scaleDepthU * dataTileInfo.scaleBpe
-    MT0 = dataTileInfo.globalMMATileGrid[0] * dataTileInfo.mmaTileShape[0]
-    module.add(SMovB32(dst=sgpr(tmpSgpr), src=hex(MT0 * scaleDepthUBytes // 4), comment="scale%s: interleave stride"%tc))
+    module.add(SMovB32(dst=sgpr(tmpSgpr), src=hex(totalScaleBytes // 4), comment="scale%s: quarter scale region"%tc))
     module.add(VAndB32(dst=vgpr(tmp1), src0=hex(1), src1=vgpr(waveId), comment="scale%s: waveId & 1"%tc))
     module.add(VMulLOU32(dst=vgpr(tmp1), src1=vgpr(tmp1), src0=sgpr(tmpSgpr), comment="scale%s: interleave offset"%tc))
-    module.add(SMovB32(dst=sgpr(tmpSgpr), src=bytes_loaded // 2, comment="scale%s: bytes_loaded/2"%tc))
+    module.add(SMovB32(dst=sgpr(tmpSgpr), src=totalScaleBytes // 2, comment="scale%s: half scale region"%tc))
     module.add(VLShiftRightB32(dst=vgpr(tmp), shiftHex=hex(1), src=vgpr(waveId), comment="scale%s: waveId / 2"%tc))
     module.add(VMulLOU32(dst=vgpr(tmp), src1=vgpr(tmp), src0=sgpr(tmpSgpr), comment="scale%s: wave pair offset"%tc))
     module.add(VAddU32(dst=vgpr(tmp), src0=vgpr(tmp), src1=vgpr(tmp1), comment="scale%s: total partition"%tc))
@@ -1078,12 +1057,12 @@ def _applyScaleWavePartitionLROffset(module, writer, kernel, dataTileInfo, scale
 ##################################################
 # Generate LR offset calculation for scaleA/B.
 #
-# Scale LR uses simple contiguous access among waves (no swizzling,
-# rotation, or half-wave split). The MFMA lane mapping is preserved:
-#   lane16 = laneId % mi_m        (row within 16-row MFMA tile)
-#   lane16Group = laneId / mi_m   (column group selector)
-#   colOffset = lane16Group % scaleBlockSize
-#   rowOffset = lane16 * scaleDepthUBytes
+# Scale LR uses a simple linear per-lane offset:
+#   offset = waveOffset + laneId * sizeof(dword)
+#
+# Wave partition (2x2):
+#   LRA: waveOffset = (waveId / 2) * (MT0 / 2) * scaleDepthU
+#   LRB: waveOffset = (waveId % 2) * (MT1 / 2) * scaleDepthU
 #
 # LDS layout (single buffer):
 #   [DataA + DataB] [ScaleA (aligned)] [ScaleB]
@@ -1107,45 +1086,21 @@ def lraTileAssignmentScaleSwizzled(writer, kernel):
     module.addComment0("Scale LR offsets: skipped (no MX block scaling)")
     return module
 
-  # Lane mapping is shared between A and B — requires matching scale geometry
-  if tileInfoA.mxBlock > 0 and tileInfoB.mxBlock > 0:
-    assert tileInfoA.scaleBlockSize == tileInfoB.scaleBlockSize, \
-      "Scale LR offset sharing requires identical scaleBlockSize for A (%d) and B (%d)" \
-      % (tileInfoA.scaleBlockSize, tileInfoB.scaleBlockSize)
-
   module.addComment0("LR Offset Calculation for Scale Tensors")
 
   wavesize = kernel["WavefrontSize"]
-  mi_m = tileInfoA.mmaTileShape[0]
 
-  refTile = tileInfoA if tileInfoA.mxBlock > 0 else tileInfoB
-  scaleDepthUBytes = refTile.scaleDepthU * refTile.scaleBpe
-  scaleBlockSize = refTile.scaleBlockSize
+  # Per-lane offset: laneId * sizeof(dword) = (serial & (wavesize-1)) << 2
+  laneOffset = writer.vgprPool.checkOut(1)
+  module.add(VAndB32(dst=vgpr(laneOffset), src0=vgpr("Serial"), src1=wavesize-1, comment="scale: laneId"))
+  module.add(VLShiftLeftB32(dst=vgpr(laneOffset), shiftHex=hex(2), src=vgpr(laneOffset), comment="scale: laneId * 4"))
 
-  tmpVgpr = writer.vgprPool.checkOut(4)
-  lane16, lane16Group, rowOffset, colOffset = range(tmpVgpr, tmpVgpr + 4)
-
-  # lane16 and lane16Group (MFMA layout)
-  module.add(VAndB32(dst=vgpr(lane16Group), src0=vgpr("Serial"), src1=wavesize-1, comment="scale: laneId"))
-  module.add(VLShiftRightB32(dst=vgpr(lane16Group), shiftHex=hex(mi_m.bit_length()-1), src=vgpr(lane16Group), comment="scale: lane16Group"))
-  module.add(VAndB32(dst=vgpr(lane16), src0=vgpr("Serial"), src1=mi_m-1, comment="scale: lane16"))
-
-  # Simple col offset: lane16Group % scaleBlockSize (no swizzle/rotation)
-  if scaleBlockSize > 1:
-    module.add(VAndB32(dst=vgpr(colOffset), src0=vgpr(lane16Group), src1=hex(scaleBlockSize-1), comment="scale: colOffset = lane16Group %% blockSize"))
-  else:
-    module.add(VMovB32(dst=vgpr(colOffset), src=0, comment="scale: colOffset=0 (blockSize=1)"))
-
-  # Row offset
-  module.add(VLShiftLeftB32(dst=vgpr(rowOffset), shiftHex=hex(scaleDepthUBytes.bit_length()-1), src=vgpr(lane16), comment="scale: rowOffset = scaleDepthUBytes*lane16"))
-
-  # Compute scale LR offset: write to MXSA/MXSB offset VGPRs, geometry from data tileInfo
   if mxsaTileInfo:
-    _computeScaleLROffset(module, kernel, tileInfoA, mxsaTileInfo, colOffset, rowOffset)
+    module.add(VMovB32(dst=vgpr(mxsaTileInfo.sharedVgprLROffset[0]), src=vgpr(laneOffset), comment="scaleA: lrOffset = laneId * 4"))
   if mxsbTileInfo:
-    _computeScaleLROffset(module, kernel, tileInfoB, mxsbTileInfo, colOffset, rowOffset)
+    module.add(VMovB32(dst=vgpr(mxsbTileInfo.sharedVgprLROffset[0]), src=vgpr(laneOffset), comment="scaleB: lrOffset = laneId * 4"))
 
-  writer.vgprPool.checkIn(tmpVgpr)
+  writer.vgprPool.checkIn(laneOffset)
 
   # Wave partitioning
   waveIdVgpr = writer.vgprPool.checkOut(1)

@@ -301,61 +301,38 @@ def generate_lra_scale_asm(cfg):
 
 
 def compute_expected_scale_lr_offset(thread_id, cfg, tileInfo, otherTileInfo):
-    """Python reference for scale LR offset (contiguous access, no swizzle/split).
+    """Python reference for scale LR offset.
+
+    Formula: offset = waveOffset + laneId * sizeof(dword) + baseLdsOffset
+      LRA waveOffset = (waveId / 2) * (MT0 / 2) * (DU / MXBlock)
+      LRB waveOffset = (waveId % 2) * (MT1 / 2) * (DU / MXBlock)
 
     otherTileInfo: the tileInfo for the other matrix (needed for LDS base offset of B).
     """
-    mi_m = tileInfo.mmaTileShape[0]  # 16
     scaleBpe = tileInfo.scaleBpe
     scaleDepthU = tileInfo.scaleDepthU
     scaleDepthUBytes = scaleDepthU * scaleBpe
-    scaleLoadWidth = tileInfo.scaleLoadWidth
-    scaleBlockSize = tileInfo.scaleBlockSize
-    scaleMMATileK = tileInfo.scaleMMATileK
-    numMFMACols = scaleMMATileK * scaleBpe // scaleLoadWidth
 
     laneId = thread_id % WAVESIZE
-    lane16 = laneId % mi_m
-    lane16Group = laneId // mi_m
 
-    # Simple col offset: lane16Group % scaleBlockSize (no swizzle/rotation)
-    if scaleBlockSize > 1:
-        colOffset = lane16Group % scaleBlockSize
-    else:
-        colOffset = 0
-
-    rowOffset = lane16 * scaleDepthUBytes
-
-    # Per-MMA-tile column offsets
-    offsets = []
-    for i in range(tileInfo.numLRScalePerSubtile):
-        newCol = (colOffset + numMFMACols * i) % scaleBlockSize if scaleBlockSize > 1 else colOffset
-        offsets.append(rowOffset + newCol * scaleLoadWidth)
-
-    # No split offset for scale (contiguous access)
+    # Per-lane offset: laneId * sizeof(dword)
+    laneOffset = laneId * 4
 
     # Wave partitioning
     waveId = thread_id // WAVESIZE
-    bytesLoaded = WAVESIZE * scaleLoadWidth
-    partitionOffset = 0
+    MT0 = cfg.mt_a if tileInfo.tc == 'A' else cfg.mt_b
+    totalScaleBytes = MT0 * scaleDepthUBytes
+    waveOffset = 0
 
     if tileInfo.loadRatioGR == 1.0:  # 2x2
         if tileInfo.tc == 'A':
-            if waveId % 2 == 1:
-                partitionOffset = bytesLoaded // 2
+            waveOffset = (waveId // 2) * (totalScaleBytes // 2)
         elif tileInfo.tc == 'B':
-            if (waveId // 2) % 2 == 1:
-                partitionOffset = bytesLoaded // 2
+            waveOffset = (waveId % 2) * (totalScaleBytes // 2)
     elif tileInfo.loadRatioGR == 0.5:  # 1x4 or 4x1
-        MT0 = cfg.mt_a if tileInfo.tc == 'A' else cfg.mt_b
-        interleaveStride = MT0 * scaleDepthUBytes // 4
-        if waveId % 2 == 1:
-            partitionOffset += interleaveStride
-        if (waveId // 2) % 2 == 1:
-            partitionOffset += bytesLoaded // 2
+        waveOffset = waveId * (totalScaleBytes // 4)
 
-    for i in range(len(offsets)):
-        offsets[i] += partitionOffset
+    offset = laneOffset + waveOffset
 
     # LDS base offsets: scale A after data A+B, scale B after data A+B + aligned(scaleA)
     dataLdsSize = cfg.mt_a * cfg.depth_u * BPE + cfg.mt_b * cfg.depth_u * BPE
@@ -364,16 +341,12 @@ def compute_expected_scale_lr_offset(thread_id, cfg, tileInfo, otherTileInfo):
     if tileInfo.tc == 'A':
         baseLdsOffset = dataLdsSize
     else:
-        # Alignment uses tileInfoA's scaleLoadWidth (matching production code)
         ldsAlignment = WAVESIZE * numWaves * (otherTileInfo.scaleLoadWidth if otherTileInfo.mxBlock > 0 else 1)
         scaleASize = cfg.mt_a * otherTileInfo.scaleDepthU * otherTileInfo.scaleBpe if otherTileInfo.mxBlock > 0 else 0
         scaleAAligned = ((scaleASize + ldsAlignment - 1) // ldsAlignment) * ldsAlignment if scaleASize > 0 else 0
         baseLdsOffset = dataLdsSize + scaleAAligned
 
-    for i in range(len(offsets)):
-        offsets[i] += baseLdsOffset
-
-    return offsets
+    return [offset + baseLdsOffset]
 
 
 SCALE_LR_TILE_CONFIGS = [
