@@ -3798,30 +3798,39 @@ class KernelWriter(metaclass=abc.ABCMeta):
     module.addComment1("global read addresses: addresses b")
     module.add(self.graAddresses(kernel, tensorParametersB))
 
+    atileInfo = self.states.a.tileInfo
+    btileInfo = self.states.b.tileInfo
+    dtileInfo = self.states.d.tileInfo
+    mxsatileInfo = self.states.mxsa.tileInfo if kernel["ProblemType"].get("MXBlockA", 0) else None
+    mxsbtileInfo = self.states.mxsb.tileInfo if kernel["ProblemType"].get("MXBlockB", 0) else None
+
+    # List of tiles that need to be read form
+    readtileInfoList = [atileInfo, btileInfo, mxsatileInfo, mxsbtileInfo]
+
+    # Printout tile info
+    for tileInfo in [atileInfo, btileInfo, mxsatileInfo, mxsbtileInfo, dtileInfo]:
+      if tileInfo != None:
+        module.addComment0(str(tileInfo))
+
     # Allocate registers for GR/LR
-    self.states.a.tileInfo.allocOffsetRegisters(self, kernel)
-    self.states.b.tileInfo.allocOffsetRegisters(self, kernel)
+    for tileInfo in [atileInfo, btileInfo, mxsatileInfo, mxsbtileInfo]:
+      if tileInfo != None:
+        tileInfo.allocOffsetRegisters(self, kernel)
+        module.addComment("Allocating v%s for %s GR"%(str(tileInfo.sharedVgprGROffset), tileInfo.tc))
+        module.addComment("Allocating v%s for %s LR"%(str(tileInfo.sharedVgprLROffset), tileInfo.tc))
+        module.addComment("Allocating v%s for %s LR Swap"%(str(tileInfo.sharedVgprLROffsetSwap), tileInfo.tc))
 
-    atile = self.states.a.tileInfo
-    btile = self.states.b.tileInfo
-
-    module.addComment("Allocating v%s for A GR"%(str(self.states.a.tileInfo.sharedVgprGROffset)))
-    module.addComment("Allocating v%s for B GR"%(str(self.states.b.tileInfo.sharedVgprGROffset)))
-    module.addComment("Allocating v%s for A LR"%(str(self.states.a.tileInfo.sharedVgprLROffset)))
-    module.addComment("Allocating v%s for B LR"%(str(self.states.b.tileInfo.sharedVgprLROffset)))
-
-    for st in atile.localSubtiles:
-      linearId = atile.localSubtiles.index(st)
-      sId0, sId1 = atile.getLocalSubtileIdFromLinearId(linearId)
-      regstr = 's' if st.useSgpr else 'v'
-      module.addComment0("Using %s%s for A GR, subtile: [%u, %u]"%(regstr, str(atile.localSubtilesRegister[st.regListId]), sId0, sId1))
-
-
-    for st in btile.localSubtiles:
-      linearId = btile.localSubtiles.index(st)
-      sId0, sId1 = btile.getLocalSubtileIdFromLinearId(linearId)
-      regstr = 's' if st.useSgpr else 'v'
-      module.addComment0("Using %s%s for B GR, subtile: [%u, %u]"%(regstr, str(btile.localSubtilesRegister[st.regListId]), sId0, sId1))
+    for tileInfo in [atileInfo, btileInfo, mxsatileInfo, mxsbtileInfo]:
+      if tileInfo != None:
+        for st in tileInfo.localSubtiles:
+          # Print out, only if register is allocated
+          if len(tileInfo.localSubtilesRegister):
+            linearId = tileInfo.localSubtiles.index(st)
+            sId0, sId1 = tileInfo.getLocalSubtileIdFromLinearId(linearId)
+            regstr = 's' if st.useSgpr else 'v'
+            module.addComment0("Using %s%s for %s GR, subtile: [%u, %u]"%(\
+                               tileInfo.tc, \
+                               regstr, str(tileInfo.localSubtilesRegister[st.regListId]), sId0, sId1))
 
 
     module.add(graTileAssignment(self, kernel))
@@ -3835,30 +3844,22 @@ class KernelWriter(metaclass=abc.ABCMeta):
 
     module.add(self.calculateLoopNumIter(kernel, tensorParametersA, tensorParametersB, self.states.unrollIdx))
 
-
-
     # Allocate registers for VGPR tiles
-    self.states.a.tileInfo.allocVgprTileRegisters(self, kernel)
-    self.states.b.tileInfo.allocVgprTileRegisters(self, kernel)
-    self.states.d.tileInfo.allocVgprTileRegisters(self, kernel)
-    # Allocate scale VGPR tiles for MFMA scale inputs
-    self.states.a.tileInfo.allocScaleVgprTiles(self, kernel)
-    self.states.b.tileInfo.allocScaleVgprTiles(self, kernel)
-    module.add(initVgprTilesToZero(self, kernel,self.states.d.tileInfo))
+    for tileInfo in [atileInfo, btileInfo, dtileInfo]:
+      tileInfo.allocVgprTileRegisters(self, kernel)
 
-    self.states.scheduleInfo = ScheduleInfo(self.states.a.tileInfo, self.states.b.tileInfo)
+    for tileInfo in [mxsatileInfo, mxsbtileInfo]:
+      if tileInfo:
+        tileInfo.allocVgprTileRegisters(self, kernel)
+    module.add(initVgprTilesToZero(self, kernel, dtileInfo))
 
-    for vtiles in self.states.a.tileInfo.vgprTiles:
-      regStr = "Vgpr" if vtiles.regList.regPool == self.vgprPool else "Agpr" # shouldn't this only be vgpr pool?
-      module.addComment("%ss used for A mma tile %u: %s"%(regStr, self.states.a.tileInfo.vgprTiles.index(vtiles), str(vtiles)))
+    self.states.scheduleInfo = ScheduleInfo(atileInfo, btileInfo)
 
-    for vtiles in self.states.b.tileInfo.vgprTiles:
-      regStr = "Vgpr" if vtiles.regList.regPool == self.vgprPool else "Agpr" # shouldn't this only be vgpr pool?
-      module.addComment("%ss used for B mma tile %u: %s"%(regStr, self.states.b.tileInfo.vgprTiles.index(vtiles), str(vtiles)))
-
-    for vtiles in self.states.d.tileInfo.vgprTiles:
-      regStr = "Vgpr" if vtiles.regList.regPool == self.vgprPool else "Agpr"
-      module.addComment("%ss used for D mma tile %u: %s"%(regStr, self.states.d.tileInfo.vgprTiles.index(vtiles), str(vtiles)))
+    for tileInfo in [atileInfo, btileInfo, mxsatileInfo, mxsbtileInfo, dtileInfo]:
+      if tileInfo:
+        for vtiles in tileInfo.vgprTiles:
+          regStr = "Vgpr" if vtiles.regList.regPool == self.vgprPool else "Agpr" # shouldn't this only be vgpr pool?
+          module.addComment("%ss used for %s mma tile %u: %s"%(regStr, tileInfo.tc, tileInfo.vgprTiles.index(vtiles), str(vtiles)))
 
 
     vtmp = self.vgprPool.checkOut(1)
@@ -3871,19 +3872,16 @@ class KernelWriter(metaclass=abc.ABCMeta):
     #module.add(preLoop(self, kernel))
     module.add(mainLoop(self, kernel))
 
-    atileInfo = self.states.a.tileInfo
-    btileInfo = self.states.b.tileInfo
-    dtileInfo = self.states.d.tileInfo
 
     # Deallocate registers used for GR/LR offsets
-    self.states.a.tileInfo.deallocOffsetRegisters(self, kernel)
-    self.states.b.tileInfo.deallocOffsetRegisters(self, kernel)
-    # Deallocate scale VGPR tiles
-    self.states.a.tileInfo.deallocScaleVgprTiles(self, kernel)
-    self.states.b.tileInfo.deallocScaleVgprTiles(self, kernel)
-    # Deallocate registers used for VGPR A/Btiles
-    self.states.a.tileInfo.deallocVgprTileRegisters(self, kernel)
-    self.states.b.tileInfo.deallocVgprTileRegisters(self, kernel)
+    for tileInfo in [atileInfo, btileInfo, mxsatileInfo, mxsbtileInfo]:
+      if tileInfo != None:
+        tileInfo.deallocOffsetRegisters(self, kernel)
+
+    # Deallocate registers used for VGPR A/B/MXS tiles
+    for tileInfo in [atileInfo, btileInfo, mxsatileInfo, mxsbtileInfo]:
+      if tileInfo:
+        tileInfo.deallocVgprTileRegisters(self, kernel)
 
     # Start of post-loop code
     if 1:
@@ -3925,7 +3923,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
       self.vgprPool.checkIn(self.states.c.startVgprValu)
 
     # Deallocate registers used for C/D tiles after store code instructions are emitted
-    self.states.d.tileInfo.deallocVgprTileRegisters(self, kernel)
+    dtileInfo.deallocVgprTileRegisters(self, kernel)
 
 
 
@@ -4941,24 +4939,28 @@ class KernelWriter(metaclass=abc.ABCMeta):
     print("================= Macro Tile config: %u x %u x %u ========================"%(kernel["MacroTile0"], kernel["MacroTile1"], kernel["DepthU"]))
 
     def initSubTileInfo(tc):
-
-      if tc == 'A':
-        self.states.a.tileInfo = TileInfo(tc, kernel)
-        tileInfo = self.states.a.tileInfo
-      elif tc == 'B':
-        self.states.b.tileInfo = TileInfo(tc, kernel)
-        tileInfo = self.states.b.tileInfo
-      elif tc == 'D':
-        self.states.d.tileInfo = TileInfo(tc, kernel)
-        tileInfo = self.states.d.tileInfo
-
-      print(tileInfo)
+      tileMap = {
+        'A' : self.states.a,
+        'B' : self.states.b,
+        'D' : self.states.d,
+        'MXSA' : self.states.mxsa,
+        'MXSB' : self.states.mxsb,
+      }
+      matrixInfo = tileMap[tc]
+      matrixInfo.tileInfo = TileInfo(tc, kernel)
+      tileInfo = matrixInfo.tileInfo
+      #print(tileInfo)
 
 
     if kernel["UseSubtileImpl"]:
       initSubTileInfo('A')
       initSubTileInfo('B')
       initSubTileInfo('D')
+
+      if kernel["ProblemType"].get("MXBlockA", 0) > 0:
+        initSubTileInfo('MXSA')
+      if kernel["ProblemType"].get("MXBlockB", 0) > 0:
+        initSubTileInfo('MXSB')
 
       self.ldsStartOffsetA = 0
       aTileInfo = self.states.a.tileInfo

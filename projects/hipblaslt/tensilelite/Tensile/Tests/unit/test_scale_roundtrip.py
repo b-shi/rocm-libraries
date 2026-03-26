@@ -115,14 +115,22 @@ def generate_roundtrip_kernel(cfg, tc):
     tileInfoA.allocOffsetRegisters(writer, kernel)
     tileInfoB.allocOffsetRegisters(writer, kernel)
 
+    # Allocate offset registers for MXSA/MXSB (scale offset VGPRs)
+    mxsaTileInfo = getattr(writer.states.mxsa, 'tileInfo', None)
+    mxsbTileInfo = getattr(writer.states.mxsb, 'tileInfo', None)
+    if mxsaTileInfo:
+        mxsaTileInfo.allocOffsetRegisters(writer, kernel)
+    if mxsbTileInfo:
+        mxsbTileInfo.allocOffsetRegisters(writer, kernel)
+
     # Scale GR + LR offset computation
     gra_module = graTileAssignmentScaleSwizzled(writer, kernel)
     lra_module = lraTileAssignmentScaleSwizzled(writer, kernel)
 
-    # Roundtrip logic: which matrix to test
-    tileInfo = tileInfoA if tc == 'A' else tileInfoB
-    grOffReg = tileInfo.sharedVgprGROffset[0]
-    lrOffReg = tileInfo.sharedVgprLROffset[0]
+    # Roundtrip logic: which matrix to test — use MXSA/MXSB for offset VGPRs
+    scaleTileInfo = mxsaTileInfo if tc == 'A' else mxsbTileInfo
+    grOffReg = scaleTileInfo.sharedVgprGROffset[0]
+    lrOffReg = scaleTileInfo.sharedVgprLROffset[0]
     ptrLo = 4 if tc == 'A' else 6
     ptrHi = 5 if tc == 'A' else 7
 

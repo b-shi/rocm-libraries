@@ -168,9 +168,17 @@ def create_writer(cfg, mi_wave_group=None):
     writer.agprPool = RegisterPool(0, RegisterType.Accvgpr,
                                     defaultPreventOverflow=False, printRP=False)
 
+    # Create MXSA/MXSB TileInfo when MX block scaling is active
+    mxBlockA = kernel["ProblemType"].get("MXBlockA", 0)
+    mxBlockB = kernel["ProblemType"].get("MXBlockB", 0)
+    tileInfoMXSA = TileInfo('MXSA', kernel) if mxBlockA > 0 else None
+    tileInfoMXSB = TileInfo('MXSB', kernel) if mxBlockB > 0 else None
+
     writer.states = SimpleNamespace(
         a=SimpleNamespace(tileInfo=tileInfoA),
         b=SimpleNamespace(tileInfo=tileInfoB),
+        mxsa=SimpleNamespace(tileInfo=tileInfoMXSA) if tileInfoMXSA else SimpleNamespace(),
+        mxsb=SimpleNamespace(tileInfo=tileInfoMXSB) if tileInfoMXSB else SimpleNamespace(),
         regCaps={"MaxSgpr": 106, "MaxVgpr": 256, "PhysicalMaxVgpr": 512},
     )
     # LDS layout: A subtiles followed by B subtiles, aligned to readSize

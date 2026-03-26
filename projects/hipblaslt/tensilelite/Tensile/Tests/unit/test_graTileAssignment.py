@@ -261,7 +261,7 @@ class TestGraTileAssignmentGPU:
 # ---- Scale GR tests ----
 
 def generate_gra_scale_asm(cfg):
-    """Run graTileAssignmentScaleSwizzled and return (asm, writer, tileInfoA, tileInfoB, kernel)."""
+    """Run graTileAssignmentScaleSwizzled and return (asm, writer, tileInfoA/B, mxsa/mxsbTileInfo, kernel)."""
     writer, kernel, tileInfoA, tileInfoB = create_writer(cfg)
     init_rocisa()
 
@@ -270,6 +270,14 @@ def generate_gra_scale_asm(cfg):
     writer.sgprs["StrideB1J"] = 11
     tileInfoA.allocOffsetRegisters(writer, kernel)
     tileInfoB.allocOffsetRegisters(writer, kernel)
+
+    # Allocate offset registers for MXSA/MXSB tileInfo (scale offset VGPRs)
+    mxsaTileInfo = getattr(writer.states.mxsa, 'tileInfo', None)
+    mxsbTileInfo = getattr(writer.states.mxsb, 'tileInfo', None)
+    if mxsaTileInfo:
+        mxsaTileInfo.allocOffsetRegisters(writer, kernel)
+    if mxsbTileInfo:
+        mxsbTileInfo.allocOffsetRegisters(writer, kernel)
 
     prologue = generate_load_params(EXPORT_LOAD_PARAMS)
     module = graTileAssignmentScaleSwizzled(writer, kernel)
@@ -313,29 +321,33 @@ class TestGraTileAssignmentScaleGPU:
         )
 
     def test_offset_a_scale(self, gra_scale_env):
-        """Validate scale GR offset for matrix A (stored in sharedVgprGROffset[0])."""
+        """Validate scale GR offset for matrix A (stored in MXSA sharedVgprGROffset[0])."""
         cfg = gra_scale_env.cfg
-        tileInfo = gra_scale_env.tileInfoA
-        reg = tileInfo.sharedVgprGROffset[0]
+        dataTileInfo = gra_scale_env.tileInfoA
+        scaleTileInfo = getattr(gra_scale_env.writer.states.mxsa, 'tileInfo', None)
+        assert scaleTileInfo is not None, "MXSA tileInfo not created"
+        reg = scaleTileInfo.sharedVgprGROffset[0]
         results = export_register(gra_scale_env.writer, gra_scale_env.gra_asm, reg, False,
                                   cfg, gra_scale_env.tmp_path,
                                   f"scaleGR_A_v{reg}_{cfg.label}")
         for tid in range(NUM_THREADS):
-            expected = compute_expected_scale_gr_offset(tid, cfg, tileInfo)
+            expected = compute_expected_scale_gr_offset(tid, cfg, dataTileInfo)
             assert results[tid] == expected[0], \
                 f"[{cfg.label}] Scale A GR v{reg} tid={tid}: " \
                 f"got {results[tid]}, expected {expected[0]}"
 
     def test_offset_b_scale(self, gra_scale_env):
-        """Validate scale GR offset for matrix B (stored in sharedVgprGROffset[0])."""
+        """Validate scale GR offset for matrix B (stored in MXSB sharedVgprGROffset[0])."""
         cfg = gra_scale_env.cfg
-        tileInfo = gra_scale_env.tileInfoB
-        reg = tileInfo.sharedVgprGROffset[0]
+        dataTileInfo = gra_scale_env.tileInfoB
+        scaleTileInfo = getattr(gra_scale_env.writer.states.mxsb, 'tileInfo', None)
+        assert scaleTileInfo is not None, "MXSB tileInfo not created"
+        reg = scaleTileInfo.sharedVgprGROffset[0]
         results = export_register(gra_scale_env.writer, gra_scale_env.gra_asm, reg, False,
                                   cfg, gra_scale_env.tmp_path,
                                   f"scaleGR_B_v{reg}_{cfg.label}")
         for tid in range(NUM_THREADS):
-            expected = compute_expected_scale_gr_offset(tid, cfg, tileInfo)
+            expected = compute_expected_scale_gr_offset(tid, cfg, dataTileInfo)
             assert results[tid] == expected[0], \
                 f"[{cfg.label}] Scale B GR v{reg} tid={tid}: " \
                 f"got {results[tid]}, expected {expected[0]}"

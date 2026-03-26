@@ -286,6 +286,14 @@ def generate_lra_scale_asm(cfg):
     tileInfoA.allocOffsetRegisters(writer, kernel)
     tileInfoB.allocOffsetRegisters(writer, kernel)
 
+    # Allocate offset registers for MXSA/MXSB tileInfo (scale offset VGPRs)
+    mxsaTileInfo = getattr(writer.states.mxsa, 'tileInfo', None)
+    mxsbTileInfo = getattr(writer.states.mxsb, 'tileInfo', None)
+    if mxsaTileInfo:
+        mxsaTileInfo.allocOffsetRegisters(writer, kernel)
+    if mxsbTileInfo:
+        mxsbTileInfo.allocOffsetRegisters(writer, kernel)
+
     prologue = generate_load_params(EXPORT_LOAD_PARAMS)
     module = lraTileAssignmentScaleSwizzled(writer, kernel)
     lra_asm = f"{prologue}\n{module}"
@@ -398,11 +406,13 @@ class TestLraTileAssignmentScaleGPU:
         )
 
     def test_offset_a_scale(self, lra_scale_env):
-        """Validate scale LR offset for matrix A (stored in sharedVgprLROffset[0])."""
+        """Validate scale LR offset for matrix A (stored in MXSA sharedVgprLROffset[0])."""
         cfg = lra_scale_env.cfg
         tileInfoA = lra_scale_env.tileInfoA
         tileInfoB = lra_scale_env.tileInfoB
-        reg = tileInfoA.sharedVgprLROffset[0]
+        scaleTileInfo = getattr(lra_scale_env.writer.states.mxsa, 'tileInfo', None)
+        assert scaleTileInfo is not None, "MXSA tileInfo not created"
+        reg = scaleTileInfo.sharedVgprLROffset[0]
         results = export_register(lra_scale_env.writer, lra_scale_env.lra_asm, reg, False,
                                   cfg, lra_scale_env.tmp_path,
                                   f"scaleLR_A_v{reg}_{cfg.label}")
@@ -413,11 +423,13 @@ class TestLraTileAssignmentScaleGPU:
                 f"got {results[tid]}, expected {expected[0]}"
 
     def test_offset_b_scale(self, lra_scale_env):
-        """Validate scale LR offset for matrix B (stored in sharedVgprLROffset[0])."""
+        """Validate scale LR offset for matrix B (stored in MXSB sharedVgprLROffset[0])."""
         cfg = lra_scale_env.cfg
         tileInfoA = lra_scale_env.tileInfoA
         tileInfoB = lra_scale_env.tileInfoB
-        reg = tileInfoB.sharedVgprLROffset[0]
+        scaleTileInfo = getattr(lra_scale_env.writer.states.mxsb, 'tileInfo', None)
+        assert scaleTileInfo is not None, "MXSB tileInfo not created"
+        reg = scaleTileInfo.sharedVgprLROffset[0]
         results = export_register(lra_scale_env.writer, lra_scale_env.lra_asm, reg, False,
                                   cfg, lra_scale_env.tmp_path,
                                   f"scaleLR_B_v{reg}_{cfg.label}")
