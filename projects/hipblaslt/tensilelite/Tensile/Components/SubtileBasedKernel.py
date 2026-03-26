@@ -1009,13 +1009,10 @@ def graTileAssignmentScaleSwizzled(writer, kernel):
 ##################################################
 # Apply wave partition offset for scale LR.
 #
-# Partitions the scale LDS region across waves using MIWaveGroup dimensions:
-#   A: partition_idx = waveId / MIWaveGroup[1]
-#      partitionStride = totalScaleBytes / MIWaveGroup[0]
-#   B: partition_idx = waveId % MIWaveGroup[1]
-#      partitionStride = totalScaleBytes / MIWaveGroup[1]
-#
-# loadRatioGR >= 2.0: single wave owns entire tile, no partition needed.
+# Maps waves to scale LDS regions based on the wave group layout:
+#   loadRatioGR == 2.0: No partitioning.
+#   loadRatioGR == 1.0 (2x2): A partitions by waveId/2, B by waveId%2.
+#   loadRatioGR == 0.5 (1x4/4x1): Two-level partitioning.
 #
 def _applyScaleWavePartitionLROffset(module, writer, kernel, dataTileInfo, scaleTileInfo, waveId):
   tc = dataTileInfo.tc
@@ -1023,26 +1020,35 @@ def _applyScaleWavePartitionLROffset(module, writer, kernel, dataTileInfo, scale
   if dataTileInfo.loadRatioGR >= 2.0:
     return
 
+  # Partition stride is based on actual scale data size, not GR load capacity.
+  # Mirrors data tile partition (_applyWavePartitionLROffset) which uses
+  # MT * depthUBytes // numPartitions.
   scaleDepthUBytes = dataTileInfo.scaleDepthU * dataTileInfo.scaleBpe
-  MT = dataTileInfo.globalMMATileGrid[0] * dataTileInfo.mmaTileShape[0]
-  totalScaleBytes = MT * scaleDepthUBytes
-
-  if tc == 'A':
-    numPartitions = kernel["MIWaveGroup"][0]
-  else:
-    numPartitions = kernel["MIWaveGroup"][1]
-  partitionStride = totalScaleBytes // numPartitions
+  MT0 = dataTileInfo.globalMMATileGrid[0] * dataTileInfo.mmaTileShape[0]
+  totalScaleBytes = MT0 * scaleDepthUBytes
 
   tmpSgpr = writer.sgprPool.checkOut(1)
-  tmp = writer.vgprPool.checkOut(1)
+  tmp = writer.vgprPool.checkOut(2)
+  tmp1 = tmp + 1
 
-  if tc == 'A':
-    module.add(VLShiftRightB32(dst=vgpr(tmp), shiftHex=hex(int(math.log2(kernel["MIWaveGroup"][1]))), src=vgpr(waveId), comment="scale%s: waveId / %d"%( tc, kernel["MIWaveGroup"][1])))
-  else:
-    module.add(VAndB32(dst=vgpr(tmp), src0=kernel["MIWaveGroup"][1]-1, src1=vgpr(waveId), comment="scale%s: waveId %% %d"%(tc, kernel["MIWaveGroup"][1])))
-  module.add(SMovB32(dst=sgpr(tmpSgpr), src=partitionStride, comment="scale%s: partitionStride=%d"%(tc, partitionStride)))
-  module.add(VMulLOU32(dst=vgpr(tmp), src0=sgpr(tmpSgpr), src1=vgpr(tmp), comment="scale%s: partition offset"%tc))
-  module.add(VAddU32(dst=vgpr(scaleTileInfo.sharedVgprLROffset[0]), src0=vgpr(scaleTileInfo.sharedVgprLROffset[0]), src1=vgpr(tmp), comment="scale%s: wave partition"%tc))
+  if dataTileInfo.loadRatioGR == 1.0:
+    if tc == 'A':
+      module.add(VLShiftRightB32(dst=vgpr(tmp), shiftHex=hex(1), src=vgpr(waveId), comment="scale%s: waveId / 2"%tc))
+    else:
+      module.add(VAndB32(dst=vgpr(tmp), src0=hex(1), src1=vgpr(waveId), comment="scale%s: waveId %% 2"%tc))
+    module.add(SMovB32(dst=sgpr(tmpSgpr), src=totalScaleBytes // 2, comment="scale%s: half scale region"%tc))
+    module.add(VMulLOU32(dst=vgpr(tmp), src0=sgpr(tmpSgpr), src1=vgpr(tmp), comment="scale%s: partition offset"%tc))
+    module.add(VAddU32(dst=vgpr(scaleTileInfo.sharedVgprLROffset[0]), src0=vgpr(scaleTileInfo.sharedVgprLROffset[0]), src1=vgpr(tmp), comment="scale%s: wave partition"%tc))
+
+  elif dataTileInfo.loadRatioGR == 0.5:
+    module.add(SMovB32(dst=sgpr(tmpSgpr), src=hex(totalScaleBytes // 4), comment="scale%s: quarter scale region"%tc))
+    module.add(VAndB32(dst=vgpr(tmp1), src0=hex(1), src1=vgpr(waveId), comment="scale%s: waveId & 1"%tc))
+    module.add(VMulLOU32(dst=vgpr(tmp1), src1=vgpr(tmp1), src0=sgpr(tmpSgpr), comment="scale%s: interleave offset"%tc))
+    module.add(SMovB32(dst=sgpr(tmpSgpr), src=totalScaleBytes // 2, comment="scale%s: half scale region"%tc))
+    module.add(VLShiftRightB32(dst=vgpr(tmp), shiftHex=hex(1), src=vgpr(waveId), comment="scale%s: waveId / 2"%tc))
+    module.add(VMulLOU32(dst=vgpr(tmp), src1=vgpr(tmp), src0=sgpr(tmpSgpr), comment="scale%s: wave pair offset"%tc))
+    module.add(VAddU32(dst=vgpr(tmp), src0=vgpr(tmp), src1=vgpr(tmp1), comment="scale%s: total partition"%tc))
+    module.add(VAddU32(dst=vgpr(scaleTileInfo.sharedVgprLROffset[0]), src0=vgpr(scaleTileInfo.sharedVgprLROffset[0]), src1=vgpr(tmp), comment="scale%s: wave partition"%tc))
 
   writer.vgprPool.checkIn(tmp)
   writer.sgprPool.checkIn(tmpSgpr)
@@ -1054,9 +1060,9 @@ def _applyScaleWavePartitionLROffset(module, writer, kernel, dataTileInfo, scale
 # Scale LR uses a simple linear per-lane offset:
 #   offset = waveOffset + laneId * sizeof(dword)
 #
-# Wave partition (via MIWaveGroup):
-#   LRA: waveOffset = (waveId / MIWaveGroup[1]) * totalScaleBytes / MIWaveGroup[0]
-#   LRB: waveOffset = (waveId % MIWaveGroup[1]) * totalScaleBytes / MIWaveGroup[1]
+# Wave partition (2x2):
+#   LRA: waveOffset = (waveId / 2) * (MT0 / 2) * scaleDepthU
+#   LRB: waveOffset = (waveId % 2) * (MT1 / 2) * scaleDepthU
 #
 # LDS layout (single buffer):
 #   [DataA + DataB] [ScaleA (aligned)] [ScaleB]
@@ -1102,7 +1108,6 @@ def lraTileAssignmentScaleSwizzled(writer, kernel):
 
   if mxsaTileInfo:
     _applyScaleWavePartitionLROffset(module, writer, kernel, tileInfoA, mxsaTileInfo, waveIdVgpr)
-    
   if mxsbTileInfo:
     _applyScaleWavePartitionLROffset(module, writer, kernel, tileInfoB, mxsbTileInfo, waveIdVgpr)
 
