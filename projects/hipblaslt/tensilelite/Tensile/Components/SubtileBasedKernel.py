@@ -33,7 +33,8 @@ from rocisa.instruction import BufferLoadB128, BufferLoadB32, BufferLoadB64, \
   SMFMAInstruction, SNop, SSetPrior, SSetRegIMM32B32, SSubU32, SSubBU32, SWaitCnt, SWaitAlu, SXorB32, \
   SLongBranchPositive, VAccvgprWrite, VFmaMixF32, VMadMixF32, VMovB32, VAndB32, VCmpXEqU32, VCndMaskB32, VReadfirstlaneB32, \
   VMovB64, VLShiftRightB32, VLShiftLeftB32, VLShiftLeftAddU32, VMulLOU32, VAddU32, VAddCOU32, VAddCCOU32, VXorB32, \
-  SMovB32, SMulI32, FlatStoreB32, SWaitCnt, SMovB64, VSubU32, VPermlane16SwapB32, MFMAInstruction
+  SMovB32, SMulI32, FlatStoreB32, SWaitCnt, SMovB64, VSubU32, VPermlane16SwapB32, MFMAInstruction, \
+  VCmpLtU32, SAndSaveExecB64
 from rocisa.register import RegisterPool
 from rocisa.enum import RegisterType, DataTypeEnum
 # Store various scheduling info
@@ -1202,7 +1203,9 @@ def lraTileAssignmentScaleSwizzled(writer, kernel):
 # Uses BufferLoadB128 with lds=True. M0 is set to scaleLdsBase, and
 # sharedVgprGROffset[0] = serial * scaleLoadWidth serves as both the
 # global read offset (from SRD) and the LDS write offset (from M0).
-# OOB threads load 0 via SRD bounds and write to LDS padding (harmless).
+#
+# OOB masking: threads where grOffset >= totalScaleBytes are masked off
+# via exec to avoid writing beyond the valid scale LDS region.
 #
 def globalReadDoScaleSubtile(tc, writer, kernel):
   module = Module()
@@ -1216,6 +1219,21 @@ def globalReadDoScaleSubtile(tc, writer, kernel):
 
   module.addComment0("Scale GR: %s (DTL: BufferLoadB128 -> LDS)" % tc)
 
+  MT0 = dataTileInfo.globalMMATileGrid[0] * dataTileInfo.mmaTileShape[0]
+  totalScaleBytes = MT0 * dataTileInfo.scaleDepthU * dataTileInfo.scaleBpe
+
+  # OOB mask: only threads with grOffset < totalScaleBytes execute the load
+  # sgpr pair must be even-aligned for v_cmp and s_and_saveexec_b64
+  tmpSgpr = writer.sgprPool.checkOutAligned(2, 2)
+  module.add(SMovB32(dst=sgpr(tmpSgpr), src=totalScaleBytes,
+                     comment="scale%s: totalScaleBytes" % tc))
+  module.add(VCmpLtU32(dst=sgpr(tmpSgpr, 2),
+                       src0=vgpr(scaleTileInfo.sharedVgprGROffset[0]),
+                       src1=sgpr(tmpSgpr),
+                       comment="scale%s: grOffset < totalScaleBytes" % tc))
+  module.add(SAndSaveExecB64(dst=sgpr(tmpSgpr, 2), src=sgpr(tmpSgpr, 2),
+                             comment="scale%s: mask off OOB threads" % tc))
+
   # Set M0 to scale LDS base address for DTL write destination
   module.add(SMovB32(dst=mgpr(0), src=hex(dataTileInfo.scaleLdsBase),
                      comment="scale%s: M0 = scaleLdsBase" % tc))
@@ -1225,6 +1243,10 @@ def globalReadDoScaleSubtile(tc, writer, kernel):
   module.add(BufferLoadB128(dst=None, vaddr=vgpr(scaleTileInfo.sharedVgprGROffset[0]),
                             saddr=sgpr("SrdMXS%s" % tc, 4), soffset=0, mubuf=mubuf,
                             comment="scale%s: DTL b128 load" % tc))
+
+  # Restore exec mask
+  module.add(SMovB64(dst=EXEC(), src=-1, comment="scale%s: restore exec" % tc))
+  writer.sgprPool.checkIn(tmpSgpr)
 
   return module
 
