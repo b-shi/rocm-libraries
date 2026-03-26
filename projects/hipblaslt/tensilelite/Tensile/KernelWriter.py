@@ -316,8 +316,10 @@ class StateValues:
   savedLocalReadDoCntMXSB: int           = 0
   savedLocalReadDoCntMetadata: int       = 0
 
-  ldsStartOffsetA: int                   = 0
-  ldsStartOffsetB: int                   = 0
+  ldsStartOffsetA: int                   = -1
+  ldsStartOffsetB: int                   = -1
+  ldsStartOffsetMXSA: int                = -1
+  ldsStartOffsetMXSB: int                = -1
   ldsTotalSize: int                      = 0
 
   dtvKIntervalA: int                     = 1
@@ -3771,12 +3773,20 @@ class KernelWriter(metaclass=abc.ABCMeta):
     #self.removeSgprVarFromPool("SrdD")
     #self.removeSgprVarFromPool("SrdC")
 
+    atileInfo = self.states.a.tileInfo
+    btileInfo = self.states.b.tileInfo
+    dtileInfo = self.states.d.tileInfo
+    mxsatileInfo = self.states.mxsa.tileInfo if kernel["ProblemType"].get("MXBlockA", 0) else None
+    mxsbtileInfo = self.states.mxsb.tileInfo if kernel["ProblemType"].get("MXBlockB", 0) else None
+
     ##
     # TODOBS: need to add init c code, and also init sum unroll code.
     #
 
     module.add(globalReadDTLInitCommonSgpr(self, kernel))
 
+    if mxsatileInfo != None and mxsbtileInfo != None:
+      module.add(globalReadScaleSwizzledDTLInitCommonSgpr(self, kernel))
 
     # TODOBS: globalWriteWorkGroupInit can be emitted here or later on, check..
     if self.states.doShadowInit:
@@ -3798,11 +3808,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
     module.addComment1("global read addresses: addresses b")
     module.add(self.graAddresses(kernel, tensorParametersB))
 
-    atileInfo = self.states.a.tileInfo
-    btileInfo = self.states.b.tileInfo
-    dtileInfo = self.states.d.tileInfo
-    mxsatileInfo = self.states.mxsa.tileInfo if kernel["ProblemType"].get("MXBlockA", 0) else None
-    mxsbtileInfo = self.states.mxsb.tileInfo if kernel["ProblemType"].get("MXBlockB", 0) else None
+
 
     # List of tiles that need to be read form
     readtileInfoList = [atileInfo, btileInfo, mxsatileInfo, mxsbtileInfo]
@@ -4972,23 +4978,20 @@ class KernelWriter(metaclass=abc.ABCMeta):
       sizeA = ((numASubtiles * aTileInfo.subtileSize + readSize-1) // readSize) * readSize
       sizeB = ((numBSubtiles * bTileInfo.subtileSize + readSize-1) // readSize) * readSize
       self.ldsStartOffsetB = sizeA
-      # Add scale LDS regions when MX scaling is enabled
-      scaleSize = 0
-      wavesize = kernel["WavefrontSize"]
-      numWaves = kernel["MIWaveGroup"][0] * kernel["MIWaveGroup"][1]
-      if aTileInfo.mxBlock > 0:
-        MT0A = aTileInfo.globalMMATileGrid[0] * aTileInfo.mmaTileShape[0]
-        MT0B = bTileInfo.globalMMATileGrid[0] * bTileInfo.mmaTileShape[0]
-        scaleALdsRaw = MT0A * aTileInfo.scaleDepthU * aTileInfo.scaleBpe
-        ldsAlignment = wavesize * numWaves * aTileInfo.scaleLoadWidth
-        scaleALdsSize = math.ceil(scaleALdsRaw / ldsAlignment) * ldsAlignment
-        scaleBLdsRaw = MT0B * bTileInfo.scaleDepthU * bTileInfo.scaleBpe if bTileInfo.mxBlock > 0 else 0
-        scaleBLdsSize = math.ceil(scaleBLdsRaw / ldsAlignment) * ldsAlignment if scaleBLdsRaw > 0 else 0
-        scaleSize = scaleALdsSize + scaleBLdsSize
+      if kernel["ProblemType"].get("MXBlockA", 0) > 0 and kernel["ProblemType"].get("MXBlockB", 0) > 0:
+        mxsaTileInfo = self.states.mxsa.tileInfo
+        mxsbTileInfo = self.states.mxsb.tileInfo
 
-      self.ldsTotalSize = sizeA + sizeB + scaleSize
+        # For Swizzled scale we use extra LDS space for now to allow wider DTL loads
+        numWaves = kernel["MIWaveGroup"][0] * kernel["MIWaveGroup"][1]
+        sizeMXSA = mxsaTileInfo.loadWidthGR * kernel["WavefrontSize"] * numWaves
+        sizeMXSB = mxsbTileInfo.loadWidthGR * kernel["WavefrontSize"] * numWaves
+        self.ldsStartOffsetMXSA = sizeA + sizeB
+        self.ldsStartOffsetMXSB = sizeA + sizeB + sizeMXSA
 
-      kernel["LdsNumBytes"] = max(1, int((sizeA + sizeB + scaleSize) * kernel["NumLdsBlk"]))
+      self.ldsTotalSize = sizeA + sizeB + sizeMXSA + sizeMXSB
+
+      kernel["LdsNumBytes"] = max(1, int(self.ldsTotalSize * kernel["NumLdsBlk"]))
 
 
     #print(self.states.a.tileInfo.getLocalSubtileId(1,0))
@@ -7042,6 +7045,12 @@ class KernelWriter(metaclass=abc.ABCMeta):
       self.defineSgpr("LocalWriteBaseAddrB", 1)
       self.defineSgpr("LocalWriteSwapA", 1)
       self.defineSgpr("LocalWriteSwapB", 1)
+      if kernel["ProblemType"]["MXBlockA"]:
+        self.defineSgpr("LocalWriteBaseAddrMXSA", 1)
+        self.defineSgpr("LocalWriteSwapMXSA", 1)
+      if kernel["ProblemType"]["MXBlockB"]:
+        self.defineSgpr("LocalWriteBaseAddrMXSB", 1)
+        self.defineSgpr("LocalWriteSwapMXSB", 1)
 
     # Allocate registers to swap between lds buffers
     if self.states.useCommonSgprSwap:

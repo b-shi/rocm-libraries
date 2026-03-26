@@ -1008,10 +1008,6 @@ def _graTileAssignmentScaleSwizzledCommon(tc, writer, kernel):
                             comment="Scale by load width for each thread in group"))
   module.add(VAddU32(dst=vgpr(tileInfo.sharedVgprGROffset[0]), src0=vgpr(tileInfo.sharedVgprGROffset[0]), src1=vgpr(vtmp), comment="Final offset calc"))
 
-  #module.add(VAndB32(dst=vgpr(vtmp1),
-  #                   src0=loadWidthShift - 1, src1=vgpr("Serial"),
-  #                   comment="%s: grOffset = serial * %d" % (tc, loadWidth)))
-
   writer.vgprPool.checkIn(vtmp)
   writer.sgprPool.checkIn(stmp)
 
@@ -1429,6 +1425,44 @@ def globalReadDTLInitCommonSgpr(writer, kernel):
 
 
   return module
+
+##################################################
+# Subroutine to generate DTL M0 LDS buffer swap
+#
+# For Swizzled Scales each wave will collectively stream
+# the scale values
+# 
+def globalReadScaleSwizzledDTLInitCommonSgpr(writer, kernel):
+  module = Module()
+
+  loadWidth = 16 # dwordx4 loads only
+  wavesize = kernel["WavefrontSize"]
+  vgprWaveId = writer.vgprPool.checkOut(1)
+  module.addComment0("Compute shared offsets used by m0 in DTL loads")
+  module.add(VLShiftRightB32(dst=vgpr(vgprWaveId), shiftHex=hex(wavesize.bit_length()-1), src=vgpr("Serial"), comment="Wave Id"))
+
+  mxsatile = writer.states.mxsa.tileInfo
+  mxsbtile = writer.states.mxsb.tileInfo
+
+  bytesPerLoad = loadWidth * wavesize
+  module.add(VLShiftLeftB32(dst=vgpr(vgprWaveId), shiftHex=hex((bytesPerLoad).bit_length()-1), src=vgpr(vgprWaveId), comment="Apply wave-specific common offset (%u) for A/B"%bytesPerLoad))
+
+  module.add(SNop(waitState=0, comment="Wait for VGPR to be ready"))
+  module.add(VReadfirstlaneB32(dst=sgpr("LocalWriteBaseAddrMXSA"), src=vgpr(vgprWaveId), comment="Store base LDS offset, will be modified"))
+  module.add(VReadfirstlaneB32(dst=sgpr("LocalWriteBaseAddrMXSB"), src=vgpr(vgprWaveId), comment="Store base LDS offset, will be modified"))
+  module.add(SAddU32(dst=sgpr("LocalWriteBaseAddrMXSA"), src0=sgpr("LocalWriteBaseAddrMXSA"), src1=hex(writer.ldsStartOffsetMXSA), comment=""))
+  module.add(SAddU32(dst=sgpr("LocalWriteBaseAddrMXSB"), src0=sgpr("LocalWriteBaseAddrMXSB"), src1=hex(writer.ldsStartOffsetMXSB), comment=""))
+
+  module.add(SAddU32(dst=sgpr("LocalWriteSwapMXSA"), src0=sgpr("LocalWriteBaseAddrMXSA"), src1=writer.ldsTotalSize, comment=""))
+  module.add(SXorB32(dst=sgpr("LocalWriteSwapMXSA"), src0=sgpr("LocalWriteBaseAddrMXSA"), src1=sgpr("LocalWriteSwapMXSA"), comment=""))
+  module.add(SAddU32(dst=sgpr("LocalWriteSwapMXSB"), src0=sgpr("LocalWriteBaseAddrMXSB"), src1=writer.ldsTotalSize, comment=""))
+  module.add(SXorB32(dst=sgpr("LocalWriteSwapMXSB"), src0=sgpr("LocalWriteBaseAddrMXSB"), src1=sgpr("LocalWriteSwapMXSB"), comment=""))
+
+  writer.vgprPool.checkIn(vgprWaveId)
+  return module
+
+
+
 
 def localReadDTLInitCommonSwapVgpr(writer, kernel):
   module = Module()
