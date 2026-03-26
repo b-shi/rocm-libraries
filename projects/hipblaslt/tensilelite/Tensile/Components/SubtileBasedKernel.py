@@ -522,14 +522,13 @@ class TileInfo:
     self.scaleVgprTiles = []
 
   def deallocVgprTileRegisters(self, writer, kernel):
-    # checkin GR registers
-    for vtiles in self.vgprTiles:
+    numMMATilesPerReg = max(1, int(1 // self.mmaTileRegCount))
+    for i, vtiles in enumerate(self.vgprTiles):
+      if i % numMMATilesPerReg != 0:
+        continue
       pool = vtiles.regList.regPool
-      for vval in vtiles:
-        # TODOBS: kinda hacky but checks in every 4 vgprs
-        # to avoid double checking in vgprs
-        if vtiles.index(vval) % 4 == 0:
-          pool.checkIn(vval)
+      if vtiles.regList.regValues:
+        pool.checkIn(vtiles.regList.regValues[0])
 
 def _computeLROffset(module, kernel, tileInfo, colOffset, rowOffset):
   tc = tileInfo.tc

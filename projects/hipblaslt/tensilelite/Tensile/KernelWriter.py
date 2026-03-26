@@ -4972,8 +4972,6 @@ class KernelWriter(metaclass=abc.ABCMeta):
       sizeA = ((numASubtiles * aTileInfo.subtileSize + readSize-1) // readSize) * readSize
       sizeB = ((numBSubtiles * bTileInfo.subtileSize + readSize-1) // readSize) * readSize
       self.ldsStartOffsetB = sizeA
-      self.ldsTotalSize = sizeA + sizeB
-
       # Add scale LDS regions when MX scaling is enabled
       scaleSize = 0
       wavesize = kernel["WavefrontSize"]
@@ -4987,6 +4985,8 @@ class KernelWriter(metaclass=abc.ABCMeta):
         scaleBLdsRaw = MT0B * bTileInfo.scaleDepthU * bTileInfo.scaleBpe if bTileInfo.mxBlock > 0 else 0
         scaleBLdsSize = math.ceil(scaleBLdsRaw / ldsAlignment) * ldsAlignment if scaleBLdsRaw > 0 else 0
         scaleSize = scaleALdsSize + scaleBLdsSize
+
+      self.ldsTotalSize = sizeA + sizeB + scaleSize
 
       kernel["LdsNumBytes"] = max(1, int((sizeA + sizeB + scaleSize) * kernel["NumLdsBlk"]))
 
