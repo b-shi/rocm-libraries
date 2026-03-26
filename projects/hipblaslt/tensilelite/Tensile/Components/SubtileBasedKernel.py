@@ -1793,7 +1793,7 @@ def mainLoop(writer, kernel):
     loopBegin = Label("LoopBeginL", "")
     module.addComment0("MAINLOOP")
     module.add(loopBegin)
-    module.add(scheduler._emitLoop(writer, kernel, "MAINLOOP", scheduler.mainloopSteps, pendingLRWait=True))
+    module.add(scheduler._emitLoop(writer, kernel, "MAINLOOP", scheduler.mainloopSteps))
     module.add(SSubU32(dst=sgpr("LoopCounterL"), src0=sgpr("LoopCounterL"), src1=1,
                        comment="dec counterL"))
     module.add(SCmpEQU32(src0=sgpr("LoopCounterL"), src1=2,
@@ -1805,12 +1805,12 @@ def mainLoop(writer, kernel):
     module.add(skipMainloop)
     module.addComment0("NGLL")
     module.add(Label("SkipToNGLL", ""))
-    module.add(scheduler._emitLoop(writer, kernel, "NGLL", scheduler.ngllSteps, pendingLRWait=True))
+    module.add(scheduler._emitLoop(writer, kernel, "NGLL", scheduler.ngllSteps))
 
     # NLL
     module.addComment0("NLL")
     module.add(Label("SkipToNLL", ""))
-    module.add(scheduler._emitLoop(writer, kernel, "NLL", scheduler.nllSteps, pendingLRWait=True))
+    module.add(scheduler._emitLoop(writer, kernel, "NLL", scheduler.nllSteps))
 
     scheduler.deallocVgprTiles(writer)
 
