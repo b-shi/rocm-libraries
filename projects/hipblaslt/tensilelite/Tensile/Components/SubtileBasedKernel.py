@@ -1583,8 +1583,7 @@ def emitMfmaCode(writer, kernel):
   btileInfo = writer.states.b.tileInfo
   dtileInfo = writer.states.d.tileInfo
 
-  mxsatileInfo = writer.states.mxsa.tileInfo
-  mxsbtileInfo = writer.states.mxsb.tileInfo
+
 
   # Use loaded scale VGPRs when allocated; matches localReadDoScaleSubtile guard
   hasScaleA = atileInfo.mxBlock > 0 and len(atileInfo.scaleVgprTiles) > 0
@@ -1598,17 +1597,24 @@ def emitMfmaCode(writer, kernel):
         dtiles = dtileInfo.vgprTiles[mma0 + mma1 * dtileInfo.localMMATileGrid[0]]
 
 
+        if hasScaleA:
+          mxsatileInfo = writer.states.mxsa.tileInfo
+          mxsbtileInfo = writer.states.mxsb.tileInfo
+          mxsaId0, mxsaId1 = mxsatileInfo.getLocalSubtileIdFromMMATile(mma0, mmak)
+          mxsbId0, mxsbId1 = mxsbtileInfo.getLocalSubtileIdFromMMATile(mma1, mmak)
+          mxsaLinearId = mxsatileInfo.getLocalSubtileLinearId(mxsaId0, mxsaId1)
+          mxsbLinearId = mxsbtileInfo.getLocalSubtileLinearId(mxsbId0, mxsbId1)
 
-        mxsaId0, mxsaId1 = mxsatileInfo.getLocalSubtileIdFromMMATile(mma0, mmak)
-        mxsbId0, mxsbId1 = mxsbtileInfo.getLocalSubtileIdFromMMATile(mma1, mmak)
-        mxsaLinearId = mxsatileInfo.getLocalSubtileLinearId(mxsaId0, mxsaId1)
-        mxsbLinearId = mxsbtileInfo.getLocalSubtileLinearId(mxsbId0, mxsbId1)
+          scaleAVgpr = mxsatileInfo.vgprTiles[4 * mxsaLinearId].regList.regValues[0] if mxsatileInfo.mxBlock else -1
+          scaleBVgpr = mxsbtileInfo.vgprTiles[4 * mxsbLinearId].regList.regValues[0] if mxsbtileInfo.mxBlock else -1
 
-        scaleAVgpr = mxsatileInfo.vgprTiles[4 * mxsaLinearId].regList.regValues[0] if mxsatileInfo.mxBlock else -1
-        scaleBVgpr = mxsbtileInfo.vgprTiles[4 * mxsbLinearId].regList.regValues[0] if mxsbtileInfo.mxBlock else -1
-
-        sAsel = mma0 + 2 * mmak
-        sBsel = mma1 + 2 * mmak
+          sAsel = mma0 + 2 * mmak
+          sBsel = mma1 + 2 * mmak
+        else:
+          scaleAVgpr = -1
+          scaleBVgpr = -1
+          sAsel = -1
+          sBsel = -1
 
         module.add(emitMfmaInstruction(writer, kernel, atiles, btiles, dtiles, dtiles,
                                        scaleAVgpr=scaleAVgpr, scaleBVgpr=scaleBVgpr, scaleAsel=sAsel, scaleBsel=sBsel,
@@ -1632,45 +1638,44 @@ def mainLoopImplPGR0(writer, kernel):
   loopBegin = Label("LoopBeginL", "")
   module.add(loopBegin)
 
-  if pgr == 2:
-    # PGR=2 pipeline: MFMA uses vgprs from *previous* LR (preloop's LR on first iter)
-    # 1. MFMA (consume previous LR data)
-    module.add(emitMfmaCode(writer, kernel))
+  hasScales = kernel["ProblemType"]["MXBlockA"] and kernel["ProblemType"]["MXBlockB"]
 
-    # 2. Issue next GR into current GR buffer
-    module.add(globalReadDoSubtile('A', writer, kernel))
-    module.add(globalReadDoSubtile('B', writer, kernel))
-    # Scale GR: load scale data from global to LDS (non-DTL)
+  module.add(globalReadDoSubtile('A', writer, kernel))
+  module.add(globalReadDoSubtile('B', writer, kernel))
+  # Scale GR: load scale data from global to LDS (non-DTL)
+  if hasScales:
     module.add(globalReadDoScaleSubtile('MXSA', writer, kernel))
     module.add(globalReadDoScaleSubtile('MXSB', writer, kernel))
-    module.add(SWaitCnt(dscnt=-1, vlcnt=0, vscnt=-1, comment="Wait for all subtile GRs to complete"))
-    module.add(SBarrier(comment=""))
+  module.add(SWaitCnt(dscnt=-1, vlcnt=0, vscnt=-1, comment="Wait for all subtile GRs to complete"))
+  module.add(SBarrier(comment=""))
 
   module.add(localReadDoSubtile('A', writer, kernel))
   module.add(localReadDoSubtile('B', writer, kernel))
   # Scale LR: load scale data from LDS to VGPRs
-  module.add(localReadDoScaleSubtile('MXSA', writer, kernel))
-  module.add(localReadDoScaleSubtile('MXSB', writer, kernel))
+  if hasScales:
+    module.add(localReadDoScaleSubtile('MXSA', writer, kernel))
+    module.add(localReadDoScaleSubtile('MXSB', writer, kernel))
   module.add(SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for all subtile LRs to complete"))
 
   module.add(emitMfmaCode(writer, kernel))
   module.add(globalReadLDSBufferSwap('A', writer, kernel))
   module.add(globalReadLDSBufferSwap('B', writer, kernel))
-
-  module.add(globalReadLDSBufferSwap('MXSA', writer, kernel))
-  module.add(globalReadLDSBufferSwap('MXSB', writer, kernel))
+  if hasScales:
+    module.add(globalReadLDSBufferSwap('MXSA', writer, kernel))
+    module.add(globalReadLDSBufferSwap('MXSB', writer, kernel))
 
   module.add(localReadLDSBufferSwap('A', writer, kernel))
   module.add(localReadLDSBufferSwap('B', writer, kernel))
-
-  module.add(localReadLDSBufferSwap('MXSA', writer, kernel))
-  module.add(localReadLDSBufferSwap('MXSB', writer, kernel))
+  if hasScales:
+    module.add(localReadLDSBufferSwap('MXSA', writer, kernel))
+    module.add(localReadLDSBufferSwap('MXSB', writer, kernel))
 
   module.add(globalReadPtrUpdates('A', writer, kernel))
   module.add(globalReadPtrUpdates('B', writer, kernel))
   # Scale SRD pointer updates
-  module.add(globalReadScalePtrUpdates('MXSA', writer, kernel))
-  module.add(globalReadScalePtrUpdates('MXSB', writer, kernel))
+  if hasScales:
+    module.add(globalReadScalePtrUpdates('MXSA', writer, kernel))
+    module.add(globalReadScalePtrUpdates('MXSB', writer, kernel))
 
   # Decrement and loop back if counter > 0
   module.add(SSubU32(dst=sgpr("LoopCounterL"), src0=sgpr("LoopCounterL"), src1=1,
@@ -1682,52 +1687,6 @@ def mainLoopImplPGR0(writer, kernel):
 
   return module
 
-
-##################################################
-# NGLL: No Global Load Loop
-#
-# Same as mainloop but without global reads.
-# Drains the last set of global reads that are
-# already in flight (local writes + local reads + MFMAs).
-#
-def noGlobalLoadLoop(writer, kernel):
-  module = Module()
-  module.addComment0("--------------------------------")
-  module.addComment0("-----  NGLL             --------")
-  module.addComment0("--------------------------------")
-
-  # MFMA: consume vgprs from the last LR (mainloop's last iteration or preloop)
-  module.add(emitMfmaCode(writer, kernel))
-
-  # Wait for last inflight GR to land in LDS
-  module.add(SWaitCnt(dscnt=-1, vlcnt=0, vscnt=-1, comment="Wait for last GRs to land in LDS"))
-  module.add(SBarrier(comment=""))
-
-  # LR from the buffer containing the last GR data
-  module.add(localReadDoSubtile('A', writer, kernel))
-  module.add(localReadDoSubtile('B', writer, kernel))
-  module.add(SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for all subtile LRs to complete"))
-
-  return module
-
-
-##################################################
-# NLL: No Load Loop
-#
-# No global reads, no local writes.
-# Only local reads + MFMAs to drain the last
-# data already in LDS.
-#
-def noLoadLoop(writer, kernel):
-  module = Module()
-  module.addComment0("--------------------------------")
-  module.addComment0("-----  NLL              --------")
-  module.addComment0("--------------------------------")
-
-  # MFMA: consume vgprs from NGLL's LR (or preloop's LR for LoopCounter==1)
-  module.add(emitMfmaCode(writer, kernel))
-
-  return module
 
 
 ##################################################

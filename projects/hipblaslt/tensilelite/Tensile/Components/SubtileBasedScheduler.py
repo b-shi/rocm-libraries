@@ -1,6 +1,7 @@
 import dataclasses
 from enum import Enum, auto
 from dataclasses import dataclass, field
+import math
 from typing import List, Tuple, Dict, Set, Optional, Union
 from Tensile.Components.SubtileBasedKernel import TileInfo
 from Tensile.Components.SubtileBasedKernel import emitMfmaInstruction
@@ -11,6 +12,7 @@ from rocisa.code import Module, Label
 from rocisa.instruction import SWaitCnt, SBarrier, SCmpEQU32, SCmpLeU32, SCBranchSCC1, MFMAInstruction, \
     GlobalReadInstruction, LocalReadInstruction
 from rocisa.container import sgpr
+
 
 class PrefetchMode(Enum):
     NO = auto()
@@ -972,7 +974,7 @@ class SubtileBasedScheduler:
         """Allocate a shared VGPR tile array for A and B, indexed by the scheduler's vgprTileId."""
         
         self.vgprTiles = []
-        mmaTileRegCount = self.tileInfoA.mmaTileRegCount
+        mmaTileRegCount = int(math.ceil(self.tileInfoA.mmaTileRegCount))
         for _ in range(self.totalVGPRTiles):
             tile = TileInfo.RegisterTileInfo(writer.vgprPool)
             for j in range(0, mmaTileRegCount, 4):
@@ -999,7 +1001,9 @@ class SubtileBasedScheduler:
             dTile = dtileInfo.vgprTiles[a + b * dtileInfo.localMMATileGrid[0]]
             module.add(emitMfmaInstruction(
                 writer, kernel, aTile, bTile, dTile, dTile,
-                f"MFMA C[{a},{b}] += A[{a},subIterK{op.subIterK}] * B[{b},subIterK{op.subIterK}]"))
+                comment=f"MFMA C[{a},{b}] += A[{a},subIterK{op.subIterK}] * B[{b},subIterK{op.subIterK}]"))
+
+                
         return module
 
     def emitLR(self, writer, kernel, op):

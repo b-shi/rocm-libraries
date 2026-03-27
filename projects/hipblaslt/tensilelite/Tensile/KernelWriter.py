@@ -3850,8 +3850,9 @@ class KernelWriter(metaclass=abc.ABCMeta):
 
     module.add(localReadDTLInitCommonSwapVgpr(self, kernel))
 
-    module.add(graTileAssignmentScaleSwizzled(self, kernel))
-    module.add(lraTileAssignmentScaleSwizzled(self, kernel))
+    if kernel["ProblemType"].get("MXBlockA", 0) > 0 and kernel["ProblemType"].get("MXBlockB", 0) > 0:
+      module.add(graTileAssignmentScaleSwizzled(self, kernel))
+      module.add(lraTileAssignmentScaleSwizzled(self, kernel))
 
 
     module.add(self.calculateLoopNumIter(kernel, tensorParametersA, tensorParametersB, self.states.unrollIdx))
@@ -3861,7 +3862,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
     if pgr != 2:
       # PGR=2: A/B vgprTiles are allocated by SubtileBasedScheduler in mainLoop
       # TMP HACK to still use legacy path for PGR=0
-      for tileInfo in [atileInfo, btileInfo, dtileInfo]:
+      for tileInfo in [atileInfo, btileInfo]:
         tileInfo.allocVgprTileRegisters(self, kernel)
 
     for tileInfo in [dtileInfo]:
@@ -3874,8 +3875,13 @@ class KernelWriter(metaclass=abc.ABCMeta):
 
     if pgr != 2:
       self.states.scheduleInfo = ScheduleInfo(atileInfo, btileInfo)
+      for tileInfo in [atileInfo, btileInfo]:
+        if tileInfo:
+          for vtiles in tileInfo.vgprTiles:
+            regStr = "Vgpr" if vtiles.regList.regPool == self.vgprPool else "Agpr" # shouldn't this only be vgpr pool?
+            module.addComment("%ss used for %s mma tile %u: %s"%(regStr, tileInfo.tc, tileInfo.vgprTiles.index(vtiles), str(vtiles)))
 
-    for tileInfo in [atileInfo, btileInfo, mxsatileInfo, mxsbtileInfo, dtileInfo]:
+    for tileInfo in [mxsatileInfo, mxsbtileInfo, dtileInfo]:
       if tileInfo:
         for vtiles in tileInfo.vgprTiles:
           regStr = "Vgpr" if vtiles.regList.regPool == self.vgprPool else "Agpr" # shouldn't this only be vgpr pool?
@@ -3897,8 +3903,13 @@ class KernelWriter(metaclass=abc.ABCMeta):
       if tileInfo != None:
         tileInfo.deallocOffsetRegisters(self, kernel)
 
+    if pgr != 2:
+      for tileInfo in [atileInfo, btileInfo]:
+        if tileInfo:
+          tileInfo.deallocVgprTileRegisters(self, kernel)
+
     # Deallocate registers used for VGPR A/B/MXS tiles
-    for tileInfo in [atileInfo, btileInfo, mxsatileInfo, mxsbtileInfo]:
+    for tileInfo in [mxsatileInfo, mxsbtileInfo]:
       if tileInfo:
         tileInfo.deallocVgprTileRegisters(self, kernel)
 
@@ -4991,6 +5002,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
       sizeA = ((numASubtiles * aTileInfo.subtileSize + readSize-1) // readSize) * readSize
       sizeB = ((numBSubtiles * bTileInfo.subtileSize + readSize-1) // readSize) * readSize
       self.ldsStartOffsetB = sizeA
+      sizeMXSA = sizeMXSB = 0
       if kernel["ProblemType"].get("MXBlockA", 0) > 0 and kernel["ProblemType"].get("MXBlockB", 0) > 0:
         mxsaTileInfo = self.states.mxsa.tileInfo
         mxsbTileInfo = self.states.mxsb.tileInfo
