@@ -1139,24 +1139,23 @@ def lraTileAssignmentScaleSwizzled(writer, kernel):
 # global read offset (from SRD) and the LDS write offset (from M0).
 def globalReadDoScaleSubtile(tc, writer, kernel):
   module = Module()
-  dataTileInfo = writer.states.a.tileInfo if tc == 'A' else writer.states.b.tileInfo
-  scaleTileInfo = _getScaleTileInfo(tc, writer, kernel)
+  tileInfo = writer.states.mxsa.tileInfo if tc == 'MXSA' else writer.states.mxsb.tileInfo
 
-  if not scaleTileInfo or dataTileInfo.mxBlock == 0:
+  if tileInfo.mxBlock == 0:
     return module
 
-  assert len(scaleTileInfo.sharedVgprGROffset) > 0, "Scale GR requires at least 1 GR offset VGPR"
+  assert len(tileInfo.sharedVgprGROffset) > 0, "Scale GR requires at least 1 GR offset VGPR"
 
   module.addComment0("Scale GR: %s (DTL: BufferLoadB128 -> LDS)" % tc)
 
   # Set M0 to scale LDS base address for DTL write destination
-  module.add(SMovB32(dst=mgpr(0), src=hex(dataTileInfo.scaleLdsBase),
+  module.add(SMovB32(dst=mgpr(0), src=sgpr("LocalWriteBaseAddr%s"%tc),
                      comment="scale%s: M0 = scaleLdsBase" % tc))
 
   # DTL load: data goes directly from global memory to LDS (no intermediate VGPR)
   mubuf = MUBUFModifiers(offen=True, offset12=0, glc=False, slc=False, nt=False, lds=True)
-  module.add(BufferLoadB128(dst=None, vaddr=vgpr(scaleTileInfo.sharedVgprGROffset[0]),
-                            saddr=sgpr("SrdMXS%s" % tc, 4), soffset=0, mubuf=mubuf,
+  module.add(BufferLoadB128(dst=None, vaddr=vgpr(tileInfo.sharedVgprGROffset[0]),
+                            saddr=sgpr("Srd%s" % tc, 4), soffset=0, mubuf=mubuf,
                             comment="scale%s: DTL b128 load" % tc))
 
   return module
@@ -1186,8 +1185,8 @@ def emitSubtileScaleDsRead(tc, writer, kernel, subtileId):
                        src=vgpr(tileInfo.sharedVgprLROffset[0]),
                        ds=DSModifiers(offset=dsOffset),
                        comment="scale%s[%u]: load 4B from LDS" % (tc, subtileId)))
-  module.add(SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="[DEBUG] Wait for all subtile LRs to complete"))
-  module.add(VMovB32(dst=vgpr(vdst), src="0x80808080", comment="[DEBUG]"))
+  #module.add(SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="[DEBUG] Wait for all subtile LRs to complete"))
+  #module.add(VMovB32(dst=vgpr(vdst), src="0x80808080", comment="[DEBUG]"))
   return module
 
 def localReadDoScaleSubtile(tc, writer, kernel):
@@ -1616,8 +1615,8 @@ def mainLoopImpl(writer, kernel, isNLL = False):
     module.add(globalReadDoSubtile('A', writer, kernel))
     module.add(globalReadDoSubtile('B', writer, kernel))
     # Scale GR: load scale data from global to LDS (non-DTL)
-    #module.add(globalReadDoScaleSubtile('A', writer, kernel))
-    #module.add(globalReadDoScaleSubtile('B', writer, kernel))
+    module.add(globalReadDoScaleSubtile('MXSA', writer, kernel))
+    module.add(globalReadDoScaleSubtile('MXSB', writer, kernel))
     module.add(SWaitCnt(dscnt=-1, vlcnt=0, vscnt=-1, comment="Wait for all subtile GRs to complete"))
     module.add(SBarrier(comment=""))
 
