@@ -20,7 +20,7 @@ from collections import deque
 from rocisa import rocIsa, countInstruction, countGlobalRead, \
             countLocalRead, countLocalWrite, countDSStoreB256, getMFMAs
 from rocisa.code import Module, TextBlock, StructuredModule, KernelBody
-from rocisa.container import RegisterContainer, replaceHolder, HWRegContainer, VCC, vgpr, sgpr, DPPModifiers, DSModifiers, EXEC
+from rocisa.container import RegisterContainer, replaceHolder, HWRegContainer, VCC, vgpr, sgpr, DPPModifiers, DSModifiers, EXEC, VOP3PModifiers
 from rocisa.label import LabelManager
 from rocisa.asmpass import rocIsaPass, rocIsaPassOption
 from rocisa.instruction import BufferLoadB128, BufferLoadB32, BufferLoadB64, \
@@ -1547,17 +1547,19 @@ def emitMfmaInstruction(writer, kernel, vgprTileA, vgprTileB, vgprTileC, vgprTil
                                    b=bOperand, \
                                    acc2=cAccAlias(vgprCStart,opCSize), \
                                    mxsa=vgpr(scaleAVgpr), mxsb=vgpr(scaleBVgpr), \
+                                   vop3=VOP3PModifiers(op_sel=[0, 1]), \
                                    comment=comment))
     else:
       # Fallback: hardcoded scale 0x80 (scale=2.0 for all elements)
       tmpVgprScale = writer.vgprPool.checkOut(1)
-      module.add(VMovB32(dst=vgpr(tmpVgprScale), src=hex(0x80), comment="hardcoded scale 0x80"))
+      module.add(VMovB32(dst=vgpr(tmpVgprScale), src=hex(0x80808080), comment="hardcoded scale 0x80"))
       module.add(MXMFMAInstruction(instType=InstType.INST_F4, accType=InstType.INST_F32, variant=[16,16,miK,1], \
                                    acc=dAccAlias(vgprDStart,opDSize), \
                                    a=aOperand, \
                                    b=bOperand, \
                                    acc2=cAccAlias(vgprCStart,opCSize), \
                                    mxsa=vgpr(tmpVgprScale), mxsb=vgpr(tmpVgprScale), \
+                                   vop3=VOP3PModifiers(op_sel=[0, 1], op_sel_hi=[1, 1]), \
                                    comment=comment))
       writer.vgprPool.checkIn(tmpVgprScale)
   else:
