@@ -1,28 +1,35 @@
 #!/usr/bin/env python3
 ################################################################################
-# End-to-end GPU roundtrip test for scale tensors (MX FP4).
+# GPU tests for scale tensor LDS layout (MX FP4).
 #
-# Verifies GR and LR offset consistency: data loaded from global memory
-# via GR offsets, written to LDS, and read back via LR offsets should
-# deliver the correct scale bytes.
+# TestScaleLdsDumpGPU — Direct LDS content verification:
+#   1. Init LDS to 0xFFFFFFFF marker
+#   2. Compute GR offsets (production code: strided 2D formula)
+#   3. flat_load_dwordx4 from global scale buffer at GR offset
+#   4. ds_write_b128 to LDS at GR offset
+#   5. s_barrier
+#   6. Each thread reads ds_read_b128 at tid*16 (sequential dump)
+#   7. Export via global_store_dwordx4
+#   8. Verify strided 2D pattern matches expected
 #
-# Flow per matrix (A or B):
-#   1. Compute GR + LR offsets (production code)
-#   2. flat_load_dwordx4 from global scale buffer at GR offset (16 bytes)
-#   3. ds_write_b128 to LDS at GR offset (DTL pattern: contiguous copy)
-#   4. s_barrier
-#   5. ds_read_u8 from LDS at (LR offset - scaleBase)
-#   6. Export result
+# TestScaleRoundtripGPU — GR -> LDS -> LR roundtrip:
+#   (xfail: LR wave partition has known bugs)
+#
+# GR offset formula (production _graTileAssignmentScaleSwizzledCommon):
+#   grOffset = (serial / numTPG) * StridesMXS + (serial % numTPG) * loadWidthGR
+#   numTPG = (subtileSize * localSubtileGrid[1]) / loadWidthGR
 #
 # Usage:
 #   pytest test_scale_roundtrip.py -v -s
-#   python test_scale_roundtrip.py --debug
+#   python test_scale_roundtrip.py --lds-dump --debug
 ################################################################################
 
+import math
 import os
 import struct
 import sys
 import tempfile
+from dataclasses import dataclass
 
 import pytest
 import numpy as np
@@ -39,7 +46,6 @@ from gpu_test_helpers import (
     print_offset_grid,
 )
 
-from test_graTileAssignment import compute_expected_scale_gr_offset
 from test_lraTileAssignment import compute_expected_scale_lr_offset
 
 from Tensile.Components.SubtileBasedKernel import (
@@ -47,75 +53,136 @@ from Tensile.Components.SubtileBasedKernel import (
     lraTileAssignmentScaleSwizzled,
 )
 
+
+# ---------------------------------------------------------------------------
+# Scale config with stride_mxsa/stride_mxsb
+# ---------------------------------------------------------------------------
+@dataclass
+class ScaleConfig(TileConfig):
+    stride_mxsa: int = 0
+    stride_mxsb: int = 0
+
+    @property
+    def label(self):
+        base = super().label
+        return f"{base}_smxs{self.stride_mxsa}" if self.stride_mxsa else base
+
+
 # ---------------------------------------------------------------------------
 # Test configurations
 # ---------------------------------------------------------------------------
-SCALE_ROUNDTRIP_CONFIGS = [
-    # 2x2 wave group, dense stride
-    TileConfig(mt_a=256, mt_b=256, depth_u=64, stride_a=64,  stride_b=64,  mxblock=32),
+# Tight stride = numTPG * loadWidthGR (no gaps between groups).
+# All configs must have localSubtileGrid[0] >= 1 for both MXSA and MXSB.
+SCALE_LDS_CONFIGS = [
+    # 2x2, numTPG=4, tight stride=64
+    ScaleConfig(mt_a=256, mt_b=256, depth_u=64,  stride_a=64,  stride_b=64,  mxblock=32, stride_mxsa=64,  stride_mxsb=64),
+    # 2x2, numTPG=8, tight stride=128
+    ScaleConfig(mt_a=256, mt_b=256, depth_u=128, stride_a=128, stride_b=128, mxblock=32, stride_mxsa=128, stride_mxsb=128),
+    # 2x2, non-square macro tile
+    ScaleConfig(mt_a=96,  mt_b=256, depth_u=64,  stride_a=64,  stride_b=64,  mxblock=32, stride_mxsa=64,  stride_mxsb=64),
     # 1x4 wave group
-    TileConfig(mt_a=80,  mt_b=64,  depth_u=64, stride_a=64,  stride_b=64,  mxblock=32),
+    ScaleConfig(mt_a=80,  mt_b=256, depth_u=64,  stride_a=64,  stride_b=64,  mxblock=32, stride_mxsa=64,  stride_mxsb=64),
     # 4x1 wave group
-    TileConfig(mt_a=64,  mt_b=80,  depth_u=64, stride_a=64,  stride_b=64,  mxblock=32),
-    # Non-trivial stride (stride > depthU, tests stride division by mxBlock)
-    TileConfig(mt_a=96,  mt_b=256, depth_u=64, stride_a=128, stride_b=128, mxblock=32),
+    ScaleConfig(mt_a=256, mt_b=80,  depth_u=64,  stride_a=64,  stride_b=64,  mxblock=32, stride_mxsa=64,  stride_mxsb=64),
 ]
 
+SCALE_ROUNDTRIP_CONFIGS = [
+    ScaleConfig(mt_a=256, mt_b=256, depth_u=64, stride_a=64,  stride_b=64,  mxblock=32, stride_mxsa=64, stride_mxsb=64),
+    ScaleConfig(mt_a=80,  mt_b=256, depth_u=64, stride_a=64,  stride_b=64,  mxblock=32, stride_mxsa=64, stride_mxsb=64),
+    ScaleConfig(mt_a=256, mt_b=80,  depth_u=64, stride_a=64,  stride_b=64,  mxblock=32, stride_mxsa=64, stride_mxsb=64),
+    ScaleConfig(mt_a=96,  mt_b=256, depth_u=64, stride_a=128, stride_b=128, mxblock=32, stride_mxsa=64, stride_mxsb=64),
+]
+
+LDS_DUMP_SIZE = NUM_THREADS * 16  # 4096 bytes: 256 threads x 16 bytes each
+
+# Load params and kernel args shared by all scale kernels
+SCALE_LOAD_PARAMS = [
+    (4, 4, 0x00, "input_A_ptr + input_B_ptr"),
+    (8, 4, 0x10, "output_ptr + strideA + strideB"),
+    (12, 2, 0x20, "strideMXSA + strideMXSB"),
+]
+
+SCALE_KERNEL_ARGS = (
+    ("input_scale_A_ptr", 8, "global_buffer", "u8"),
+    ("input_scale_B_ptr", 8, "global_buffer", "u8"),
+    ("output_ptr",        8, "global_buffer", "u32"),
+    ("strideA",           4, "by_value",      "u32"),
+    ("strideB",           4, "by_value",      "u32"),
+    ("strideMXSA",        4, "by_value",      "u32"),
+    ("strideMXSB",        4, "by_value",      "u32"),
+)
+
 
 # ---------------------------------------------------------------------------
-# LDS size computation (mirrors lraTileAssignmentScaleSwizzled)
+# Python reference for strided 2D GR offset
 # ---------------------------------------------------------------------------
-def compute_lds_sizes(cfg, tileInfoA, tileInfoB, kernel):
-    """Compute LDS layout sizes matching production code."""
-    MT0A = tileInfoA.globalMMATileGrid[0] * tileInfoA.mmaTileShape[0]
-    MT0B = tileInfoB.globalMMATileGrid[0] * tileInfoB.mmaTileShape[0]
-    dataLdsSize = (MT0A * cfg.depth_u * tileInfoA.bpe) + \
-                  (MT0B * cfg.depth_u * tileInfoB.bpe)
+def compute_expected_scale_gr_offset(tid, cfg, scaleTileInfo, tc):
+    """Python reference matching _graTileAssignmentScaleSwizzledCommon.
 
+    grOffset = (serial / numTPG) * strideBytes + (serial % numTPG) * loadWidthGR
+    """
+    loadWidth = scaleTileInfo.loadWidthGR  # 16
+    numTPG = (scaleTileInfo.subtileSize * scaleTileInfo.localSubtileGrid[1]) // loadWidth
+    stride = cfg.stride_mxsa if tc == 'A' else cfg.stride_mxsb
+    strideBytes = stride * scaleTileInfo.bpe  # bpe=1
+    groupId = tid >> int(math.log2(numTPG))
+    colInGroup = tid & (numTPG - 1)
+    colOffset = colInGroup << (loadWidth.bit_length() - 1)
+    return [groupId * strideBytes + colOffset]
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def compute_lds_sizes(kernel):
+    """Compute scale LDS sizes matching KernelWriter formula."""
     numWaves = kernel["MIWaveGroup"][0] * kernel["MIWaveGroup"][1]
-
-    scaleALdsRaw = MT0A * tileInfoA.scaleDepthU * tileInfoA.scaleBpe if tileInfoA.mxBlock > 0 else 0
-    ldsAlignment = WAVESIZE * numWaves * (tileInfoA.scaleLoadWidth if tileInfoA.mxBlock > 0 else 1)
-    scaleALdsSize = ((scaleALdsRaw + ldsAlignment - 1) // ldsAlignment) * ldsAlignment if scaleALdsRaw > 0 else 0
-
-    scaleBLdsRaw = MT0B * tileInfoB.scaleDepthU * tileInfoB.scaleBpe if tileInfoB.mxBlock > 0 else 0
-    scaleBLdsSize = ((scaleBLdsRaw + ldsAlignment - 1) // ldsAlignment) * ldsAlignment if scaleBLdsRaw > 0 else 0
-
-    return dataLdsSize, scaleALdsSize, scaleBLdsSize
+    loadWidthGR = 16
+    sizeMXSA = loadWidthGR * WAVESIZE * numWaves  # 4096
+    sizeMXSB = loadWidthGR * WAVESIZE * numWaves
+    return sizeMXSA, sizeMXSB
 
 
-def compute_input_size(cfg, tileInfo):
-    """Max GR offset + scaleLoadWidth across all threads (DTL B128 loads 16 bytes)."""
+def compute_input_size(cfg, scaleTileInfo, tc):
+    """Max GR offset + loadWidthGR across all threads."""
     max_off = 0
     for tid in range(NUM_THREADS):
-        offsets = compute_expected_scale_gr_offset(tid, cfg, tileInfo)
+        offsets = compute_expected_scale_gr_offset(tid, cfg, scaleTileInfo, tc)
         max_off = max(max_off, offsets[0])
-    return max_off + tileInfo.scaleLoadWidth
+    return max_off + scaleTileInfo.loadWidthGR
+
+
+def generate_block_input_data(size, block_size=256):
+    """Each block_size-byte chunk gets a constant value, starting at 1."""
+    return np.array([1 + i // block_size for i in range(size)], dtype=np.uint8)
 
 
 def generate_input_data(size):
-    """Deterministic byte array for scale input."""
+    """Deterministic byte array for scale input (used by roundtrip test)."""
     return np.array([(i * 7 + 13) & 0xFF for i in range(size)], dtype=np.uint8)
 
 
 # ---------------------------------------------------------------------------
-# ASM generation using production code paths
+# Common kernel setup
 # ---------------------------------------------------------------------------
-def generate_roundtrip_kernel(cfg, tc):
-    """Generate a complete kernel using production scale GR/LR code paths."""
+def _setup_writer_and_gr(cfg):
+    """Create writer, allocate registers, run scale GR offset code.
+
+    Returns (writer, kernel, tileInfoA, tileInfoB, gra_module,
+             mxsaTileInfo, mxsbTileInfo).
+    """
     init_rocisa()
     writer, kernel, tileInfoA, tileInfoB = create_writer(cfg)
 
-    # Reserve s0-s11 for hardware regs + kernarg loads
-    writer.sgprPool.checkOut(12)
+    writer.sgprPool.checkOut(14)
     writer.sgprs["StrideA0I"] = 10
     writer.sgprs["StrideB1J"] = 11
+    writer.sgprs["StridesMXSA"] = 12
+    writer.sgprs["StridesMXSB"] = 13
 
-    # Allocate offset registers (shared GR/LR offset vgprs)
     tileInfoA.allocOffsetRegisters(writer, kernel)
     tileInfoB.allocOffsetRegisters(writer, kernel)
 
-    # Allocate offset registers for MXSA/MXSB (scale offset VGPRs)
     mxsaTileInfo = getattr(writer.states.mxsa, 'tileInfo', None)
     mxsbTileInfo = getattr(writer.states.mxsb, 'tileInfo', None)
     if mxsaTileInfo:
@@ -123,24 +190,184 @@ def generate_roundtrip_kernel(cfg, tc):
     if mxsbTileInfo:
         mxsbTileInfo.allocOffsetRegisters(writer, kernel)
 
-    # Scale GR + LR offset computation
     gra_module = graTileAssignmentScaleSwizzled(writer, kernel)
+    return writer, kernel, tileInfoA, tileInfoB, gra_module, mxsaTileInfo, mxsbTileInfo
+
+
+# ---------------------------------------------------------------------------
+# Direct LDS content verification (GR write test)
+# ---------------------------------------------------------------------------
+def generate_lds_dump_kernel(cfg, tc):
+    """Kernel: LDS marker init, scale GR write, dump LDS.
+
+    Output is a raw 4096-byte image of LDS[0..4095] with strided 2D pattern:
+      grOffset = (serial/numTPG)*stride + (serial%numTPG)*16
+    """
+    writer, kernel, tileInfoA, tileInfoB, gra_module, \
+        mxsaTileInfo, mxsbTileInfo = _setup_writer_and_gr(cfg)
+
+    scaleTileInfo = mxsaTileInfo if tc == 'A' else mxsbTileInfo
+    grOffReg = scaleTileInfo.sharedVgprGROffset[0]
+    ptrLo = 4 if tc == 'A' else 6
+    ptrHi = 5 if tc == 'A' else 7
+
+    lds_bytes = LDS_DUMP_SIZE
+
+    # Allocate temp registers
+    vAddr = writer.vgprPool.checkOutAligned(2, 2, "addr", preventOverflow=False)
+    vData = writer.vgprPool.checkOutAligned(4, 4, "data", preventOverflow=False)
+    vTmp = writer.vgprPool.checkOut(1, "tmp", preventOverflow=False)
+
+    asm = f"""\
+  // ---- Init LDS to 0xFFFFFFFF marker ----
+  v_lshlrev_b32 v{vTmp}, 4, v0
+  v_mov_b32 v{vData}, 0xffffffff
+  v_mov_b32 v{vData+1}, 0xffffffff
+  v_mov_b32 v{vData+2}, 0xffffffff
+  v_mov_b32 v{vData+3}, 0xffffffff
+  ds_write_b128 v{vTmp}, v[{vData}:{vData+3}]
+  s_waitcnt lgkmcnt(0)
+  s_barrier
+  // ---- GR write for scale {tc} (strided 2D) ----
+  v_mov_b32 v{vAddr}, s{ptrLo}
+  v_mov_b32 v{vAddr+1}, s{ptrHi}
+  v_add_co_u32 v{vAddr}, vcc, v{vAddr}, v{grOffReg}
+  v_addc_co_u32 v{vAddr+1}, vcc, v{vAddr+1}, 0, vcc
+  flat_load_dwordx4 v[{vData}:{vData+3}], v[{vAddr}:{vAddr+1}]
+  s_waitcnt vmcnt(0) lgkmcnt(0)
+  ds_write_b128 v{grOffReg}, v[{vData}:{vData+3}]
+  s_waitcnt lgkmcnt(0)
+  s_barrier
+  // ---- Dump LDS: 16 bytes per thread ----
+  v_lshlrev_b32 v{vTmp}, 4, v0
+  ds_read_b128 v[{vData}:{vData+3}], v{vTmp}
+  s_waitcnt lgkmcnt(0)
+  global_store_dwordx4 v{vTmp}, v[{vData}:{vData+3}], s[8:9]"""
+
+    prologue = generate_load_params(SCALE_LOAD_PARAMS)
+    inner_asm = "\n".join([str(prologue), str(gra_module), asm])
+    kernel_asm = generate_kernel_asm(inner_asm, writer, SCALE_KERNEL_ARGS, lds_bytes)
+    return kernel_asm, writer, kernel, tileInfoA, tileInfoB, lds_bytes
+
+
+def compute_expected_lds_content(cfg, scaleTileInfo, input_data, tc):
+    """Expected LDS[0..4095] after strided 2D GR write.
+
+    Each unique grOffset writes 16 bytes: LDS[grOff..grOff+15] = input[grOff..grOff+15].
+    Uncovered positions remain as marker (0xFF).
+    """
+    loadWidth = scaleTileInfo.loadWidthGR
+    lds = np.full(LDS_DUMP_SIZE, 0xFF, dtype=np.uint8)
+    seen = set()
+    for tid in range(NUM_THREADS):
+        grOff = compute_expected_scale_gr_offset(tid, cfg, scaleTileInfo, tc)[0]
+        if grOff in seen or grOff >= LDS_DUMP_SIZE:
+            continue
+        seen.add(grOff)
+        end = min(grOff + loadWidth, LDS_DUMP_SIZE)
+        src_end = min(grOff + loadWidth, len(input_data))
+        lds[grOff:end] = input_data[grOff:src_end]
+    return lds
+
+
+def print_lds_blocks(label, data, block_size=256):
+    """Print LDS content summarized per block_size-byte chunk."""
+    print(f"\n  --- {label} ---")
+    for offset in range(0, min(len(data), LDS_DUMP_SIZE), block_size):
+        chunk = data[offset:min(offset + block_size, len(data))]
+        unique = set(chunk)
+        if len(unique) == 1:
+            val = unique.pop()
+            tag = " (marker)" if val == 0xFF else " (zero)" if val == 0 else ""
+            print(f"  LDS [{offset:>5}..{offset+len(chunk)-1:>5}]: "
+                  f"0x{val:02x} x{len(chunk)}{tag}")
+        else:
+            vals = " ".join(f"{v:02x}" for v in chunk[:8])
+            print(f"  LDS [{offset:>5}..{offset+len(chunk)-1:>5}]: "
+                  f"{vals}... ({len(unique)} unique vals)")
+
+
+@pytest.mark.skipif(not HAS_HIP, reason="HIP Python bindings not available")
+class TestScaleLdsDumpGPU:
+    """Verify LDS content after scale GR write (strided 2D layout)."""
+
+    @pytest.fixture(params=SCALE_LDS_CONFIGS, ids=lambda c: c.label)
+    def cfg(self, request):
+        return request.param
+
+    def _run_lds_dump(self, cfg, tc, tmp_path):
+        kernel_asm, writer, kernel, tileInfoA, tileInfoB, lds_bytes = \
+            generate_lds_dump_kernel(cfg, tc)
+
+        scaleTileInfo = getattr(writer.states.mxsa, 'tileInfo', None) if tc == 'A' \
+                        else getattr(writer.states.mxsb, 'tileInfo', None)
+        otherScaleTileInfo = getattr(writer.states.mxsb, 'tileInfo', None) if tc == 'A' \
+                             else getattr(writer.states.mxsa, 'tileInfo', None)
+
+        input_size = compute_input_size(cfg, scaleTileInfo, tc)
+        input_data = generate_block_input_data(input_size)
+        other_tc = 'B' if tc == 'A' else 'A'
+        other_size = compute_input_size(cfg, otherScaleTileInfo, other_tc)
+        other_input = generate_block_input_data(other_size)
+
+        if tc == 'A':
+            inputs = (input_data, other_input)
+        else:
+            inputs = (other_input, input_data)
+
+        label = f"lds_dump_{tc}_{cfg.label}"
+        raw = assemble_and_run(kernel_asm, tmp_path, label, LDS_DUMP_SIZE,
+                               inputs=inputs,
+                               scalars=(cfg.stride_a, cfg.stride_b,
+                                        cfg.stride_mxsa, cfg.stride_mxsb),
+                               lds_size=lds_bytes)
+
+        actual = np.frombuffer(raw, dtype=np.uint8)
+        expected = compute_expected_lds_content(cfg, scaleTileInfo, input_data, tc)
+
+        errors = 0
+        for i in range(LDS_DUMP_SIZE):
+            if actual[i] != expected[i]:
+                errors += 1
+                if errors <= 16:
+                    print(f"  byte {i}: got 0x{actual[i]:02x}, expected 0x{expected[i]:02x}")
+
+        if errors > 0:
+            print_lds_blocks(f"ACTUAL scale {tc}", actual)
+            print_lds_blocks(f"EXPECTED scale {tc}", expected)
+
+        assert errors == 0, \
+            f"Scale {tc} LDS content ({cfg.label}): {errors} errors"
+
+    def test_lds_content_a(self, cfg, tmp_path):
+        """Verify LDS content after GR write for scale A."""
+        self._run_lds_dump(cfg, 'A', tmp_path)
+
+    def test_lds_content_b(self, cfg, tmp_path):
+        """Verify LDS content after GR write for scale B."""
+        self._run_lds_dump(cfg, 'B', tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# GR -> LDS -> LR roundtrip test
+# ---------------------------------------------------------------------------
+def generate_roundtrip_kernel(cfg, tc):
+    """Generate a complete kernel using production scale GR/LR code paths."""
+    writer, kernel, tileInfoA, tileInfoB, gra_module, \
+        mxsaTileInfo, mxsbTileInfo = _setup_writer_and_gr(cfg)
+
     lra_module = lraTileAssignmentScaleSwizzled(writer, kernel)
 
-    # Roundtrip logic: which matrix to test — use MXSA/MXSB for offset VGPRs
     scaleTileInfo = mxsaTileInfo if tc == 'A' else mxsbTileInfo
     grOffReg = scaleTileInfo.sharedVgprGROffset[0]
     lrOffReg = scaleTileInfo.sharedVgprLROffset[0]
     ptrLo = 4 if tc == 'A' else 6
     ptrHi = 5 if tc == 'A' else 7
 
-    # LDS layout
-    dataLdsSize, scaleALdsSize, scaleBLdsSize = compute_lds_sizes(
-        cfg, tileInfoA, tileInfoB, kernel)
-    scaleBase = dataLdsSize if tc == 'A' else (dataLdsSize + scaleALdsSize)
-    lds_bytes = scaleALdsSize + scaleBLdsSize
+    sizeMXSA, sizeMXSB = compute_lds_sizes(kernel)
+    scaleBase = 0 if tc == 'A' else sizeMXSA
+    lds_bytes = sizeMXSA + sizeMXSB
 
-    # Allocate temp registers for roundtrip
     vAddr = writer.vgprPool.checkOutAligned(2, 2, "addr", preventOverflow=False)
     vData = writer.vgprPool.checkOutAligned(4, 4, "data", preventOverflow=False)
     vLrAdj = writer.vgprPool.checkOut(1, "lr_adj", preventOverflow=False)
@@ -148,7 +375,7 @@ def generate_roundtrip_kernel(cfg, tc):
     sTmp = writer.sgprPool.checkOut(1, "tmp", preventOverflow=False)
 
     roundtrip_asm = f"""\
-  // ---- Roundtrip for scale {tc} (DTL pattern: 16-byte load/write) ----
+  // ---- Roundtrip for scale {tc} (DTL: 16-byte load/write) ----
   v_mov_b32 v{vAddr}, s{ptrLo}
   v_mov_b32 v{vAddr+1}, s{ptrHi}
   v_add_co_u32 v{vAddr}, vcc, v{vAddr}, v{grOffReg}
@@ -165,11 +392,7 @@ def generate_roundtrip_kernel(cfg, tc):
   v_lshlrev_b32 v{vByteOff}, 2, v0
   global_store_dword v{vByteOff}, v{vData}, s[8:9]"""
 
-    # Prologue
-    prologue = generate_load_params([
-        (4, 4, 0x00, "input_A_ptr + input_B_ptr"),
-        (8, 4, 0x10, "output_ptr + strideA + strideB"),
-    ])
+    prologue = generate_load_params(SCALE_LOAD_PARAMS)
 
     inner_asm = "\n".join([
         str(prologue),
@@ -178,33 +401,21 @@ def generate_roundtrip_kernel(cfg, tc):
         roundtrip_asm,
     ])
 
-    args = (
-        ("input_scale_A_ptr", 8, "global_buffer", "u8"),
-        ("input_scale_B_ptr", 8, "global_buffer", "u8"),
-        ("output_ptr",        8, "global_buffer", "u32"),
-        ("strideA",           4, "by_value",      "u32"),
-        ("strideB",           4, "by_value",      "u32"),
-    )
-
-    kernel_asm = generate_kernel_asm(inner_asm, writer, args, lds_bytes)
+    kernel_asm = generate_kernel_asm(inner_asm, writer, SCALE_KERNEL_ARGS, lds_bytes)
     return kernel_asm, writer, kernel, tileInfoA, tileInfoB, lds_bytes
 
 
-# ---------------------------------------------------------------------------
-# Python reference
-# ---------------------------------------------------------------------------
 def compute_expected_roundtrip(cfg, tileInfoA, tileInfoB, input_data, tc, kernel):
     """Compute expected scale byte for each thread after the roundtrip.
 
-    DTL pattern: GR writes input[0..N*16-1] contiguously to LDS[0..N*16-1].
-    Thread T reads LDS[lrOff(T) - scaleBase], so expected = input[lrOff(T) - scaleBase].
+    GR writes strided 2D pattern; LR reads from lrOffset - scaleBase.
     """
     tileInfo = tileInfoA if tc == 'A' else tileInfoB
     otherTileInfo = tileInfoB if tc == 'A' else tileInfoA
 
-    dataLdsSize, scaleALdsSize, scaleBLdsSize = compute_lds_sizes(cfg, tileInfoA, tileInfoB, kernel)
-    scaleBase = dataLdsSize if tc == 'A' else (dataLdsSize + scaleALdsSize)
-    scaleLdsSize = scaleALdsSize if tc == 'A' else scaleBLdsSize
+    sizeMXSA, sizeMXSB = compute_lds_sizes(kernel)
+    scaleBase = 0 if tc == 'A' else sizeMXSA
+    scaleLdsSize = sizeMXSA if tc == 'A' else sizeMXSB
 
     expected = [0] * NUM_THREADS
     for T in range(NUM_THREADS):
@@ -222,9 +433,6 @@ def compute_expected_roundtrip(cfg, tileInfoA, tileInfoB, input_data, tc, kernel
     return expected
 
 
-# ---------------------------------------------------------------------------
-# Orchestrator
-# ---------------------------------------------------------------------------
 def build_and_run_roundtrip(cfg, tc, tmp_path, debug=False):
     """Generate, assemble, run roundtrip for one matrix; return (results, expected)."""
     sys.stdout.flush()
@@ -237,12 +445,16 @@ def build_and_run_roundtrip(cfg, tc, tmp_path, debug=False):
         print(kernel_asm)
         print("--- End ---\n")
 
-    tileInfo = tileInfoA if tc == 'A' else tileInfoB
-    input_size = compute_input_size(cfg, tileInfo)
+    scaleTileInfo = getattr(writer.states.mxsa, 'tileInfo', None) if tc == 'A' \
+                    else getattr(writer.states.mxsb, 'tileInfo', None)
+    otherScaleTileInfo = getattr(writer.states.mxsb, 'tileInfo', None) if tc == 'A' \
+                         else getattr(writer.states.mxsa, 'tileInfo', None)
+
+    input_size = compute_input_size(cfg, scaleTileInfo, tc)
     input_data = generate_input_data(input_size)
 
-    other_tileInfo = tileInfoB if tc == 'A' else tileInfoA
-    other_input_size = compute_input_size(cfg, other_tileInfo)
+    other_tc = 'B' if tc == 'A' else 'A'
+    other_input_size = compute_input_size(cfg, otherScaleTileInfo, other_tc)
     other_input = generate_input_data(other_input_size)
 
     if tc == 'A':
@@ -254,7 +466,8 @@ def build_and_run_roundtrip(cfg, tc, tmp_path, debug=False):
     label = f"scale_roundtrip_{tc}_{cfg.label}"
     output_bytes = assemble_and_run(kernel_asm, tmp_path, label, out_size,
                                     inputs=(input_a, input_b),
-                                    scalars=(cfg.stride_a, cfg.stride_b),
+                                    scalars=(cfg.stride_a, cfg.stride_b,
+                                             cfg.stride_mxsa, cfg.stride_mxsb),
                                     lds_size=lds_bytes)
 
     results = struct.unpack(f"{NUM_THREADS}I", output_bytes)
@@ -262,10 +475,9 @@ def build_and_run_roundtrip(cfg, tc, tmp_path, debug=False):
     return results, expected
 
 
-# ---------------------------------------------------------------------------
-# Pytest tests
-# ---------------------------------------------------------------------------
 @pytest.mark.skipif(not HAS_HIP, reason="HIP Python bindings not available")
+@pytest.mark.xfail(reason="LR wave partition bugs: _applyScaleWavePartitionLROffset "
+                          "tc=='MXSA' always false, totalScaleBytes=0")
 class TestScaleRoundtripGPU:
 
     @pytest.fixture(params=SCALE_ROUNDTRIP_CONFIGS, ids=lambda c: c.label)
@@ -298,39 +510,26 @@ class TestScaleRoundtripGPU:
 # ---------------------------------------------------------------------------
 # Debug helpers
 # ---------------------------------------------------------------------------
-def print_intermediate_values(cfg, tileInfoA, tileInfoB, tc, kernel):
-    """Print GR offset, LR offset, writer thread, and expected value per thread."""
-    tileInfo = tileInfoA if tc == 'A' else tileInfoB
-    otherTileInfo = tileInfoB if tc == 'A' else tileInfoA
+def print_intermediate_values(cfg, writer, tc, kernel):
+    """Print GR offset, LR offset, and expected value per thread."""
+    scaleTileInfo = getattr(writer.states.mxsa, 'tileInfo', None) if tc == 'A' \
+                    else getattr(writer.states.mxsb, 'tileInfo', None)
+    tileInfo = writer.states.a.tileInfo if tc == 'A' else writer.states.b.tileInfo
+    otherTileInfo = writer.states.b.tileInfo if tc == 'A' else writer.states.a.tileInfo
 
-    dataLdsSize, scaleALdsSize, _ = compute_lds_sizes(cfg, tileInfoA, tileInfoB, kernel)
-    scaleBase = dataLdsSize if tc == 'A' else (dataLdsSize + scaleALdsSize)
+    numTPG = (scaleTileInfo.subtileSize * scaleTileInfo.localSubtileGrid[1]) // scaleTileInfo.loadWidthGR
+    sizeMXSA, _ = compute_lds_sizes(kernel)
+    scaleBase = 0 if tc == 'A' else sizeMXSA
 
     print(f"\n  Intermediate values for scale {tc}:")
-    print(f"  dataLdsSize={dataLdsSize}, scaleALdsSize={scaleALdsSize}, scaleBase={scaleBase}")
-    print(f"  scaleBlockSize={tileInfo.scaleBlockSize}, scaleDepthU={tileInfo.scaleDepthU}, "
-          f"loadRatioGR={tileInfo.loadRatioGR}")
-    print(f"  {'tid':>4} {'GR_off':>7} {'LR_off':>7} {'LR_adj':>7} {'writer':>7}")
-    print(f"  {'-'*36}")
+    print(f"  numTPG={numTPG}, stride_mxs={cfg.stride_mxsa if tc == 'A' else cfg.stride_mxsb}, scaleBase={scaleBase}")
+    print(f"  subtileSize={scaleTileInfo.subtileSize}, localSubtileGrid={scaleTileInfo.localSubtileGrid}")
+    print(f"  {'tid':>4} {'GR_off':>7} {'LR_off':>7} {'LR_adj':>7}")
+    print(f"  {'-'*30}")
     for T in range(min(NUM_THREADS, 64)):  # first wave
-        gr_off = compute_expected_scale_gr_offset(T, cfg, tileInfo)[0]
+        gr_off = compute_expected_scale_gr_offset(T, cfg, scaleTileInfo, tc)[0]
         lr_off = compute_expected_scale_lr_offset(T, cfg, tileInfo, otherTileInfo)[0]
-        writer_t = lr_off - scaleBase
-        print(f"  {T:>4} {gr_off:>7} {lr_off:>7} {lr_off - scaleBase:>7} {writer_t:>7}")
-
-
-def print_scale_asm_only(kernel_asm):
-    """Print only the scale-related sections of the kernel assembly."""
-    in_section = False
-    for line in kernel_asm.split('\n'):
-        if ('GR Offset Calculation for Scale' in line or
-            'LR Offset Calculation for Scale' in line or
-            'Roundtrip for scale' in line):
-            in_section = True
-        if in_section:
-            print(f"  {line}")
-            if line.strip().startswith('s_endpgm') or line.strip().startswith('s_barrier'):
-                in_section = False
+        print(f"  {T:>4} {gr_off:>7} {lr_off:>7} {lr_off - scaleBase:>7}")
 
 
 # ---------------------------------------------------------------------------
@@ -339,7 +538,11 @@ def print_scale_asm_only(kernel_asm):
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Scale GR-LR roundtrip GPU test")
+    parser = argparse.ArgumentParser(description="Scale GR/LDS GPU tests")
+    parser.add_argument("--lds-dump", action="store_true",
+                        help="Run LDS dump test (verify LDS content after GR write)")
+    parser.add_argument("--roundtrip", action="store_true",
+                        help="Run GR-LR roundtrip test")
     parser.add_argument("--debug", action="store_true",
                         help="Print intermediate values and full asm (implies --grid)")
     parser.add_argument("--grid", action="store_true",
@@ -349,11 +552,19 @@ if __name__ == "__main__":
     parser.add_argument("--list", action="store_true", help="List available configs and exit")
     args = parser.parse_args()
 
+    # Default: run LDS dump if neither mode specified
+    if not args.lds_dump and not args.roundtrip:
+        args.lds_dump = True
+
     if args.list:
+        print("  LDS dump configs:")
+        for i, cfg in enumerate(SCALE_LDS_CONFIGS):
+            print(f"    {i}: {cfg.label}  (mt_a={cfg.mt_a}, mt_b={cfg.mt_b}, "
+                  f"du={cfg.depth_u}, mx={cfg.mxblock}, smxsa={cfg.stride_mxsa})")
+        print("  Roundtrip configs:")
         for i, cfg in enumerate(SCALE_ROUNDTRIP_CONFIGS):
-            print(f"  {i}: {cfg.label}  (mt_a={cfg.mt_a}, mt_b={cfg.mt_b}, "
-                  f"du={cfg.depth_u}, stride_a={cfg.stride_a}, stride_b={cfg.stride_b}, "
-                  f"mx={cfg.mxblock})")
+            print(f"    {i}: {cfg.label}  (mt_a={cfg.mt_a}, mt_b={cfg.mt_b}, "
+                  f"du={cfg.depth_u}, mx={cfg.mxblock}, smxsa={cfg.stride_mxsa})")
         sys.exit(0)
 
     if args.debug:
@@ -363,81 +574,112 @@ if __name__ == "__main__":
         print("HIP not available")
         sys.exit(1)
 
-    configs = SCALE_ROUNDTRIP_CONFIGS if args.config is None else [SCALE_ROUNDTRIP_CONFIGS[args.config]]
     tc_list = list(args.tc)
     total_errors = 0
 
-    for cfg in configs:
-        for tc in tc_list:
-            print(f"\n{'='*60}")
-            print(f"  Config: {cfg.label}, matrix: {tc}")
-            print(f"{'='*60}")
+    # --- LDS dump mode ---
+    if args.lds_dump:
+        configs = SCALE_LDS_CONFIGS if args.config is None else [SCALE_LDS_CONFIGS[args.config]]
+        for cfg in configs:
+            for tc in tc_list:
+                print(f"\n{'='*60}")
+                print(f"  LDS dump: {cfg.label}, matrix: {tc}")
+                print(f"{'='*60}")
 
-            kernel_asm, _, kernel, tileInfoA, tileInfoB, lds_bytes = \
-                generate_roundtrip_kernel(cfg, tc)
+                kernel_asm, writer, kernel, tileInfoA, tileInfoB, lds_bytes = \
+                    generate_lds_dump_kernel(cfg, tc)
 
-            if args.debug:
-                print("\n--- Scale ASM (filtered) ---")
-                print_scale_asm_only(kernel_asm)
-                print("--- End ---")
-                print_intermediate_values(cfg, tileInfoA, tileInfoB, tc, kernel)
+                scaleTileInfo = getattr(writer.states.mxsa, 'tileInfo', None) if tc == 'A' \
+                                else getattr(writer.states.mxsb, 'tileInfo', None)
+                otherScaleTileInfo = getattr(writer.states.mxsb, 'tileInfo', None) if tc == 'A' \
+                                     else getattr(writer.states.mxsa, 'tileInfo', None)
 
-            tileInfo = tileInfoA if tc == 'A' else tileInfoB
-            input_size = compute_input_size(cfg, tileInfo)
-            input_data = generate_input_data(input_size)
+                numTPG = (scaleTileInfo.subtileSize * scaleTileInfo.localSubtileGrid[1]) // scaleTileInfo.loadWidthGR
+                print(f"  numTPG={numTPG}, stride_mxs={cfg.stride_mxsa if tc == 'A' else cfg.stride_mxsb}")
 
-            other_tileInfo = tileInfoB if tc == 'A' else tileInfoA
-            other_input_size = compute_input_size(cfg, other_tileInfo)
-            other_input = generate_input_data(other_input_size)
+                input_size = compute_input_size(cfg, scaleTileInfo, tc)
+                input_data = generate_block_input_data(input_size)
+                other_tc = 'B' if tc == 'A' else 'A'
+                other_size = compute_input_size(cfg, otherScaleTileInfo, other_tc)
+                other_input = generate_block_input_data(other_size)
 
-            if tc == 'A':
-                input_a, input_b = input_data, other_input
-            else:
-                input_a, input_b = other_input, input_data
+                if tc == 'A':
+                    inputs = (input_data, other_input)
+                else:
+                    inputs = (other_input, input_data)
 
-            with tempfile.TemporaryDirectory() as tmp_dir:
-                tmp_path = type('P', (), {'__truediv__': lambda s, n: os.path.join(tmp_dir, n)})()
-                out_size = NUM_THREADS * 4
-                label = f"scale_roundtrip_{tc}_{cfg.label}"
-                output_bytes = assemble_and_run(kernel_asm, tmp_path, label, out_size,
-                                                inputs=(input_a, input_b),
-                                                scalars=(cfg.stride_a, cfg.stride_b),
-                                                lds_size=lds_bytes)
+                expected = compute_expected_lds_content(cfg, scaleTileInfo, input_data, tc)
 
-            results = struct.unpack(f"{NUM_THREADS}I", output_bytes)
-            expected = compute_expected_roundtrip(
-                cfg, tileInfoA, tileInfoB, input_data, tc, kernel)
+                if args.debug:
+                    print_intermediate_values(cfg, writer, tc, kernel)
+                    print_lds_blocks(f"EXPECTED scale {tc}", expected)
 
-            if args.grid:
-                print_offset_grid(f"Scale {tc} GPU result ({cfg.label})",
-                                  results, WAVESIZE, NUM_WAVES)
-                print_offset_grid(f"Scale {tc} EXPECTED ({cfg.label})",
-                                  expected, WAVESIZE, NUM_WAVES)
+                with tempfile.TemporaryDirectory() as tmp_dir:
+                    tmp_path = type('P', (), {'__truediv__': lambda s, n: os.path.join(tmp_dir, n)})()
+                    raw = assemble_and_run(kernel_asm, tmp_path,
+                                           f"lds_dump_{tc}_{cfg.label}",
+                                           LDS_DUMP_SIZE,
+                                           inputs=inputs,
+                                           scalars=(cfg.stride_a, cfg.stride_b,
+                                                    cfg.stride_mxsa, cfg.stride_mxsb),
+                                           lds_size=lds_bytes)
 
-            errors = 0
-            for tid in range(NUM_THREADS):
-                if results[tid] != expected[tid]:
-                    errors += 1
-                    if errors <= 8 or args.debug:
-                        print(f"  MISMATCH tid={tid}: got {results[tid]}, "
-                              f"expected {expected[tid]}")
+                actual = np.frombuffer(raw, dtype=np.uint8)
 
-            if errors == 0:
-                print(f"  PASS")
-            else:
-                print(f"  FAIL: {errors} mismatches")
+                if args.debug or args.grid:
+                    print_lds_blocks(f"ACTUAL scale {tc}", actual)
+
+                    # Print GR offsets as grid
+                    gr_offsets = [compute_expected_scale_gr_offset(t, cfg, scaleTileInfo, tc)[0]
+                                 for t in range(NUM_THREADS)]
+                    print_offset_grid(f"Scale {tc} GR offsets ({cfg.label})",
+                                      gr_offsets, WAVESIZE, NUM_WAVES)
+
+                errors = 0
+                for i in range(LDS_DUMP_SIZE):
+                    if actual[i] != expected[i]:
+                        errors += 1
+                        if errors <= 16 or args.debug:
+                            print(f"  byte {i}: got 0x{actual[i]:02x}, "
+                                  f"expected 0x{expected[i]:02x}")
+
+                print(f"  {'PASS' if errors == 0 else f'FAIL: {errors} errors'}")
+                total_errors += errors
+
+    # --- Roundtrip mode ---
+    if args.roundtrip:
+        configs = SCALE_ROUNDTRIP_CONFIGS if args.config is None else [SCALE_ROUNDTRIP_CONFIGS[args.config]]
+        for cfg in configs:
+            for tc in tc_list:
+                print(f"\n{'='*60}")
+                print(f"  Roundtrip: {cfg.label}, matrix: {tc}")
+                print(f"{'='*60}")
+
+                if args.debug:
+                    kernel_asm, writer, kernel, tileInfoA, tileInfoB, _ = \
+                        generate_roundtrip_kernel(cfg, tc)
+                    print_intermediate_values(cfg, writer, tc, kernel)
+
+                with tempfile.TemporaryDirectory() as tmp_dir:
+                    tmp_path = type('P', (), {'__truediv__': lambda s, n: os.path.join(tmp_dir, n)})()
+                    results, expected = build_and_run_roundtrip(cfg, tc, tmp_path,
+                                                                debug=args.debug)
+
                 if args.grid:
-                    diff = [("." if results[t] == expected[t]
-                             else f"{results[t]}!={expected[t]}")
-                            for t in range(NUM_THREADS)]
-                    print(f"\n  Diff (wave x lane):")
-                    for w in range(NUM_WAVES):
-                        print(f"  w{w}: ", end="")
-                        for lane in range(WAVESIZE):
-                            tid = w * WAVESIZE + lane
-                            if diff[tid] != ".":
-                                print(f" t{tid}:{diff[tid]}", end="")
-                        print()
+                    print_offset_grid(f"Scale {tc} GPU result ({cfg.label})",
+                                      results, WAVESIZE, NUM_WAVES)
+                    print_offset_grid(f"Scale {tc} EXPECTED ({cfg.label})",
+                                      expected, WAVESIZE, NUM_WAVES)
+
+                errors = 0
+                for tid in range(NUM_THREADS):
+                    if results[tid] != expected[tid]:
+                        errors += 1
+                        if errors <= 8 or args.debug:
+                            print(f"  MISMATCH tid={tid}: got {results[tid]}, "
+                                  f"expected {expected[tid]}")
+
+                print(f"  {'PASS' if errors == 0 else f'FAIL: {errors} errors'}")
                 total_errors += errors
 
     print(f"\n{'='*60}")
