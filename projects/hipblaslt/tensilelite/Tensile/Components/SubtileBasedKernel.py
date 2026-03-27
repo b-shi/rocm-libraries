@@ -1244,16 +1244,18 @@ def localReadDoScaleSubtile(tc, writer, kernel):
 #
 def globalReadScalePtrUpdates(tc, writer, kernel):
   module = Module()
-  tileInfo = writer.states.a.tileInfo if tc == 'A' else writer.states.b.tileInfo
+  tileInfo = writer.states.mxsa.tileInfo if tc == 'MXSA' else writer.states.mxsb.tileInfo
 
   if tileInfo.mxBlock == 0:
     return module
 
-  inc = tileInfo.scaleDepthU * tileInfo.scaleBpe
+  inc = tileInfo.subtileSize * tileInfo.localSubtileGrid[1]
   module.addComment0("Scale SRD update: %s += %u" % (tc, inc))
-  module.add(SAddU32(dst=sgpr("SrdMXS%s" % tc), src0=sgpr("SrdMXS%s" % tc), src1=inc))
-  module.add(SAddCU32(dst=sgpr("SrdMXS%s+1" % tc), src0=sgpr("SrdMXS%s+1" % tc), src1=0))
+  module.add(SAddU32(dst=sgpr("Srd%s" % tc), src0=sgpr("Srd%s" % tc), src1=inc))
+  module.add(SAddCU32(dst=sgpr("Srd%s+1" % tc), src0=sgpr("Srd%s+1" % tc), src1=0))
 
+  module.add(SSubU32(dst=sgpr("Srd%s+2"%tc), src0=sgpr("Srd%s+2"%tc), src1=inc))
+  
   return module
 
 ##################################################
@@ -1489,7 +1491,10 @@ def globalReadLDSBufferSwap(tc, writer, kernel):
 def localReadLDSBufferSwap(tc, writer, kernel):
   module = Module()
 
-  tile = writer.states.a.tileInfo if tc == 'A' else writer.states.b.tileInfo
+  if tc in ['A', 'B']:
+    tile = writer.states.a.tileInfo if tc == 'A' else writer.states.b.tileInfo
+  else:
+    tile = writer.states.mxsa.tileInfo if tc == 'MXSA' else writer.states.mxsb.tileInfo
 
   module.addComment0("Emit code to swap %s LR vgpr offsets"%tc)
 
@@ -1512,7 +1517,7 @@ def globalReadPtrUpdates(tc, writer, kernel):
   module.add(SAddCU32(dst=sgpr("Srd%s+1"%tc), src0=sgpr("Srd%s+1"%tc), src1=0))
 
   # TODOBS: commented out for now, need to re-enable
-  #module.add(SSubU32(dst=sgpr("Srd%s+2"%tc), src0=sgpr("Srd%s+2"%tc), src1=inc))
+  module.add(SSubU32(dst=sgpr("Srd%s+2"%tc), src0=sgpr("Srd%s+2"%tc), src1=inc))
 
   return module
 
@@ -1662,14 +1667,20 @@ def mainLoopImpl(writer, kernel, isNLL = False):
   module.add(globalReadLDSBufferSwap('A', writer, kernel))
   module.add(globalReadLDSBufferSwap('B', writer, kernel))
 
+  module.add(globalReadLDSBufferSwap('MXSA', writer, kernel))
+  module.add(globalReadLDSBufferSwap('MXSB', writer, kernel))
+
   module.add(localReadLDSBufferSwap('A', writer, kernel))
   module.add(localReadLDSBufferSwap('B', writer, kernel))
+
+  module.add(localReadLDSBufferSwap('MXSA', writer, kernel))
+  module.add(localReadLDSBufferSwap('MXSB', writer, kernel))
 
   module.add(globalReadPtrUpdates('A', writer, kernel))
   module.add(globalReadPtrUpdates('B', writer, kernel))
   # Scale SRD pointer updates
-  module.add(globalReadScalePtrUpdates('A', writer, kernel))
-  module.add(globalReadScalePtrUpdates('B', writer, kernel))
+  module.add(globalReadScalePtrUpdates('MXSA', writer, kernel))
+  module.add(globalReadScalePtrUpdates('MXSB', writer, kernel))
 
   module.add(SSubU32(dst=sgpr("LoopCounterL"), src0=sgpr("LoopCounterL"), src1=1))
   module.add(SCmpEQU32(src0=sgpr("LoopCounterL"), src1=0))
