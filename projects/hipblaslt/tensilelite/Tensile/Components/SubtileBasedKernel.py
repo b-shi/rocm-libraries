@@ -1255,7 +1255,7 @@ def globalReadScalePtrUpdates(tc, writer, kernel):
   module.add(SAddCU32(dst=sgpr("Srd%s+1" % tc), src0=sgpr("Srd%s+1" % tc), src1=0))
 
   module.add(SSubU32(dst=sgpr("Srd%s+2"%tc), src0=sgpr("Srd%s+2"%tc), src1=inc))
-  
+
   return module
 
 ##################################################
@@ -1526,7 +1526,7 @@ def globalReadPtrUpdates(tc, writer, kernel):
 # Given RegisterTileInfo inputs for A,B,C,D operands
 # emit corresponding mfma instruction
 #
-def emitMfmaInstruction(writer, kernel, vgprTileA, vgprTileB, vgprTileC, vgprTileD, scaleAVgpr=-1, scaleBVgpr=-1, comment = ""):
+def emitMfmaInstruction(writer, kernel, vgprTileA, vgprTileB, vgprTileC, vgprTileD, scaleAVgpr=-1, scaleBVgpr=-1, scaleAsel=-1, scaleBsel=-1, comment = ""):
   module = Module()
 
   vgprAStart = vgprTileA.regList.regValues[0]
@@ -1561,7 +1561,7 @@ def emitMfmaInstruction(writer, kernel, vgprTileA, vgprTileB, vgprTileC, vgprTil
                                    b=bOperand, \
                                    acc2=cAccAlias(vgprCStart,opCSize), \
                                    mxsa=vgpr(scaleAVgpr), mxsb=vgpr(scaleBVgpr), \
-                                   vop3=VOP3PModifiers(op_sel=[0, 1]), \
+                                   vop3=VOP3PModifiers(op_sel=[scaleAsel%2, scaleBsel%2], op_sel_hi=[(scaleAsel>>1)%2, (scaleBsel>>1)%2]), \
                                    comment=comment))
     else:
       # Fallback: hardcoded scale 0x80 (scale=2.0 for all elements)
@@ -1573,7 +1573,6 @@ def emitMfmaInstruction(writer, kernel, vgprTileA, vgprTileB, vgprTileC, vgprTil
                                    b=bOperand, \
                                    acc2=cAccAlias(vgprCStart,opCSize), \
                                    mxsa=vgpr(tmpVgprScale), mxsb=vgpr(tmpVgprScale), \
-                                   vop3=VOP3PModifiers(op_sel=[0, 1], op_sel_hi=[1, 1]), \
                                    comment=comment))
       writer.vgprPool.checkIn(tmpVgprScale)
   else:
@@ -1623,8 +1622,11 @@ def emitMfmaCode(writer, kernel):
         scaleAVgpr = mxsatileInfo.vgprTiles[4 * mxsaLinearId].regList.regValues[0] if mxsatileInfo.mxBlock else -1
         scaleBVgpr = mxsbtileInfo.vgprTiles[4 * mxsbLinearId].regList.regValues[0] if mxsbtileInfo.mxBlock else -1
 
+        sAsel = mma0 + 2 * mmak
+        sBsel = mma1 + 2 * mmak
+
         module.add(emitMfmaInstruction(writer, kernel, atiles, btiles, dtiles, dtiles,
-                                       scaleAVgpr=scaleAVgpr, scaleBVgpr=scaleBVgpr,
+                                       scaleAVgpr=scaleAVgpr, scaleBVgpr=scaleBVgpr, scaleAsel=sAsel, scaleBsel=sBsel,
                                        comment="Emit MMFA code for MMA tiles C[%u, %u] += A[%u, %u] * B[%u, %u]"%(mma0, mma1, mma0, mmak, mmak, mma1)))
 
   return module
