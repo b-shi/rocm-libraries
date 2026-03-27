@@ -4978,6 +4978,8 @@ class KernelWriter(metaclass=abc.ABCMeta):
       sizeA = ((numASubtiles * aTileInfo.subtileSize + readSize-1) // readSize) * readSize
       sizeB = ((numBSubtiles * bTileInfo.subtileSize + readSize-1) // readSize) * readSize
       self.ldsStartOffsetB = sizeA
+      sizeMXSA = 0
+      sizeMXSB = 0
       if kernel["ProblemType"].get("MXBlockA", 0) > 0 and kernel["ProblemType"].get("MXBlockB", 0) > 0:
         mxsaTileInfo = self.states.mxsa.tileInfo
         mxsbTileInfo = self.states.mxsb.tileInfo
