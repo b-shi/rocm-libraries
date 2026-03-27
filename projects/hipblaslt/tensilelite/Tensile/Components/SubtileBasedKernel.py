@@ -36,6 +36,7 @@ from rocisa.instruction import BufferLoadB128, BufferLoadB32, BufferLoadB64, \
   SMovB32, SMulI32, FlatStoreB32, SWaitCnt, SMovB64, VSubU32, VPermlane16SwapB32, MFMAInstruction
 from rocisa.register import RegisterPool
 from rocisa.enum import RegisterType, DataTypeEnum
+
 # Store various scheduling info
 class ScheduleInfo:
 
@@ -1623,14 +1624,8 @@ def emitMfmaCode(writer, kernel):
 #
 # Scheduling logic would be introduced here
 #
-def mainLoopImpl(writer, kernel):
+def mainLoopImplPGR0(writer, kernel):
   module = Module()
-  module.addComment0("--------------------------------")
-  module.addComment0("-----  MAINLOOP         --------")
-  module.addComment0("--------------------------------")
-
-  pgr = kernel["PrefetchGlobalRead"]
-  endCounter = pgr  # PGR=0 -> 0, PGR=2 -> 2
 
   loopBegin = Label("LoopBeginL", "")
   module.add(loopBegin)
@@ -1675,11 +1670,11 @@ def mainLoopImpl(writer, kernel):
   module.add(globalReadScalePtrUpdates('MXSA', writer, kernel))
   module.add(globalReadScalePtrUpdates('MXSB', writer, kernel))
 
-  # Decrement and loop back if counter > endCounter
+  # Decrement and loop back if counter > 0
   module.add(SSubU32(dst=sgpr("LoopCounterL"), src0=sgpr("LoopCounterL"), src1=1,
                      comment="dec counterL"))
-  module.add(SCmpEQU32(src0=sgpr("LoopCounterL"), src1=endCounter,
-                       comment="counterL == %d?" % endCounter))
+  module.add(SCmpEQU32(src0=sgpr("LoopCounterL"), src1=0,
+                       comment="counterL == 0?"))
   module.add(SCBranchSCC0(labelName=loopBegin.getLabelName(),
                           comment="restart mainloop"))
 
@@ -1783,8 +1778,9 @@ def mainLoop(writer, kernel):
     from Tensile.Components.SubtileBasedScheduler import SubtileBasedScheduler, SchedulerConfig, PrefetchMode, VGPRTileReUseStrategy
     tiA = writer.states.a.tileInfo
     tiB = writer.states.b.tileInfo
+    # Use a single partition for now. TODO
     # cfg = SchedulerConfig(tiA.localSubtileGrid[0]//2, tiB.localSubtileGrid[0]//2,
-    cfg = SchedulerConfig(tiA.localSubtileGrid[0], tiB.localSubtileGrid[0]//10,
+    cfg = SchedulerConfig(tiA.localSubtileGrid[0], tiB.localSubtileGrid[0],
                           PrefetchMode.HALF_PREFETCH, VGPRTileReUseStrategy.ACROSS_SUBGROUP)
     scheduler = SubtileBasedScheduler(tiA, tiB, cfg)
     scheduler.allocVgprTiles(writer)
@@ -1821,7 +1817,7 @@ def mainLoop(writer, kernel):
   else:
     # PGR=0: non-pipelined
     module.addComment0("MAINLOOP")
-    module.add(mainLoopImpl(writer, kernel))
+    module.add(mainLoopImplPGR0(writer, kernel))
     module.addComment("")
 
   return module
