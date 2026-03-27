@@ -77,6 +77,8 @@ class DataInitName(Enum):
   TrigIndCos = 24
   TrigIndAbsSin = 25
   TrigIndAbsCos = 26
+  MXScaleBlockSerial = 27
+  MXScaleBlockQuad = 28
 
 class ClientLogLevel(Enum):
   Error = 0

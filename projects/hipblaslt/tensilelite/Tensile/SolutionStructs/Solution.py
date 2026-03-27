@@ -1733,7 +1733,8 @@ class Solution(collections.abc.Mapping):
       state["StaggerU"] = 0
 
     if state["ProblemType"]["MXBlockA"]:
-      if state["UseSubtileImpl"]:
+      #if state["UseSubtileImpl"]:
+      if False:
         # Subtile impl handles scale loading separately; disable classic MXS path
         state["DirectToVgprMXSA"] = False
         state["DirectToLdsMXSA"] = False
@@ -1768,7 +1769,8 @@ class Solution(collections.abc.Mapping):
         state["MIWaveTileMXSA"] = state["MIWaveTileA"]
 
     if state["ProblemType"]["MXBlockB"]:
-      if state["UseSubtileImpl"]:
+      #if state["UseSubtileImpl"]:
+      if False:
         # Subtile impl handles scale loading separately; disable classic MXS path
         state["DirectToVgprMXSB"] = False
         state["DirectToLdsMXSB"] = False
@@ -2737,7 +2739,7 @@ class Solution(collections.abc.Mapping):
         totalVectorsCoalescedA = totalElementsCoalescedA // GlobalReadVectorWidthA
 
         # handle global read vector width MXSA
-        if state["ProblemType"]["MXBlockA"] and not state["UseSubtileImpl"]:
+        if state["ProblemType"]["MXBlockA"]:
           if state["ProblemType"]["TLUA"]: # NT/NN
             totalElementsCoalescedMXSA = state["MacroTileMXSA"]
             totalElementsPerpMXSA = state["_DepthUMXSA"]
@@ -2798,7 +2800,7 @@ class Solution(collections.abc.Mapping):
         totalVectorsCoalescedB = totalElementsCoalescedB // GlobalReadVectorWidthB
 
         # handle global read vector width MXSB
-        if state["ProblemType"]["MXBlockB"] and not state["UseSubtileImpl"]:
+        if state["ProblemType"]["MXBlockB"]:
           if state["ProblemType"]["TLUB"]: # NT/NN
             totalElementsCoalescedMXSB = state["MacroTileMXSB"]
             totalElementsPerpMXSB = state["_DepthUMXSB"]
@@ -3066,7 +3068,7 @@ class Solution(collections.abc.Mapping):
         totalVectorsCoalescedA, totalElementsPerpA, depthUA, printRejectionReason):
       return
 
-    if state["ProblemType"]["MXBlockA"] and not state["UseSubtileImpl"]:
+    if state["ProblemType"]["MXBlockA"]:
       if not Solution.setGlobalLoadTileDimClassic(state, "MXSA", state["NumLoadsMXSA"], \
           totalVectorsCoalescedMXSA, totalElementsPerpMXSA, state["_DepthUMXSA"], printRejectionReason):
         return
@@ -3075,7 +3077,7 @@ class Solution(collections.abc.Mapping):
         totalVectorsCoalescedB, totalElementsPerpB, depthUB, printRejectionReason):
       return
 
-    if state["ProblemType"]["MXBlockB"] and not state["UseSubtileImpl"]:
+    if state["ProblemType"]["MXBlockB"]:
       if not Solution.setGlobalLoadTileDimClassic(state, "MXSB", state["NumLoadsMXSB"], \
           totalVectorsCoalescedMXSB, totalElementsPerpMXSB, state["_DepthUMXSB"], printRejectionReason):
         return
@@ -3143,14 +3145,14 @@ class Solution(collections.abc.Mapping):
     state["LVCA"] = roundupRatio(state["LSCA"] , state["GlobalReadVectorWidthA"])
     state["LVPA"] = roundupRatio(state["LSPA"] , state["GlobalReadVectorWidthA"])
 
-    if state["ProblemType"]["MXBlockA"] and not state["UseSubtileImpl"]:
+    if state["ProblemType"]["MXBlockA"]:
       state["LVCMXSA"] = roundupRatio(state["LSCMXSA"] , state["GlobalReadVectorWidthMXSA"])
       state["LVPMXSA"] = roundupRatio(state["LSPMXSA"] , state["GlobalReadVectorWidthMXSA"])
 
     state["LVCB"] = roundupRatio(state["LSCB"] , state["GlobalReadVectorWidthB"])
     state["LVPB"] = roundupRatio(state["LSPB"] , state["GlobalReadVectorWidthB"])
 
-    if state["ProblemType"]["MXBlockB"] and not state["UseSubtileImpl"]:
+    if state["ProblemType"]["MXBlockB"]:
       state["LVCMXSB"] = roundupRatio(state["LSCMXSB"] , state["GlobalReadVectorWidthMXSB"])
       state["LVPMXSB"] = roundupRatio(state["LSPMXSB"] , state["GlobalReadVectorWidthMXSB"])
 
@@ -3313,7 +3315,7 @@ class Solution(collections.abc.Mapping):
       #1LDS buffer must be 0 for DirectToLdsA
       state["1LDSBuffer"] = 0
     # MX case
-    if (state["ProblemType"]["MXBlockA"] or state["ProblemType"]["MXBlockB"]) and not state["UseSubtileImpl"]:
+    if (state["ProblemType"]["MXBlockA"] or state["ProblemType"]["MXBlockB"]):
       if state["DirectToLdsA"] != state["DirectToLdsMXSA"] or state["DirectToLdsB"] != state["DirectToLdsMXSB"]:
           reject(state, printRejectionReason, "DirectToLdsA/B and DirectToLdsMXSA/B should match")
 

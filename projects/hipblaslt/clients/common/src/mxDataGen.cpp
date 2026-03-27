@@ -29,6 +29,7 @@
 #include <mxDataGenerator/PreSwizzle.hpp>
 #include <cblas.h>
 #include <cmath>
+#include <cstring>
 
 
 template <typename DT>
@@ -222,7 +223,8 @@ std::vector<float> generateData(T                           dgen,
                                 bool                        isTranspose,
                                 bool                        isMatrixA,
                                 std::vector<size_t> const&  preSwizzleTile,
-                                std::vector<size_t> const&  preTile)
+                                std::vector<size_t> const&  preTile,
+                                std::string_view const      scaleInitMethod = "")
 {
     using namespace DGen;
 
@@ -232,34 +234,108 @@ std::vector<float> generateData(T                           dgen,
     std::vector<uint8_t> dataBytes = dgen.getDataBytes();
     std::memcpy(data, dataBytes.data(), dataBytes.size() * sizeof(uint8_t));
 
-    std::vector<uint8_t> scaleBytes = dgen.getScaleBytes();
+    std::vector<uint8_t> scaleBytes    = dgen.getScaleBytes();
+    bool                 scaleOverride = !scaleInitMethod.empty();
 
-    // Apply pre-swizzle to scale data
+    // Scale tensor dimensions (needed for 2D init patterns)
     size_t scaleRows = sizes[0] / elementsPerMXBlock;
     size_t scaleCols = sizes[1];
+
+    // If a separate scale init method is specified, re-initialize scale bytes
+    // before they're used for reference float computation or pre-swizzling.
+    // The data bytes remain as generated; only scales (and thus reference floats) change.
+    if(scaleOverride)
+    {
+        if(scaleInitMethod == "Zeros")
+        {
+            std::fill(scaleBytes.begin(), scaleBytes.end(), 0);
+        }
+        else if(scaleInitMethod == "Ones")
+        {
+            // E8M0 value 127 = 2^(127-127) = 2^0 = 1.0
+            std::fill(scaleBytes.begin(), scaleBytes.end(), 127);
+        }
+        else if(scaleInitMethod == "Sequential")
+        {
+            for(size_t i = 0; i < scaleBytes.size(); ++i)
+                scaleBytes[i] = static_cast<uint8_t>(i & 0xFF);
+        }
+        else if(scaleInitMethod == "SerialIdx")
+        {
+            for(size_t i = 0; i < scaleBytes.size(); ++i)
+                scaleBytes[i] = static_cast<uint8_t>((i / 256) + 1);
+        }
+        else if(scaleInitMethod == "MXScaleBlockSerial")
+        {
+            for(size_t i = 0; i < scaleBytes.size(); ++i)
+                scaleBytes[i] = static_cast<uint8_t>((i / 256) + 1);
+        }
+        else if(scaleInitMethod == "MXScaleBlockQuad")
+        {
+            // 32x8 block pattern with 16x4 quadrants:
+            //   Top-left  (rows 0-15,  cols 0-3) = 1
+            //   Bottom-left (rows 16-31, cols 0-3) = 2
+            //   Top-right (rows 0-15,  cols 4-7) = 3
+            //   Bottom-right(rows 16-31, cols 4-7) = 4
+            // Scale bytes stored column-major: byte[i] -> row = i % scaleRows, col = i / scaleRows
+            for(size_t i = 0; i < scaleBytes.size(); ++i)
+            {
+                size_t row = i % scaleRows;
+                size_t col = i / scaleRows;
+                bool   top  = (row % 32) < 16;
+                bool   left = (col % 8) < 4;
+                if(top && left)
+                    scaleBytes[i] = 1;
+                else if(!top && left)
+                    scaleBytes[i] = 2;
+                else if(top && !left)
+                    scaleBytes[i] = 3;
+                else
+                    scaleBytes[i] = 4;
+            }
+        }
+    }
+
+    // Keep a copy of scale bytes before pre-swizzle for reference float computation
+    std::vector<uint8_t> scaleBytesForRef = scaleBytes;
 
     if(preSwizzleTile.size() == 3)
     {
         scaleBytes = DGen::preSwizzleScalesGFX950(scaleBytes, {scaleCols, scaleRows});
-        
     }
 
     std::memcpy(scale, scaleBytes.data(), scaleBytes.size() * sizeof(uint8_t));
 
     if((isMatrixA && isTranspose) || (!isMatrixA && !isTranspose))
     {
-        // For (1) transposed matrixA and (2) non-transposed matrixB,
-        // return the reference float directly since they are aligned already.
-        return dgen.getReferenceFloat();
+        if(!scaleOverride)
+        {
+            return dgen.getReferenceFloat();
+        }
+        else
+        {
+            // Recompute reference floats with overridden scales (pre-swizzle layout)
+            auto blockSize = opt.blockScaling;
+            auto numElems  = sizes[0] * sizes[1];
+            std::vector<float> ret(numElems);
+#pragma omp parallel for
+            for(size_t i = 0; i < numElems; ++i)
+            {
+                auto scaleIdx = i / blockSize;
+                ret[i] = DGen::toFloat<DT>(scaleBytesForRef.data(), dataBytes.data(), scaleIdx, i);
+            }
+            return ret;
+        }
     }
 
     // For types smaller than 8-bit, mxDataGenerator returns packed data (i.e., two FP4 will be
-    // stored in a uint8_t), so unpacking the data is required before converting them to float
+    // stored in a uint8_t), so unpacking the data is required before converting them to float.
+    // Use the (possibly overridden) scaleBytesForRef for reference float computation.
     if constexpr(std::is_same_v<DT, DGen::ocp_e5m2_mxfp8>
                  || std::is_same_v<DT, DGen::ocp_e4m3_mxfp8>)
     {
         auto ret = getAlignedFloat<DT>(
-            dataBytes, scaleBytes, {sizes[0], sizes[1]}, elementsPerMXBlock, isMatrixA);
+            dataBytes, scaleBytesForRef, {sizes[0], sizes[1]}, elementsPerMXBlock, isMatrixA);
         std::memcpy(data, dataBytes.data(), dataBytes.size() * sizeof(uint8_t));
         return ret;
     }
@@ -268,8 +344,7 @@ std::vector<float> generateData(T                           dgen,
     {
         auto unpackedDataBytes = unpackData<DT>(dataBytes);
         auto ret               = getAlignedFloat<DT>(
-            unpackedDataBytes, scaleBytes, {sizes[0], sizes[1]}, elementsPerMXBlock, isMatrixA);
-        // GPU expects the data are packed
+            unpackedDataBytes, scaleBytesForRef, {sizes[0], sizes[1]}, elementsPerMXBlock, isMatrixA);
         packData<DT>(unpackedDataBytes, static_cast<uint8_t*>(data));
         return ret;
     }
@@ -277,8 +352,7 @@ std::vector<float> generateData(T                           dgen,
     {
         auto unpackedDataBytes = unpackData<DT>(dataBytes);
         auto ret               = getAlignedFloat<DT>(
-            unpackedDataBytes, scaleBytes, {sizes[0], sizes[1]}, elementsPerMXBlock, isMatrixA);
-        // GPU expects the data are packed
+            unpackedDataBytes, scaleBytesForRef, {sizes[0], sizes[1]}, elementsPerMXBlock, isMatrixA);
         packData<DT>(unpackedDataBytes, static_cast<uint8_t*>(data));
         return ret;
     }
@@ -311,7 +385,8 @@ std::vector<float> generateMXInput(hipDataType                dataType,
                                    bool                       isMatrixA,
                                    std::string_view const     initMethod,
                                    float                      min_val,
-                                   float                      max_val)
+                                   float                      max_val,
+                                   std::string_view const     scaleInitMethod)
 {
     using namespace DGen;
 
@@ -357,81 +432,51 @@ std::vector<float> generateMXInput(hipDataType                dataType,
     {
         DGen::DataGenerator<DGen::ocp_e5m2_mxfp8> dgen;
         return generateData<decltype(dgen), DGen::ocp_e5m2_mxfp8>(dgen,
-                                                                  data,
-                                                                  scale,
-                                                                  sizes,
-                                                                  strides,
-                                                                  seed,
-                                                                  opt,
-                                                                  elementsPerMXBlock,
-                                                                  isTranspose,
-                                                                  isMatrixA,
-                                                                  preSwizzleTile,
-                                                                  preTile);
+                                                                  data, scale, sizes, strides,
+                                                                  seed, opt, elementsPerMXBlock,
+                                                                  isTranspose, isMatrixA,
+                                                                  preSwizzleTile, preTile,
+                                                                  scaleInitMethod);
     }
     else if(dataType == HIP_R_8F_E4M3)
     {
         DGen::DataGenerator<DGen::ocp_e4m3_mxfp8> dgen;
         return generateData<decltype(dgen), DGen::ocp_e4m3_mxfp8>(dgen,
-                                                                  data,
-                                                                  scale,
-                                                                  sizes,
-                                                                  strides,
-                                                                  seed,
-                                                                  opt,
-                                                                  elementsPerMXBlock,
-                                                                  isTranspose,
-                                                                  isMatrixA,
-                                                                  preSwizzleTile,
-                                                                  preTile);
+                                                                  data, scale, sizes, strides,
+                                                                  seed, opt, elementsPerMXBlock,
+                                                                  isTranspose, isMatrixA,
+                                                                  preSwizzleTile, preTile,
+                                                                  scaleInitMethod);
     }
     else if(static_cast<hipDataType>(dataType) == HIP_R_6F_E2M3)
     {
         DGen::DataGenerator<DGen::ocp_e2m3_mxfp6> dgen;
         return generateData<decltype(dgen), DGen::ocp_e2m3_mxfp6>(dgen,
-                                                                  data,
-                                                                  scale,
-                                                                  sizes,
-                                                                  strides,
-                                                                  seed,
-                                                                  opt,
-                                                                  elementsPerMXBlock,
-                                                                  isTranspose,
-                                                                  isMatrixA,
-                                                                  preSwizzleTile,
-                                                                  preTile);
+                                                                  data, scale, sizes, strides,
+                                                                  seed, opt, elementsPerMXBlock,
+                                                                  isTranspose, isMatrixA,
+                                                                  preSwizzleTile, preTile,
+                                                                  scaleInitMethod);
     }
     else if(static_cast<hipDataType>(dataType) == HIP_R_6F_E3M2)
     {
         DGen::DataGenerator<DGen::ocp_e3m2_mxfp6> dgen;
         return generateData<decltype(dgen), DGen::ocp_e3m2_mxfp6>(dgen,
-                                                                  data,
-                                                                  scale,
-                                                                  sizes,
-                                                                  strides,
-                                                                  seed,
-                                                                  opt,
-                                                                  elementsPerMXBlock,
-                                                                  isTranspose,
-                                                                  isMatrixA,
-                                                                  preSwizzleTile,
-                                                                  preTile);
+                                                                  data, scale, sizes, strides,
+                                                                  seed, opt, elementsPerMXBlock,
+                                                                  isTranspose, isMatrixA,
+                                                                  preSwizzleTile, preTile,
+                                                                  scaleInitMethod);
     }
     else if(static_cast<hipDataType>(dataType) == HIP_R_4F_E2M1)
     {
         DGen::DataGenerator<DGen::ocp_e2m1_mxfp4> dgen;
         return generateData<decltype(dgen), DGen::ocp_e2m1_mxfp4>(dgen,
-                                                                  data,
-                                                                  scale,
-                                                                  sizes,
-                                                                  strides,
-                                                                  seed,
-                                                                  opt,
-                                                                  elementsPerMXBlock,
-                                                                  isTranspose,
-                                                                  isMatrixA,
-                                                                  preSwizzleTile,
-                                                                  preTile);
+                                                                  data, scale, sizes, strides,
+                                                                  seed, opt, elementsPerMXBlock,
+                                                                  isTranspose, isMatrixA,
+                                                                  preSwizzleTile, preTile,
+                                                                  scaleInitMethod);
     }
     else
     {

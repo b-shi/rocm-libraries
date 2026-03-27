@@ -196,6 +196,10 @@ namespace TensileLite
                 return "TrigIndAbsSin";
             case InitMode::TrigIndAbsCos:
                 return "TrigIndAbsCos";
+            case InitMode::MXScaleBlockSerial:
+                return "MXScaleBlockSerial";
+            case InitMode::MXScaleBlockQuad:
+                return "MXScaleBlockQuad";
 
             case InitMode::Count:
                 break;
@@ -267,6 +271,10 @@ namespace TensileLite
                 mode = InitMode::TrigIndAbsSin;
             else if(strValue == ToString(InitMode::TrigIndAbsCos))
                 mode = InitMode::TrigIndAbsCos;
+            else if(strValue == ToString(InitMode::MXScaleBlockSerial))
+                mode = InitMode::MXScaleBlockSerial;
+            else if(strValue == ToString(InitMode::MXScaleBlockQuad))
+                mode = InitMode::MXScaleBlockQuad;
             else if(std::all_of(strValue.begin(), strValue.end(), isdigit))
             {
                 int value = atoi(strValue.c_str());
@@ -1786,6 +1794,10 @@ namespace TensileLite
             case InitMode::SerialDim0:
             case InitMode::SerialDim1:
                 return "Sequential";
+            case InitMode::MXScaleBlockSerial:
+                return "MXScaleBlockSerial";
+            case InitMode::MXScaleBlockQuad:
+                return "MXScaleBlockQuad";
             default:
                 return "Bounded";
             }
@@ -1847,7 +1859,11 @@ namespace TensileLite
                 auto& pristineMXScaleA
                     = m_vdata[ContractionProblemGemm::TENSOR::MXSA].pristine[problem.mxsa().dataType()];
 
-                auto initA = m_vdata[ContractionProblemGemm::TENSOR::A].init;
+                auto initA     = m_vdata[ContractionProblemGemm::TENSOR::A].init;
+                auto initMXSA  = m_vdata[ContractionProblemGemm::TENSOR::MXSA].init;
+                auto scaleInit = (initMXSA != initA)
+                                     ? initModeToMXMethod(initMXSA)
+                                     : std::string_view("");
                 generateMXInput((hipDataType)HIP_R_4F_E2M1,
                                 pristineA.cpuInput.valid.get(),
                                 pristineMXScaleA.cpuInput.valid.get(),
@@ -1862,7 +1878,8 @@ namespace TensileLite
                                 true,
                                 initModeToMXMethod(initA),
                                 -1.0f,
-                                1.0f);
+                                1.0f,
+                                scaleInit);
             }
 
             if(isMXFP4Tensor(problem.b(), problem.mxBlockB()))
@@ -1877,7 +1894,11 @@ namespace TensileLite
                 auto& pristineMXScaleB
                     = m_vdata[ContractionProblemGemm::TENSOR::MXSB].pristine[problem.mxsb().dataType()];
 
-                auto initB = m_vdata[ContractionProblemGemm::TENSOR::B].init;
+                auto initB     = m_vdata[ContractionProblemGemm::TENSOR::B].init;
+                auto initMXSB  = m_vdata[ContractionProblemGemm::TENSOR::MXSB].init;
+                auto scaleInitB = (initMXSB != initB)
+                                      ? initModeToMXMethod(initMXSB)
+                                      : std::string_view("");
                 generateMXInput((hipDataType)HIP_R_4F_E2M1,
                                 pristineB.cpuInput.valid.get(),
                                 pristineMXScaleB.cpuInput.valid.get(),
@@ -1892,7 +1913,8 @@ namespace TensileLite
                                 false,
                                 initModeToMXMethod(initB),
                                 -1.0f,
-                                1.0f);
+                                1.0f,
+                                scaleInitB);
             }
         }
 

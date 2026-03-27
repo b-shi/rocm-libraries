@@ -88,6 +88,8 @@ namespace TensileLite
             TrigIndCos, // 24
             TrigIndAbsSin, // 25
             TrigIndAbsCos, // 26
+            MXScaleBlockSerial, // 27 — scale bytes: block[n] = n+1 (256 bytes per block)
+            MXScaleBlockQuad,  // 28 — 32x8 block pattern: TL=1, BL=2, TR=3, BR=4 (16x4 quadrants)
             Count
         };
 

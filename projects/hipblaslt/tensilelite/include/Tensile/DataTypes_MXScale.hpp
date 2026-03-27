@@ -26,6 +26,8 @@
 
 #pragma once
 
+#include <iomanip>
+
 #define TENSILE_USE_MX_SCALE
 
 #ifdef TENSILE_USE_MX_SCALE
@@ -127,7 +129,12 @@ namespace std
 
     inline ostream& operator<<(ostream& stream, const TensileLite::MXScale a)
     {
-        return stream << static_cast<float>(a);
+        // Print as hex (0xNN) for easier debugging of E8M0 scale bytes
+        auto flags = stream.flags();
+        stream << "0x" << std::hex << std::setfill('0') << std::setw(2)
+               << static_cast<unsigned>(a.data);
+        stream.flags(flags);
+        return stream;
     }
 } // namespace std
 
