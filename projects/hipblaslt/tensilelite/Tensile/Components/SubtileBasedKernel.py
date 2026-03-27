@@ -984,7 +984,7 @@ def _graTileAssignmentScaleSwizzledCommon(tc, writer, kernel):
   # TODO: this logic assumes scales are in block TLU=0 format.
   subtileSize = tileInfo.subtileSize # subtile size in bytes
   # number of consecutive threads needed to load all subtiles in contiguous dim
-  numThreadsPerGroup = subtileSize * tileInfo.localSubtileGrid[1] // loadWidth
+  numThreadsPerGroup = (subtileSize * tileInfo.localSubtileGrid[1]) // loadWidth
 
   vtmp = writer.vgprPool.checkOut(2)
   vtmp1 = vtmp + 1
@@ -1002,11 +1002,10 @@ def _graTileAssignmentScaleSwizzledCommon(tc, writer, kernel):
   module.add(VAndB32(dst=vgpr(tileInfo.sharedVgprGROffset[0]),
                      src0=hex(numThreadsPerGroup - 1), src1=vgpr("Serial"),
                      comment="%s: grOffset = serial %% %d" % (tc, loadWidth)))
-  module.add(VLShiftRightB32(dst=vgpr(tileInfo.sharedVgprGROffset[0]),
+  module.add(VLShiftLeftB32(dst=vgpr(tileInfo.sharedVgprGROffset[0]),
                             shiftHex=hex(loadWidthShift), src=vgpr(tileInfo.sharedVgprGROffset[0]),
                             comment="Scale by load width for each thread in group"))
   module.add(VAddU32(dst=vgpr(tileInfo.sharedVgprGROffset[0]), src0=vgpr(tileInfo.sharedVgprGROffset[0]), src1=vgpr(vtmp), comment="Final offset calc"))
-
   writer.vgprPool.checkIn(vtmp)
   writer.sgprPool.checkIn(stmp)
 
