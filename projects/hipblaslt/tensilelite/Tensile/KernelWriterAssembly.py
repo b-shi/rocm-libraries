@@ -4010,7 +4010,7 @@ class KernelWriterAssembly(KernelWriter):
           module.add(SAddU32(dst=sgpr(tileStart+0), src0=sgpr(tileStart+0), src1=sgpr(stmp+0), comment="baseCol"))
           module.add(SMovB32(dst=sgpr(tileStart+1), src=0))
         strideF = self.strideRef(tc, tP['tileIdx'])
-        if not self.isConstUnitStride(strideF) and not isMX:
+        if not self.isConstUnitStride(strideF):
           if isMX:
             # MX (pre shuffle) case, stride = (roundup(sizeL/mxSwizzleSize1) * (mxSwizzleSize0*mxSwizzleSize1/mxBlock))
             for i in range(0, numDim):
