@@ -270,6 +270,26 @@ def compute_expected_lds_content(cfg, scaleTileInfo, input_data, tc):
     return lds
 
 
+def print_scale_gr_grid(label, offsets, numTPG, wavesize=WAVESIZE, num_waves=NUM_WAVES,
+                        group_size=16):
+    """Print GR offsets in LDS layout format, lanes grouped by group_size.
+
+    Output format:
+        Wave 0:
+        Lane  0-15: 0 16 32 48 64 80 ...
+        Lane 16-31: 256 272 ...
+        ...
+    """
+    print(f"\n--- {label} ---")
+    for w in range(num_waves):
+        print(f"  Wave {w}:")
+        for start in range(0, wavesize, group_size):
+            end = start + group_size - 1
+            base_tid = w * wavesize + start
+            vals = " ".join(str(offsets[base_tid + i]) for i in range(group_size))
+            print(f"    Lane {start:>2}-{end:<2}: {vals}")
+
+
 def print_lds_blocks(label, data, block_size=256):
     """Print LDS content summarized per block_size-byte chunk."""
     print(f"\n  --- {label} ---")
@@ -629,11 +649,11 @@ if __name__ == "__main__":
                 if args.debug or args.grid:
                     print_lds_blocks(f"ACTUAL scale {tc}", actual)
 
-                    # Print GR offsets as grid
+                    # Print GR offsets grouped by numTPG
                     gr_offsets = [compute_expected_scale_gr_offset(t, cfg, scaleTileInfo, tc)[0]
                                  for t in range(NUM_THREADS)]
-                    print_offset_grid(f"Scale {tc} GR offsets ({cfg.label})",
-                                      gr_offsets, WAVESIZE, NUM_WAVES)
+                    print_scale_gr_grid(f"Scale {tc} GR offsets ({cfg.label})",
+                                        gr_offsets, numTPG)
 
                 errors = 0
                 for i in range(LDS_DUMP_SIZE):
