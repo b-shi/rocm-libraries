@@ -855,6 +855,7 @@ namespace TensileLite
             {
                 m_currentGemmProblem
                     = dynamic_cast<ContractionProblemGemm const*>(problem);
+                m_currentSolution = nullptr;
             }
             virtual void postProblem() override {}
             virtual void preSolution(ContractionSolution* const solution) override
