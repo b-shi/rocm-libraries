@@ -862,9 +862,9 @@ namespace TensileLite
                 m_currentSolution = solution;
                 // Re-init MX scale with preSwizzle now that solution is available
                 if(m_currentSolution != nullptr
+                   && m_mxScaleFormat > 0
                    && m_currentGemmProblem != nullptr
-                   && !m_gpuPtrs.empty()
-                   && (m_currentGemmProblem->mxBlockA() > 0 || m_currentGemmProblem->mxBlockB() > 0))
+                   && !m_gpuPtrs.empty())
                 {
                     bool isMXFP4 = isMXFP4Problem(*m_currentGemmProblem);
                     if(isMXFP4)
