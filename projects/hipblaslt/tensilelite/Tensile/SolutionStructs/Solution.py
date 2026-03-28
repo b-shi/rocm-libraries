@@ -2697,7 +2697,7 @@ class Solution(collections.abc.Mapping):
       #######################################
       while True: # exit criteria at end
         validDepthU = True
-
+        
         # how many elements to load
         if state["ProblemType"]["TLUA"]: # NT/NN
           totalElementsCoalescedA = state["MacroTileA"]
@@ -2910,7 +2910,7 @@ class Solution(collections.abc.Mapping):
                 validDepthU = False
                 extraComment = ": DepthU(%u) < Min-DU for swizzleB + LSU(%u)"%(depthUB, state["LocalSplitU"])
         # this depthU is valid, done unless user wants to double (for TN)
-        if validDepthU:
+        if validDepthU or state["UseSubtileImpl"]:
           state["DepthU"] = depthU
           break
 

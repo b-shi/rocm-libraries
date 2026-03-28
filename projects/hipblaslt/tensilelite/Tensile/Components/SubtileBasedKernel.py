@@ -1021,8 +1021,8 @@ def _graTileAssignmentScaleSwizzledCommon(tc, writer, kernel):
 def graTileAssignmentScaleSwizzled(writer, kernel):
   module = Module()
 
-  if writer.states.mxsa.tileInfo.mxBlock == 0 and writer.states.mxsb.tileInfo.mxBlock == 0:
-    module.addComment0("Scale GR offsets: skipped (no MX block scaling)")
+  if not kernel["ProblemType"].get("MXBlockA", 0) and not kernel["ProblemType"].get("MXBlockB", 0):
+    module.addComment0("Scale GR tile assignment: skipped (no MX block scaling)")
     return module
 
   # DTL linear offset: vaddr = serial * scaleLoadWidth (= serial << log2(loadWidth))
@@ -1059,7 +1059,10 @@ def _applyScaleWavePartitionLROffset(module, writer, kernel, tileInfo, waveId):
   if tc == 'MXSA':
     module.add(VAndB32(dst=vgpr(tmp), src0=kernel["MIWaveGroup"][0]-1, src1=vgpr(waveId), comment="scale%s: waveId %% 2"%tc))
   else:
-    module.add(VLShiftRightB32(dst=vgpr(tmp), shiftHex=int(math.log2(kernel["MIWaveGroup"][1])), src=vgpr(waveId), comment="scale%s: waveId / 2"%tc))
+    # N-direction wave index = waveId / numWavesInM (MIWaveGroup[0])
+    # Using MIWaveGroup[0] (not [1]) correctly handles asymmetric configs like 4x1
+    # where log2(MIWaveGroup[1])=0 would give waveId unchanged instead of waveId/4.
+    module.add(VLShiftRightB32(dst=vgpr(tmp), shiftHex=int(math.log2(kernel["MIWaveGroup"][0])), src=vgpr(waveId), comment="scale%s: waveId / numWavesM"%tc))
 
   module.add(SMovB32(dst=sgpr(tmpSgpr), src=totalScaleBytes, comment="scale%s: scale region"%tc))
   module.add(VMulLOU32(dst=vgpr(tileInfo.sharedVgprLROffset[0]), src0=sgpr(tmpSgpr), src1=vgpr(tmp), comment="scale%s: partition offset"%tc))
@@ -1091,12 +1094,12 @@ def _applyScaleWavePartitionLROffset(module, writer, kernel, tileInfo, waveId):
 def lraTileAssignmentScaleSwizzled(writer, kernel):
   module = Module()
 
+  if not kernel["ProblemType"].get("MXBlockA", 0) and not kernel["ProblemType"].get("MXBlockB", 0):
+    module.addComment0("Scale LR tile assignment: skipped (no MX block scaling)")
+    return module
+
   mxsaTileInfo = writer.states.mxsa.tileInfo
   mxsbTileInfo = writer.states.mxsb.tileInfo
-
-  if mxsaTileInfo.mxBlock == 0 or mxsbTileInfo.mxBlock == 0:
-    module.addComment0("Scale LR offsets: skipped (no MX block scaling)")
-    return module
 
   module.addComment0("LR Offset Calculation for Scale Tensors")
 
@@ -1127,6 +1130,17 @@ def lraTileAssignmentScaleSwizzled(writer, kernel):
 
   module.add(SMovB32(dst=sgpr(tmpSgpr), src=hex(writer.ldsStartOffsetMXSB), comment="scale: LDS offset for B scale"))
   module.add(VAddU32(dst=vgpr(mxsbTileInfo.sharedVgprLROffset[0]), src0=vgpr(mxsbTileInfo.sharedVgprLROffset[0]), src1=sgpr(tmpSgpr), comment="scaleB: +=LDS offset"))
+
+  # Init scale LR swap VGPRs here, after the LR offsets are fully computed.
+  # (Must NOT be done in localReadDTLInitCommonSwapVgpr, which runs before this function.)
+  module.add(SMovB32(dst=sgpr(tmpSgpr), src=writer.ldsTotalSize, comment="scale: total LDS size for swap"))
+  for tileInfo in [mxsaTileInfo, mxsbTileInfo]:
+    for i in range(len(tileInfo.sharedVgprLROffset)):
+      vgprId     = tileInfo.sharedVgprLROffset[i]
+      vgprSwapId = tileInfo.sharedVgprLROffsetSwap[i]
+      module.add(VAddU32(dst=vgpr(vgprSwapId), src0=vgpr(vgprId), src1=sgpr(tmpSgpr), comment="scale%s: LR swap"%tileInfo.tc))
+      module.add(VXorB32(dst=vgpr(vgprSwapId), src0=vgpr(vgprId), src1=vgpr(vgprSwapId),  comment="scale%s: LR swap"%tileInfo.tc))
+
   writer.sgprPool.checkIn(tmpSgpr)
 
   return module
@@ -1139,6 +1153,10 @@ def lraTileAssignmentScaleSwizzled(writer, kernel):
 # global read offset (from SRD) and the LDS write offset (from M0).
 def globalReadDoScaleSubtile(tc, writer, kernel):
   module = Module()
+
+  if not kernel["ProblemType"].get("MXBlockA", 0) and not kernel["ProblemType"].get("MXBlockB", 0):
+    return module
+
   tileInfo = writer.states.mxsa.tileInfo if tc == 'MXSA' else writer.states.mxsb.tileInfo
 
   if tileInfo.mxBlock == 0:
@@ -1191,6 +1209,9 @@ def emitSubtileScaleDsRead(tc, writer, kernel, subtileId):
 
 def localReadDoScaleSubtile(tc, writer, kernel):
   module = Module()
+
+  if not kernel["ProblemType"].get("MXBlockA", 0) and not kernel["ProblemType"].get("MXBlockB", 0):
+    return module
 
   tileInfo = writer.states.mxsa.tileInfo if tc == 'MXSA' else writer.states.mxsb.tileInfo
 
@@ -1252,6 +1273,7 @@ def emitSubtileBufferLoad(tc, writer, kernel, subtileId):
     useSgpr = subtileInfo.useSgpr
     soffset = sgpr(regList.regValues[0]) if len(regList) > 0 and useSgpr else 0
     voff = tileInfo.sharedVgprGROffset[i] if useSgpr or len(regList) == 0 else regList.regValues[i]
+    #module.addComment("Use sgpr: %u, %s"%(useSgpr, str(regList.regValues)))
     module.add(BufferLoadB128(dst=None, vaddr=vgpr(voff), saddr=sgpr("Srd%s"%tc, 4), soffset=soffset, mubuf=mubuf, comment="grBaseId = %u, i= %u"%(grBaseId , i)))
 
   return module
@@ -1528,7 +1550,7 @@ def emitMfmaInstruction(writer, kernel, vgprTileA, vgprTileB, vgprTileC, vgprTil
     else:
       # Fallback: hardcoded scale 0x80 (scale=2.0 for all elements)
       tmpVgprScale = writer.vgprPool.checkOut(1)
-      module.add(VMovB32(dst=vgpr(tmpVgprScale), src=hex(0x80808080), comment="hardcoded scale 0x80"))
+      module.add(VMovB32(dst=vgpr(tmpVgprScale), src=hex(0x7f7f7f7f), comment="hardcoded scale 0x80"))
       module.add(MXMFMAInstruction(instType=InstType.INST_F4, accType=InstType.INST_F32, variant=[16,16,miK,1], \
                                    acc=dAccAlias(vgprDStart,opDSize), \
                                    a=aOperand, \
@@ -1560,12 +1582,12 @@ def emitMfmaCode(writer, kernel):
   btileInfo = writer.states.b.tileInfo
   dtileInfo = writer.states.d.tileInfo
 
-  mxsatileInfo = writer.states.mxsa.tileInfo
-  mxsbtileInfo = writer.states.mxsb.tileInfo
+  mxsatileInfo = writer.states.mxsa.tileInfo if kernel["ProblemType"].get("MXBlockA", 0) > 0 else None
+  mxsbtileInfo = writer.states.mxsb.tileInfo if kernel["ProblemType"].get("MXBlockB", 0) > 0 else None
 
   # Use loaded scale VGPRs when allocated; matches localReadDoScaleSubtile guard
-  hasScaleA = atileInfo.mxBlock > 0 and len(atileInfo.scaleVgprTiles) > 0
-  hasScaleB = btileInfo.mxBlock > 0 and len(btileInfo.scaleVgprTiles) > 0
+  #hasScaleA = atileInfo.mxBlock > 0 and len(atileInfo.scaleVgprTiles) > 0
+  #hasScaleB = btileInfo.mxBlock > 0 and len(btileInfo.scaleVgprTiles) > 0
 
   for mmak in range(atileInfo.localMMATileGrid[1]):
     for mma1 in range(btileInfo.localMMATileGrid[0]):
@@ -1575,21 +1597,29 @@ def emitMfmaCode(writer, kernel):
         dtiles = dtileInfo.vgprTiles[mma0 + mma1 * dtileInfo.localMMATileGrid[0]]
 
 
+        if mxsatileInfo != None and mxsbtileInfo != None:
+          mxsaId0, mxsaId1 = mxsatileInfo.getLocalSubtileIdFromMMATile(mma0, mmak)
+          mxsbId0, mxsbId1 = mxsbtileInfo.getLocalSubtileIdFromMMATile(mma1, mmak)
+          mxsaLinearId = mxsatileInfo.getLocalSubtileLinearId(mxsaId0, mxsaId1)
+          mxsbLinearId = mxsbtileInfo.getLocalSubtileLinearId(mxsbId0, mxsbId1)
 
-        mxsaId0, mxsaId1 = mxsatileInfo.getLocalSubtileIdFromMMATile(mma0, mmak)
-        mxsbId0, mxsbId1 = mxsbtileInfo.getLocalSubtileIdFromMMATile(mma1, mmak)
-        mxsaLinearId = mxsatileInfo.getLocalSubtileLinearId(mxsaId0, mxsaId1)
-        mxsbLinearId = mxsbtileInfo.getLocalSubtileLinearId(mxsbId0, mxsbId1)
+          scaleAVgpr = mxsatileInfo.vgprTiles[4 * mxsaLinearId].regList.regValues[0] if mxsatileInfo.mxBlock else -1
+          scaleBVgpr = mxsbtileInfo.vgprTiles[4 * mxsbLinearId].regList.regValues[0] if mxsbtileInfo.mxBlock else -1
 
-        scaleAVgpr = mxsatileInfo.vgprTiles[4 * mxsaLinearId].regList.regValues[0] if mxsatileInfo.mxBlock else -1
-        scaleBVgpr = mxsbtileInfo.vgprTiles[4 * mxsbLinearId].regList.regValues[0] if mxsbtileInfo.mxBlock else -1
+          _mma0 = mma0 % 2
+          _mma1 = mma1 % 2
+          _mmak = mmak % 2
 
-        sAsel = mma0 + 2 * mmak
-        sBsel = mma1 + 2 * mmak
+          sAsel = _mma0 + 2 * _mmak
+          sBsel = _mma1 + 2 * _mmak
+        else:
+          scaleAVgpr = -1
+          scaleBVgpr = -1
+          sAsel = sBsel = 0
 
         module.add(emitMfmaInstruction(writer, kernel, atiles, btiles, dtiles, dtiles,
                                        scaleAVgpr=scaleAVgpr, scaleBVgpr=scaleBVgpr, scaleAsel=sAsel, scaleBsel=sBsel,
-                                       comment="Emit MMFA code for MMA tiles C[%u, %u] += A[%u, %u] * B[%u, %u]"%(mma0, mma1, mma0, mmak, mmak, mma1)))
+                                       comment="Emit MMFA code for MMA tiles C[%u, %u] += A[%u, %u] * B[%u, %u] sA = %u, sB = %u"%(mma0, mma1, mma0, mmak, mmak, mma1, sAsel, sBsel)))
 
   return module
 
@@ -1614,37 +1644,48 @@ def mainLoopImpl(writer, kernel, isNLL = False):
   if not isNLL:
     module.add(globalReadDoSubtile('A', writer, kernel))
     module.add(globalReadDoSubtile('B', writer, kernel))
-    # Scale GR: load scale data from global to LDS (non-DTL)
-    module.add(globalReadDoScaleSubtile('MXSA', writer, kernel))
-    module.add(globalReadDoScaleSubtile('MXSB', writer, kernel))
+    if kernel["ProblemType"].get("MXBlockA", 0) and kernel["ProblemType"].get("MXBlockB", 0):
+      # Scale GR: load scale data from global to LDS (non-DTL)
+      pass
+      module.add(globalReadDoScaleSubtile('MXSA', writer, kernel))
+      module.add(globalReadDoScaleSubtile('MXSB', writer, kernel))
     module.add(SWaitCnt(dscnt=-1, vlcnt=0, vscnt=-1, comment="Wait for all subtile GRs to complete"))
     module.add(SBarrier(comment=""))
 
   module.add(localReadDoSubtile('A', writer, kernel))
   module.add(localReadDoSubtile('B', writer, kernel))
-  # Scale LR: load scale data from LDS to VGPRs
-  module.add(localReadDoScaleSubtile('MXSA', writer, kernel))
-  module.add(localReadDoScaleSubtile('MXSB', writer, kernel))
+  if kernel["ProblemType"].get("MXBlockA", 0) and kernel["ProblemType"].get("MXBlockB", 0):
+    # Scale LR: load scale data from LDS to VGPRs
+    pass
+    module.add(localReadDoScaleSubtile('MXSA', writer, kernel))
+    module.add(localReadDoScaleSubtile('MXSB', writer, kernel))
   module.add(SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for all subtile LRs to complete"))
 
   module.add(emitMfmaCode(writer, kernel))
   module.add(globalReadLDSBufferSwap('A', writer, kernel))
   module.add(globalReadLDSBufferSwap('B', writer, kernel))
 
-  module.add(globalReadLDSBufferSwap('MXSA', writer, kernel))
-  module.add(globalReadLDSBufferSwap('MXSB', writer, kernel))
+  if kernel["ProblemType"].get("MXBlockA", 0) and kernel["ProblemType"].get("MXBlockB", 0):
+    pass
+    module.add(globalReadLDSBufferSwap('MXSA', writer, kernel))
+    module.add(globalReadLDSBufferSwap('MXSB', writer, kernel))
 
   module.add(localReadLDSBufferSwap('A', writer, kernel))
   module.add(localReadLDSBufferSwap('B', writer, kernel))
 
-  module.add(localReadLDSBufferSwap('MXSA', writer, kernel))
-  module.add(localReadLDSBufferSwap('MXSB', writer, kernel))
+
+  if kernel["ProblemType"].get("MXBlockA", 0) and kernel["ProblemType"].get("MXBlockB", 0):
+    pass
+    module.add(localReadLDSBufferSwap('MXSA', writer, kernel))
+    module.add(localReadLDSBufferSwap('MXSB', writer, kernel))
 
   module.add(globalReadPtrUpdates('A', writer, kernel))
   module.add(globalReadPtrUpdates('B', writer, kernel))
-  # Scale SRD pointer updates
-  module.add(globalReadScalePtrUpdates('MXSA', writer, kernel))
-  module.add(globalReadScalePtrUpdates('MXSB', writer, kernel))
+  if kernel["ProblemType"].get("MXBlockA", 0) and kernel["ProblemType"].get("MXBlockB", 0):
+    # Scale SRD pointer updates
+    pass
+    module.add(globalReadScalePtrUpdates('MXSA', writer, kernel))
+    module.add(globalReadScalePtrUpdates('MXSB', writer, kernel))
 
   module.add(SSubU32(dst=sgpr("LoopCounterL"), src0=sgpr("LoopCounterL"), src1=1))
   module.add(SCmpEQU32(src0=sgpr("LoopCounterL"), src1=0))
