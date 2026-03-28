@@ -4017,7 +4017,7 @@ class KernelWriterAssembly(KernelWriter):
               idx = indices[i]
               if (idx in kernel["ProblemType"]["IndicesSummation"]):
                 sizeL = self.sizeRef(indices[0])
-                module.add(SAddU32(dst=sgpr(stmp+0), src0=sizeL, src1=(mxSwizzleSize1 - 1), comment="sizeL + %u - 1")%mxSwizzleSize1)
+                module.add(SAddU32(dst=sgpr(stmp+0), src0=sizeL, src1=(mxSwizzleSize1 - 1), comment="sizeL + %u - 1"%mxSwizzleSize1))
                 module.add(SLShiftRightB32(dst=sgpr(stmp+0), src=sgpr(stmp+0), shiftHex=log2(mxSwizzleSize1), comment="roundup(size/%u)"%mxSwizzleSize1))
                 module.add(SLShiftLeftB32(dst=sgpr(stmp+0), src=sgpr(stmp+0), shiftHex=log2(mxSwizzleSize1//mxBlock), \
                                           comment="roundup(size/%u) * ((%u*%u)/%u)"%(mxSwizzleSize0, mxSwizzleSize1, mxSwizzleSize1, mxBlock)))
