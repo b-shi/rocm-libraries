@@ -4022,7 +4022,7 @@ class KernelWriterAssembly(KernelWriter):
                 module.add(SLShiftLeftB32(dst=sgpr(stmp+0), src=sgpr(stmp+0), shiftHex=log2((mxSwizzleSize0*mxSwizzleSize1)//mxBlock), \
                                           comment="roundup(size/%u) * ((%u*%u)/%u)"%(mxSwizzleSize1, mxSwizzleSize0, mxSwizzleSize1, mxBlock)))
                 module.addModuleAsFlatItems(self.s_mul_u64_u32(sgpr(tileStart), sgpr(tileStart+1), sgpr(tileStart+0), \
-                          sgpr(stmp+0), comment="tlu=0, MX pre shuffled: * (roundup(sizeL/%u) * ((%u*%u)/%u))"%(mxSwizzleSize1, mxSwizzleSize0, mxSwizzleSize1, mxBlock)))
+                          sgpr(stmp+0), comment="tlu=0, MX pre shuffled: * (roundup(sizeL/%u) * (%u/%u)"%(mxSwizzleSize1, mxSwizzleSize1, mxBlock)))
           else:
             module.addModuleAsFlatItems(self.s_mul_u64_u32(sgpr(tileStart), sgpr(tileStart+1), sgpr(tileStart+0), \
                       strideF, comment="tlu=0, scaled tile-offset by stride"))
