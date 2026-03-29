@@ -3761,11 +3761,12 @@ class KernelWriter(metaclass=abc.ABCMeta):
     module.add(skComponent.preLoop(self, kernel))
 
     # Should check for is swizzled instead of usesubtileimpl
-    if kernel["ProblemType"]["MXBlockA"] and kernel["ProblemType"]["MXBlockA"] and kernel["UseSubtileImpl"]:  
+    # TODO: Move this calculation to host-side?
+    if kernel["ProblemType"]["MXBlockA"] and kernel["ProblemType"]["MXBlockA"] and kernel["UseSubtileImpl"]:
       module.addComment("Scale StridesMXSA by 32")
       module.add(SLShiftLeftB32(sgpr("StridesMXSA"), 5, sgpr("StridesMXSA")))
       module.add(SLShiftLeftB32(sgpr("StridesMXSB"), 5, sgpr("StridesMXSB")))
-    
+
     # Open persistent loop
     loopComponent = Component.PersistentLoop.find(self)
 
@@ -3781,6 +3782,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
 
     atileInfo = self.states.a.tileInfo
     btileInfo = self.states.b.tileInfo
+    # TODO: Need corresponding ctileInfo for GSU/StreamK
     dtileInfo = self.states.d.tileInfo
     mxsatileInfo = self.states.mxsa.tileInfo if kernel["ProblemType"].get("MXBlockA", 0) else None
     mxsbtileInfo = self.states.mxsb.tileInfo if kernel["ProblemType"].get("MXBlockB", 0) else None
