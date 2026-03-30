@@ -27,7 +27,6 @@ from gpu_test_helpers import (
     generate_export_epilogue,
     print_offset_grid,
 )
-
 from Tensile.Components.SubtileBasedKernel import graTileAssignment
 
 EXPORT_LOAD_PARAMS = (
