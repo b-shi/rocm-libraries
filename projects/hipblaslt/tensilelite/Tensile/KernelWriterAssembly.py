@@ -13428,12 +13428,19 @@ class KernelWriterAssembly(KernelWriter):
       numElementsPerBatch = ss.cfg.numElementsPerBatchLimitedBySgprs
 
     # TODO: Which of DataType or DestDataType is in a better sense? 0114: Check Using DestDataType + HSS
-    if (kernel["ProblemType"]["DataType"].isHalf() or kernel["ProblemType"]["DataType"].isBFloat16()):
+    destType = kernel["ProblemType"]["DestDataType"]
+    srcType  = kernel["ProblemType"]["DataType"]
+    if (srcType.isHalf() or srcType.isBFloat16() or destType.isHalf() or destType.isBFloat16()):
       # only do an even number of halves - since these share hi/lo pieces of some registers?
       if numElementsPerBatch > 1:
         numElementsPerBatch = int(numElementsPerBatch/2)*2
-        # UseSubtileImpl paired-store: pairs are always consecutive (elementIdx % 2),
-        # so an even batch boundary is sufficient — guaranteed by the /2*2 rounding above.
+        # UseSubtileImpl paired-store: batch must be aligned to MIWaveTile[0]
+        # (the number of M-tiles per N-column) so that batch boundaries don't
+        # split sba=0/sba=1 pairs within an N-column.
+        if kernel.get("UseSubtileImpl") and kernel["MIWaveTile"][0] > 1:
+          miwt0 = kernel["MIWaveTile"][0]
+          if numElementsPerBatch >= miwt0:
+            numElementsPerBatch = (numElementsPerBatch // miwt0) * miwt0
       # dot2: no this constraint
       elif not kernel["EnableMatrixInstruction"] and not kernel["UseDotInstruction"]:
         # The globalWriteBatch routine below can't handle odd elements per batch
