@@ -8,9 +8,10 @@ from Tensile.Components.SubtileBasedKernel import emitMfmaInstruction
 from Tensile.Components.SubtileBasedKernel import emitSingleDsRead
 from Tensile.Components.SubtileBasedKernel import emitSingleBufferLoad
 from Tensile.Components.SubtileBasedKernel import globalReadPtrUpdates, globalReadLDSBufferSwap, localReadLDSBufferSwap
+from Tensile.Components.SubtileBasedKernel import globalReadDoScaleSubtile, localReadDoScaleSubtile, globalReadScalePtrUpdates, emitSubtileScaleDsRead
 from rocisa.code import Module, Label
 from rocisa.instruction import SWaitCnt, SBarrier, SCmpEQU32, SCmpLeU32, SCBranchSCC1, MFMAInstruction, \
-    GlobalReadInstruction, LocalReadInstruction
+    MXMFMAInstruction, GlobalReadInstruction, LocalReadInstruction, DSLoadB32
 from rocisa.container import sgpr
 
 
@@ -971,8 +972,8 @@ class SubtileBasedScheduler:
 
     # Allocate totalVGPRTiles vpgrTile
     def allocVgprTiles(self, writer):
-        """Allocate a shared VGPR tile array for A and B, indexed by the scheduler's vgprTileId."""
-        
+        """Allocate a shared VGPR tile array for A and B, indexed by the scheduler's vgprTileId.
+        Also allocates scale VGPRs for MXSA/MXSB when MX block scaling is active."""
         self.vgprTiles = []
         mmaTileRegCount = int(math.ceil(self.tileInfoA.mmaTileRegCount))
         for _ in range(self.totalVGPRTiles):
@@ -983,6 +984,7 @@ class SubtileBasedScheduler:
                     tile.append(vstart + k)
             self.vgprTiles.append(tile)
 
+
     def deallocVgprTiles(self, writer):
         """Deallocate VGPR tiles allocated by allocVgprTiles."""
         for tile in self.vgprTiles:
@@ -992,22 +994,47 @@ class SubtileBasedScheduler:
                     pool.checkIn(val)
         self.vgprTiles = []
 
+
     def emitMFMA(self, writer, kernel, op, dtileInfo):
         """Emit MFMA instructions for a single MFMAOp."""
         module = Module()
+        mxsaTileInfo = writer.states.mxsa.tileInfo if kernel["ProblemType"].get("MXBlockA", 0) else None
+        mxsbTileInfo = writer.states.mxsb.tileInfo if kernel["ProblemType"].get("MXBlockB", 0) else None
+        hasScale = mxsaTileInfo is not None and mxsaTileInfo.mxBlock > 0
+
         for (a, b) in op.subtiles:
             aTile = self.vgprTiles[op.vgprTileMapA[a]]
             bTile = self.vgprTiles[op.vgprTileMapB[b]]
             dTile = dtileInfo.vgprTiles[a + b * dtileInfo.localMMATileGrid[0]]
+
+            if hasScale:
+                # Mirror the non-scheduler emitMfmaCode: look up scale VGPRs via vgprTiles.
+                mxsaId0, mxsaId1 = mxsaTileInfo.getLocalSubtileIdFromMMATile(a, op.subIterK)
+                mxsbId0, mxsbId1 = mxsbTileInfo.getLocalSubtileIdFromMMATile(b, op.subIterK)
+                mxsaLinearId = mxsaTileInfo.getLocalSubtileLinearId(mxsaId0, mxsaId1)
+                mxsbLinearId = mxsbTileInfo.getLocalSubtileLinearId(mxsbId0, mxsbId1)
+                scaleAVgpr = mxsaTileInfo.vgprTiles[4 * mxsaLinearId].regList.regValues[0]
+                scaleBVgpr = mxsbTileInfo.vgprTiles[4 * mxsbLinearId].regList.regValues[0]
+                sAsel = (a % 2) + 2 * (op.subIterK % 2)
+                sBsel = (b % 2) + 2 * (op.subIterK % 2)
+            else:
+                scaleAVgpr = scaleBVgpr = -1
+                sAsel = sBsel = 0
+
             module.add(emitMfmaInstruction(
                 writer, kernel, aTile, bTile, dTile, dTile,
+                scaleAVgpr=scaleAVgpr, scaleBVgpr=scaleBVgpr,
+                scaleAsel=sAsel, scaleBsel=sBsel,
                 comment=f"MFMA C[{a},{b}] += A[{a},subIterK{op.subIterK}] * B[{b},subIterK{op.subIterK}]"))
 
-                
         return module
 
     def emitLR(self, writer, kernel, op):
-        """Emit LR (Local Read) ds_load instructions for a single LROp."""
+        """Emit LR (Local Read) ds_load instructions for a single LROp.
+        Scale LRs (DSLoadB32) are also emitted here and classified as OTHER_SLOT
+        by instructionSchedule — no MFMAs interleave with them, so the following
+        WaitLROp (s_waitcnt lgkmcnt=0) guarantees they complete before any MFMA
+        reads the scale VGPRs."""
         module = Module()
         for tA, vgprTileId in op.lrLoadA.items():
             dstTile = self.vgprTiles[vgprTileId]
@@ -1017,30 +1044,46 @@ class SubtileBasedScheduler:
             dstTile = self.vgprTiles[vgprTileId]
             module.add(emitSingleDsRead(
                 self.tileInfoB, tB, op.subIterK, dstTile))
+        # Scale data is constant within a K-iteration: load it once on the first
+        # subIterK (subIterK==0) only, not once per subIterK.
+        if op.subIterK == 0 and kernel["ProblemType"].get("MXBlockA", 0) and kernel["ProblemType"].get("MXBlockB", 0):
+            module.add(localReadDoScaleSubtile('MXSA', writer, kernel))
+            module.add(localReadDoScaleSubtile('MXSB', writer, kernel))
         return module
 
-    def emitWaitGR(self, inflightLoadsA, inflightLoadsB):
+    def emitWaitGR(self, inflightLoadsA, inflightLoadsB, hasScale=False):
         """Emit SWaitCnt for GR (buffer_load) based on inflight GR counts.
         WARNING: current algo won't work in all cases. TBD
 
         Args:
             inflightLoadsA: Number of A GR loads still inflight.
             inflightLoadsB: Number of B GR loads still inflight.
+            hasScale:       True when MX scale DTL loads are active (they complete
+                            at lgkmcnt/dscnt, so dscnt=0 is required after the barrier).
         """
         module = Module()
         grCnt = int(inflightLoadsA / self.tileInfoA.loadRatioGR) + \
                 int(inflightLoadsB / self.tileInfoB.loadRatioGR)
-        module.add(SWaitCnt(dscnt=-1, vlcnt=grCnt, vscnt=-1,
-                            comment=f"Wait GR: A={inflightLoadsA} B={inflightLoadsB} => vlcnt={grCnt}"))
+        # Scale DTL loads (buffer_load lds=True) complete at lgkmcnt (dscnt).
+        # Wait for both vmcnt (data GR) and lgkmcnt (scale DTL) before barrier.
+        dscnt = 0 if hasScale else -1
+        module.add(SWaitCnt(dscnt=dscnt, vlcnt=grCnt, vscnt=-1,
+                            comment=f"Wait GR: A={inflightLoadsA} B={inflightLoadsB} => vlcnt={grCnt}" +
+                                    (" dscnt=0 (scale DTL)" if hasScale else "")))
         return module
 
-    def emitGR(self, op):
+    def emitGR(self, writer, kernel, op):
         """Emit GR (Global Read) buffer_load instructions for a single GROp."""
         module = Module()
+        # A and B data loads
         for subtileList, tileInfo in [(op.subtileA, self.tileInfoA),
                                       (op.subtileB, self.tileInfoB)]:
             for sId0 in subtileList:
                 module.add(emitSingleBufferLoad(tileInfo, sId0, 0))
+        # Scale DTL loads after A/B (buffer_load lds=True → lgkmcnt)
+        if kernel["ProblemType"].get("MXBlockA", 0) and kernel["ProblemType"].get("MXBlockB", 0):
+            module.add(globalReadDoScaleSubtile('MXSA', writer, kernel))
+            module.add(globalReadDoScaleSubtile('MXSB', writer, kernel))
         return module
 
     def _emitSubIterK(self, writer, kernel, pss, dus):
@@ -1048,18 +1091,25 @@ class SubtileBasedScheduler:
         dtileInfo = writer.states.d.tileInfo
         module = Module()
         module.addComment0(f"Partition {pss.partitionId}: subIterK={dus.subIterK}")
+        hasScale = (kernel["ProblemType"].get("MXBlockA", 0) and
+                    kernel["ProblemType"].get("MXBlockB", 0))
         for op in dus.ops:
             if isinstance(op, GROp):
-                module.add(self.emitGR(op))
+                module.add(self.emitGR(writer, kernel, op))
             elif isinstance(op, GR_INCOp):
                 module.add(globalReadPtrUpdates('A', writer, kernel))
                 module.add(globalReadPtrUpdates('B', writer, kernel))
                 module.add(globalReadLDSBufferSwap('A', writer, kernel))
                 module.add(globalReadLDSBufferSwap('B', writer, kernel))
+                if hasScale:
+                    module.add(globalReadLDSBufferSwap('MXSA', writer, kernel))
+                    module.add(globalReadLDSBufferSwap('MXSB', writer, kernel))
+                    module.add(globalReadScalePtrUpdates('MXSA', writer, kernel))
+                    module.add(globalReadScalePtrUpdates('MXSB', writer, kernel))
             elif isinstance(op, MFMAOp):
                 module.add(self.emitMFMA(writer, kernel, op, dtileInfo))
             elif isinstance(op, WaitGROp):
-                module.add(self.emitWaitGR(op.inflightLoadsA, op.inflightLoadsB))
+                module.add(self.emitWaitGR(op.inflightLoadsA, op.inflightLoadsB, hasScale))
             elif isinstance(op, WaitLROp):
                 module.add(SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for LR to complete"))
             elif isinstance(op, SyncOp):
@@ -1067,6 +1117,9 @@ class SubtileBasedScheduler:
             elif isinstance(op, LR_INCOp):
                 module.add(localReadLDSBufferSwap('A', writer, kernel))
                 module.add(localReadLDSBufferSwap('B', writer, kernel))
+                if hasScale:
+                    module.add(localReadLDSBufferSwap('MXSA', writer, kernel))
+                    module.add(localReadLDSBufferSwap('MXSB', writer, kernel))
             elif isinstance(op, LROp):
                 module.add(self.emitLR(writer, kernel, op))
             elif isinstance(op, SkipOp):
@@ -1088,7 +1141,7 @@ class SubtileBasedScheduler:
           - MFMA instruction order is preserved
           - Non-MFMA instruction order is preserved
           - Insert 1 MFMA between each LR (ds_read) instruction
-          - Insert 4 MFMAs between the last LR and the WAIT_LR (SWaitCnt dscnt)
+          - Insert 3 MFMAs between the last LR and the WAIT_LR (SWaitCnt dscnt)
           - Insert 1 MFMA between WAIT_LR and SYNC (SBarrier)
           - No MFMAs between an m0 update and its buffer_load (they are a pair)
           - Remaining MFMAs are spread evenly between buffer_load pairs
@@ -1097,8 +1150,9 @@ class SubtileBasedScheduler:
         if not items:
             return module
 
-        mfmas = [x for x in items if isinstance(x, MFMAInstruction)]
-        others = [x for x in items if not isinstance(x, MFMAInstruction)]
+        isMFMA = lambda x: isinstance(x, (MFMAInstruction, MXMFMAInstruction))
+        mfmas = [x for x in items if isMFMA(x)]
+        others = [x for x in items if not isMFMA(x)]
 
         if not mfmas or not others:
             return module
@@ -1127,6 +1181,11 @@ class SubtileBasedScheduler:
 
         def classify(slot):
             first = slot[0]
+            # DSLoadB32 = scale LR (ds_read_b32): treat as OTHER_SLOT so no MFMAs
+            # interleave with it. Scale VGPRs must complete (via WaitLROp) before
+            # subsequent MFMAs read them; interleaving would create a race condition.
+            if isinstance(first, DSLoadB32):
+                return OTHER_SLOT
             if isinstance(first, LocalReadInstruction):
                 return LR_SLOT
             if isinstance(first, SWaitCnt):
@@ -1159,8 +1218,8 @@ class SubtileBasedScheduler:
                 mfmasAfter[si] = min(1, len(mfmas) - mi)
                 mi += mfmasAfter[si]
             elif st == LR_SLOT and nextSt == WAITLR_SLOT:
-                # 4 MFMAs between last LR and WAIT_LR
-                mfmasAfter[si] = min(4, len(mfmas) - mi)
+                # 3 MFMAs between last LR and WAIT_LR
+                mfmasAfter[si] = min(3, len(mfmas) - mi)
                 mi += mfmasAfter[si]
             elif st == LR_SLOT and nextSt != LR_SLOT and nextSt != WAITLR_SLOT:
                 # Last LR but no WAIT_LR follows — still insert 1

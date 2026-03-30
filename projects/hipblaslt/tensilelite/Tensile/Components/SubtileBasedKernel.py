@@ -167,12 +167,6 @@ class TileInfo:
 
   # MX scale fields (set for A/B when mxBlock > 0, else 0)
   mxBlock: int = 0
-  scaleBpe: int = 0
-  scaleMMATileK: int = 0
-  scaleDepthU: int = 0
-  scaleLoadWidth: int = 0
-  scaleBlockSize: int = 0
-  numLRScalePerSubtile: int = 0
 
   def __init__(self, tc, kernel):
     isAB = tc in ['A', 'B']
@@ -311,36 +305,9 @@ class TileInfo:
       # Scale tensor geometry (MX block scaling)
       mxBlockKey = "MXBlock%s"%_tc
       self.mxBlock = kernel["ProblemType"].get(mxBlockKey, 0)
-      if self.mxBlock > 0:
-        self.scaleBpe = 1  # UE8M0 = 1 byte
-        self.scaleMMATileK = mmaTileShape1 // self.mxBlock
-        self.scaleDepthU = depthU // self.mxBlock
-        scaleDepthUBytes = self.scaleDepthU * self.scaleBpe
-        self.scaleLoadWidth = 16     # GR: DTL buffer_load_b128
-        self.scaleLRReadWidth = 4    # LR: ds_read_b32
-        # scaleBlockSize: LR lane mapping decomposition (based on LR read width, not GR load width)
-        self.scaleBlockSize = scaleDepthUBytes // self.scaleLRReadWidth if scaleDepthUBytes >= self.scaleLRReadWidth else 1
-        MT0 = self.globalMMATileGrid[0] * mmaTileShape0
-        # Thread divisibility: total scale bytes must be a multiple of the GR load width
-        totalScaleBytes = MT0 * self.scaleDepthU * self.scaleBpe
-        assert totalScaleBytes % self.scaleLoadWidth == 0, \
-          "Scale bytes (%d) must be divisible by scaleLoadWidth (%d)" % (totalScaleBytes, self.scaleLoadWidth)
-        self.numLRScalePerSubtile = 1  # 1 VGPR; MMA tile selection via ds_offset at emit time
-      else:
-        self.scaleBpe = 0
-        self.scaleMMATileK = 0
-        self.scaleDepthU = 0
-        self.scaleLoadWidth = 0
-        self.scaleLRReadWidth = 0
-        self.scaleBlockSize = 0
-        self.numLRScalePerSubtile = 0
 
-      # Scale VGPR buffers for MFMA scale inputs: ceil(localMMATileGrid[0] / 2) VGPRs
-      # Each 32-bit VGPR holds 4 E8M0 scale bytes for a 32-row M-band
+      # Scale VGPR buffers populated by the scheduler for MFMA scale inputs
       self.scaleVgprTiles = []
-      # Scale LDS base offset (set during lraTileAssignmentScaleSwizzled)
-      self.scaleLdsBase = 0
-      self.scaleLdsSize = 0
 
       # Map subtiles to GR
       for sId0 in range(self.localSubtileGrid[0]):
@@ -495,14 +462,6 @@ class TileInfo:
         for k in range(numDword):
           self.vgprTiles[-1].append(vstart + k)
 
-  def allocScaleVgprTiles(self, writer, kernel):
-    if self.mxBlock == 0:
-      return
-    numScaleVgprs = math.ceil(self.localMMATileGrid[0] / 2)
-    self.scaleVgprTiles = []
-    for i in range(numScaleVgprs):
-      self.scaleVgprTiles.append(writer.vgprPool.checkOut(1))
-
   def deallocOffsetRegisters(self, writer, kernel):
     # checkin GR registers
     for voff in self.sharedVgprGROffset:
@@ -518,11 +477,6 @@ class TileInfo:
       regPool = reg.regPool
       for val in reg.regValues:
         regPool.checkIn(val)
-
-  def deallocScaleVgprTiles(self, writer, kernel):
-    for sv in self.scaleVgprTiles:
-      writer.vgprPool.checkIn(sv)
-    self.scaleVgprTiles = []
 
   def deallocVgprTileRegisters(self, writer, kernel):
     numMMATilesPerReg = max(1, int(1 // self.mmaTileRegCount))

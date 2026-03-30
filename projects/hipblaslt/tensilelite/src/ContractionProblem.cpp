@@ -1257,6 +1257,8 @@ namespace TensileLite
 
     size_t ContractionProblemGemm::flopsPerMac() const
     {
+        // 1 multiply + 1 add = 2 FLOPs per element, regardless of packing.
+        // Packing (e.g. 2 for FP4) describes storage density, not operation count.
         return 2;
     }
 
