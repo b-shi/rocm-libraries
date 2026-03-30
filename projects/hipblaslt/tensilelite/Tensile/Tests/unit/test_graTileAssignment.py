@@ -260,18 +260,37 @@ class TestGraTileAssignmentGPU:
 
 # ---- Scale GR tests ----
 
+# Scale GR needs StridesMXSA/StridesMXSB SGPRs loaded from kernel args.
+SCALE_EXPORT_LOAD_PARAMS = (
+    (4, 2, 0x00, "output_ptr"),
+    ("StrideA0I", 1, 0x08, "strideA"),
+    ("StrideB1J", 1, 0x0c, "strideB"),
+    ("StridesMXSA", 1, 0x10, "strideMXSA"),
+    ("StridesMXSB", 1, 0x14, "strideMXSB"),
+)
+
+SCALE_EXPORT_ARGS = (
+    ("output_ptr",  8, "global_buffer", "u32"),
+    ("strideA",     4, "by_value",      "u32"),
+    ("strideB",     4, "by_value",      "u32"),
+    ("strideMXSA",  4, "by_value",      "u32"),
+    ("strideMXSB",  4, "by_value",      "u32"),
+)
+
+
 def generate_gra_scale_asm(cfg):
-    """Run graTileAssignmentScaleSwizzled and return (asm, writer, tileInfoA/B, mxsa/mxsbTileInfo, kernel)."""
+    """Run graTileAssignmentScaleSwizzled and return (asm, writer, tileInfoA/B, kernel)."""
     writer, kernel, tileInfoA, tileInfoB = create_writer(cfg)
     init_rocisa()
 
-    writer.sgprPool.checkOut(12)
+    writer.sgprPool.checkOut(14)
     writer.sgprs["StrideA0I"] = 10
     writer.sgprs["StrideB1J"] = 11
+    writer.sgprs["StridesMXSA"] = 12
+    writer.sgprs["StridesMXSB"] = 13
     tileInfoA.allocOffsetRegisters(writer, kernel)
     tileInfoB.allocOffsetRegisters(writer, kernel)
 
-    # Allocate offset registers for MXSA/MXSB tileInfo (scale offset VGPRs)
     mxsaTileInfo = getattr(writer.states.mxsa, 'tileInfo', None)
     mxsbTileInfo = getattr(writer.states.mxsb, 'tileInfo', None)
     if mxsaTileInfo:
@@ -279,27 +298,49 @@ def generate_gra_scale_asm(cfg):
     if mxsbTileInfo:
         mxsbTileInfo.allocOffsetRegisters(writer, kernel)
 
-    prologue = generate_load_params(EXPORT_LOAD_PARAMS)
+    prologue = generate_load_params(SCALE_EXPORT_LOAD_PARAMS)
     module = graTileAssignmentScaleSwizzled(writer, kernel)
     gra_asm = f"{prologue}\n{module}"
     return gra_asm, writer, tileInfoA, tileInfoB, kernel
 
 
-def compute_expected_scale_gr_offset(thread_id, cfg, tileInfo):
-    """Python reference for scale GR offset (DTL linear access)."""
-    # DTL: grOffset = serial * scaleLoadWidth
-    return [thread_id * tileInfo.scaleLoadWidth]
+def export_scale_register(writer, test_asm, export_reg, is_sgpr, cfg, tmp_path, label):
+    """Export a VGPR from a scale GR test kernel (includes scale stride args)."""
+    epilogue, allocated = generate_export_epilogue(writer, export_reg, is_sgpr)
+    kernel_asm = generate_kernel_asm(f"{test_asm}\n{epilogue}", writer, SCALE_EXPORT_ARGS)
+    for v in allocated:
+        writer.vgprPool.checkIn(v)
+
+    raw = assemble_and_run(kernel_asm, tmp_path, label, NUM_THREADS * 4,
+                           scalars=(cfg.stride_a, cfg.stride_b,
+                                    cfg.stride_a, cfg.stride_b))
+    return struct.unpack(f"{NUM_THREADS}I", raw)
+
+
+def compute_expected_scale_gr_offset(thread_id, cfg, scaleTileInfo, tc):
+    """Python reference matching _graTileAssignmentScaleSwizzledCommon.
+
+    grOffset = (serial / numTPG) * strideBytes + (serial % numTPG) * loadWidthGR
+    """
+    loadWidth = scaleTileInfo.loadWidthGR
+    numTPG = (scaleTileInfo.subtileSize * scaleTileInfo.localSubtileGrid[1]) // loadWidth
+    stride = cfg.stride_a if tc == 'A' else cfg.stride_b
+    strideBytes = stride * scaleTileInfo.bpe
+    groupId = thread_id >> int(math.log2(numTPG))
+    colInGroup = thread_id & (numTPG - 1)
+    colOffset = colInGroup << (loadWidth.bit_length() - 1)
+    return [groupId * strideBytes + colOffset]
 
 
 SCALE_GR_TILE_CONFIGS = [
     # 2x2 configs
-    TileConfig(mt_a=256, mt_b=256, depth_u=64, stride_a=4096, stride_b=1024, mxblock=32),
-    TileConfig(mt_a=256, mt_b=256, depth_u=128, stride_a=4096, stride_b=1024, mxblock=32),
-    TileConfig(mt_a=96, mt_b=256, depth_u=64, stride_a=1024, stride_b=256, mxblock=32),
+    TileConfig(mt_a=256, mt_b=256, depth_u=64, stride_a=64, stride_b=64, mxblock=32),
+    TileConfig(mt_a=256, mt_b=256, depth_u=128, stride_a=128, stride_b=128, mxblock=32),
+    TileConfig(mt_a=96, mt_b=256, depth_u=64, stride_a=64, stride_b=64, mxblock=32),
     # 1x4 config
-    TileConfig(mt_a=80, mt_b=64, depth_u=64, stride_a=1024, stride_b=256, mxblock=32),
+    TileConfig(mt_a=80, mt_b=64, depth_u=64, stride_a=64, stride_b=64, mxblock=32),
     # 4x1 config
-    TileConfig(mt_a=64, mt_b=80, depth_u=64, stride_a=1024, stride_b=256, mxblock=32),
+    TileConfig(mt_a=64, mt_b=80, depth_u=64, stride_a=64, stride_b=64, mxblock=32),
 ]
 
 
@@ -323,15 +364,14 @@ class TestGraTileAssignmentScaleGPU:
     def test_offset_a_scale(self, gra_scale_env):
         """Validate scale GR offset for matrix A (stored in MXSA sharedVgprGROffset[0])."""
         cfg = gra_scale_env.cfg
-        dataTileInfo = gra_scale_env.tileInfoA
         scaleTileInfo = getattr(gra_scale_env.writer.states.mxsa, 'tileInfo', None)
         assert scaleTileInfo is not None, "MXSA tileInfo not created"
         reg = scaleTileInfo.sharedVgprGROffset[0]
-        results = export_register(gra_scale_env.writer, gra_scale_env.gra_asm, reg, False,
-                                  cfg, gra_scale_env.tmp_path,
-                                  f"scaleGR_A_v{reg}_{cfg.label}")
+        results = export_scale_register(gra_scale_env.writer, gra_scale_env.gra_asm, reg, False,
+                                        cfg, gra_scale_env.tmp_path,
+                                        f"scaleGR_A_v{reg}_{cfg.label}")
         for tid in range(NUM_THREADS):
-            expected = compute_expected_scale_gr_offset(tid, cfg, dataTileInfo)
+            expected = compute_expected_scale_gr_offset(tid, cfg, scaleTileInfo, 'A')
             assert results[tid] == expected[0], \
                 f"[{cfg.label}] Scale A GR v{reg} tid={tid}: " \
                 f"got {results[tid]}, expected {expected[0]}"
@@ -339,15 +379,14 @@ class TestGraTileAssignmentScaleGPU:
     def test_offset_b_scale(self, gra_scale_env):
         """Validate scale GR offset for matrix B (stored in MXSB sharedVgprGROffset[0])."""
         cfg = gra_scale_env.cfg
-        dataTileInfo = gra_scale_env.tileInfoB
         scaleTileInfo = getattr(gra_scale_env.writer.states.mxsb, 'tileInfo', None)
         assert scaleTileInfo is not None, "MXSB tileInfo not created"
         reg = scaleTileInfo.sharedVgprGROffset[0]
-        results = export_register(gra_scale_env.writer, gra_scale_env.gra_asm, reg, False,
-                                  cfg, gra_scale_env.tmp_path,
-                                  f"scaleGR_B_v{reg}_{cfg.label}")
+        results = export_scale_register(gra_scale_env.writer, gra_scale_env.gra_asm, reg, False,
+                                        cfg, gra_scale_env.tmp_path,
+                                        f"scaleGR_B_v{reg}_{cfg.label}")
         for tid in range(NUM_THREADS):
-            expected = compute_expected_scale_gr_offset(tid, cfg, dataTileInfo)
+            expected = compute_expected_scale_gr_offset(tid, cfg, scaleTileInfo, 'B')
             assert results[tid] == expected[0], \
                 f"[{cfg.label}] Scale B GR v{reg} tid={tid}: " \
                 f"got {results[tid]}, expected {expected[0]}"

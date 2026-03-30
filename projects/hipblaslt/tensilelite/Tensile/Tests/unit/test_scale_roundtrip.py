@@ -12,8 +12,7 @@
 #   7. Export via global_store_dwordx4
 #   8. Verify strided 2D pattern matches expected
 #
-# TestScaleRoundtripGPU — GR -> LDS -> LR roundtrip:
-#   (xfail: LR wave partition has known bugs)
+# TestScaleRoundtripGPU — GR -> LDS -> LR roundtrip
 #
 # GR offset formula (production _graTileAssignmentScaleSwizzledCommon):
 #   grOffset = (serial / numTPG) * StridesMXS + (serial % numTPG) * loadWidthGR
@@ -385,7 +384,9 @@ def generate_roundtrip_kernel(cfg, tc):
     ptrHi = 5 if tc == 'A' else 7
 
     sizeMXSA, sizeMXSB = compute_lds_sizes(kernel)
-    scaleBase = 0 if tc == 'A' else sizeMXSA
+    # LR offset includes full ldsStartOffsetMXSA/B; subtract it to get
+    # the local position within our compact test LDS [ScaleA | ScaleB].
+    ldsBase = writer.ldsStartOffsetMXSA if tc == 'A' else writer.ldsStartOffsetMXSB
     lds_bytes = sizeMXSA + sizeMXSB
 
     vAddr = writer.vgprPool.checkOutAligned(2, 2, "addr", preventOverflow=False)
@@ -393,6 +394,10 @@ def generate_roundtrip_kernel(cfg, tc):
     vLrAdj = writer.vgprPool.checkOut(1, "lr_adj", preventOverflow=False)
     vByteOff = writer.vgprPool.checkOut(1, "byte_off", preventOverflow=False)
     sTmp = writer.sgprPool.checkOut(1, "tmp", preventOverflow=False)
+
+    # GR offset is linear (serial * 16), used for both global load and LDS write.
+    # For scale B, shift the LDS write by sizeMXSA so B doesn't overwrite A.
+    grLdsShift = 0 if tc == 'A' else sizeMXSA
 
     roundtrip_asm = f"""\
   // ---- Roundtrip for scale {tc} (DTL: 16-byte load/write) ----
@@ -402,11 +407,15 @@ def generate_roundtrip_kernel(cfg, tc):
   v_addc_co_u32 v{vAddr+1}, vcc, v{vAddr+1}, 0, vcc
   flat_load_dwordx4 v[{vData}:{vData+3}], v[{vAddr}:{vAddr+1}]
   s_waitcnt vmcnt(0) lgkmcnt(0)
-  ds_write_b128 v{grOffReg}, v[{vData}:{vData+3}]
+  v_add_u32 v{vLrAdj}, {grLdsShift}, v{grOffReg}
+  ds_write_b128 v{vLrAdj}, v[{vData}:{vData+3}]
   s_waitcnt lgkmcnt(0)
   s_barrier
-  s_mov_b32 s{sTmp}, {scaleBase}
+  // LR offset from production includes ldsStartOffsetMXS{tc}; subtract to get local pos
+  s_mov_b32 s{sTmp}, {ldsBase}
   v_sub_u32 v{vLrAdj}, v{lrOffReg}, s{sTmp}
+  // Add grLdsShift to align with where we wrote in LDS
+  v_add_u32 v{vLrAdj}, {grLdsShift}, v{vLrAdj}
   ds_read_u8 v{vData}, v{vLrAdj}
   s_waitcnt lgkmcnt(0)
   v_lshlrev_b32 v{vByteOff}, 2, v0
@@ -425,25 +434,24 @@ def generate_roundtrip_kernel(cfg, tc):
     return kernel_asm, writer, kernel, tileInfoA, tileInfoB, lds_bytes
 
 
-def compute_expected_roundtrip(cfg, tileInfoA, tileInfoB, input_data, tc, kernel):
+def compute_expected_roundtrip(cfg, writer, input_data, tc, kernel):
     """Compute expected scale byte for each thread after the roundtrip.
 
-    GR writes strided 2D pattern; LR reads from lrOffset - scaleBase.
+    GR writes linear pattern to LDS; LR reads from (lrOffset - ldsBase).
     """
-    tileInfo = tileInfoA if tc == 'A' else tileInfoB
-    otherTileInfo = tileInfoB if tc == 'A' else tileInfoA
+    scaleTileInfo = writer.states.mxsa.tileInfo if tc == 'A' else writer.states.mxsb.tileInfo
+    ldsBase = writer.ldsStartOffsetMXSA if tc == 'A' else writer.ldsStartOffsetMXSB
 
     sizeMXSA, sizeMXSB = compute_lds_sizes(kernel)
-    scaleBase = 0 if tc == 'A' else sizeMXSA
     scaleLdsSize = sizeMXSA if tc == 'A' else sizeMXSB
 
     expected = [0] * NUM_THREADS
     for T in range(NUM_THREADS):
-        lr_offset = compute_expected_scale_lr_offset(T, cfg, tileInfo, otherTileInfo)[0]
-        lds_pos = lr_offset - scaleBase
+        lr_offset = compute_expected_scale_lr_offset(T, scaleTileInfo, kernel, ldsBase)[0]
+        lds_pos = lr_offset - ldsBase
 
         assert 0 <= lds_pos < scaleLdsSize, \
-            f"Thread {T}: LDS pos {lds_pos} (lr={lr_offset}, base={scaleBase}) out of range [0, {scaleLdsSize})"
+            f"Thread {T}: LDS pos {lds_pos} (lr={lr_offset}, base={ldsBase}) out of range [0, {scaleLdsSize})"
 
         assert lds_pos < len(input_data), \
             f"Thread {T}: LDS pos {lds_pos} >= input size {len(input_data)}"
@@ -491,13 +499,11 @@ def build_and_run_roundtrip(cfg, tc, tmp_path, debug=False):
                                     lds_size=lds_bytes)
 
     results = struct.unpack(f"{NUM_THREADS}I", output_bytes)
-    expected = compute_expected_roundtrip(cfg, tileInfoA, tileInfoB, input_data, tc, kernel)
+    expected = compute_expected_roundtrip(cfg, writer, input_data, tc, kernel)
     return results, expected
 
 
 @pytest.mark.skipif(not HAS_HIP, reason="HIP Python bindings not available")
-@pytest.mark.xfail(reason="LR wave partition bugs: _applyScaleWavePartitionLROffset "
-                          "tc=='MXSA' always false, totalScaleBytes=0")
 class TestScaleRoundtripGPU:
 
     @pytest.fixture(params=SCALE_ROUNDTRIP_CONFIGS, ids=lambda c: c.label)
@@ -532,24 +538,21 @@ class TestScaleRoundtripGPU:
 # ---------------------------------------------------------------------------
 def print_intermediate_values(cfg, writer, tc, kernel):
     """Print GR offset, LR offset, and expected value per thread."""
-    scaleTileInfo = getattr(writer.states.mxsa, 'tileInfo', None) if tc == 'A' \
-                    else getattr(writer.states.mxsb, 'tileInfo', None)
-    tileInfo = writer.states.a.tileInfo if tc == 'A' else writer.states.b.tileInfo
-    otherTileInfo = writer.states.b.tileInfo if tc == 'A' else writer.states.a.tileInfo
+    scaleTileInfo = writer.states.mxsa.tileInfo if tc == 'A' \
+                    else writer.states.mxsb.tileInfo
+    ldsBase = writer.ldsStartOffsetMXSA if tc == 'A' else writer.ldsStartOffsetMXSB
 
     numTPG = (scaleTileInfo.subtileSize * scaleTileInfo.localSubtileGrid[1]) // scaleTileInfo.loadWidthGR
-    sizeMXSA, _ = compute_lds_sizes(kernel)
-    scaleBase = 0 if tc == 'A' else sizeMXSA
 
     print(f"\n  Intermediate values for scale {tc}:")
-    print(f"  numTPG={numTPG}, stride_mxs={cfg.stride_mxsa if tc == 'A' else cfg.stride_mxsb}, scaleBase={scaleBase}")
+    print(f"  numTPG={numTPG}, stride_mxs={cfg.stride_mxsa if tc == 'A' else cfg.stride_mxsb}, ldsBase={ldsBase}")
     print(f"  subtileSize={scaleTileInfo.subtileSize}, localSubtileGrid={scaleTileInfo.localSubtileGrid}")
     print(f"  {'tid':>4} {'GR_off':>7} {'LR_off':>7} {'LR_adj':>7}")
     print(f"  {'-'*30}")
     for T in range(min(NUM_THREADS, 64)):  # first wave
         gr_off = compute_expected_scale_gr_offset(T, cfg, scaleTileInfo, tc)[0]
-        lr_off = compute_expected_scale_lr_offset(T, cfg, tileInfo, otherTileInfo)[0]
-        print(f"  {T:>4} {gr_off:>7} {lr_off:>7} {lr_off - scaleBase:>7}")
+        lr_off = compute_expected_scale_lr_offset(T, scaleTileInfo, kernel, ldsBase)[0]
+        print(f"  {T:>4} {gr_off:>7} {lr_off:>7} {lr_off - ldsBase:>7}")
 
 
 # ---------------------------------------------------------------------------

@@ -116,8 +116,14 @@ def _create_kernel(cfg, mi_wave_group=None):
         problemType["MXBlockA"] = cfg.mxblock
         problemType["MXBlockB"] = cfg.mxblock
 
-    return {
+    mxBlockA = problemType.get("MXBlockA", 0)
+    mxBlockB = problemType.get("MXBlockB", 0)
+
+    kernel = {
         "DepthU": cfg.depth_u,
+        "_DepthU": cfg.depth_u,
+        "_DepthUA": cfg.depth_u,
+        "_DepthUB": cfg.depth_u,
         "MacroTileA": cfg.mt_a,
         "MacroTileB": cfg.mt_b,
         "MacroTile0": cfg.mt_a,
@@ -130,6 +136,11 @@ def _create_kernel(cfg, mi_wave_group=None):
         "UseSubtileImpl": True,
         "ProblemType": problemType,
     }
+    if mxBlockA:
+        kernel["_DepthUMXSA"] = cfg.depth_u // mxBlockA
+    if mxBlockB:
+        kernel["_DepthUMXSB"] = cfg.depth_u // mxBlockB
+    return kernel
 
 
 def create_writer(cfg, mi_wave_group=None):
@@ -181,11 +192,25 @@ def create_writer(cfg, mi_wave_group=None):
         mxsb=SimpleNamespace(tileInfo=tileInfoMXSB) if tileInfoMXSB else SimpleNamespace(),
         regCaps={"MaxSgpr": 106, "MaxVgpr": 256, "PhysicalMaxVgpr": 512},
     )
-    # LDS layout: A subtiles followed by B subtiles, aligned to readSize
+    # LDS layout: [ DataA | DataB | ScaleA | ScaleB ]
     readSize = 2 * tileInfoA.subtileSize
     numASubtiles = tileInfoA.globalSubtileGrid[0] * tileInfoA.globalSubtileGrid[1]
+    numBSubtiles = tileInfoB.globalSubtileGrid[0] * tileInfoB.globalSubtileGrid[1]
+    sizeA = ((numASubtiles * tileInfoA.subtileSize + readSize-1) // readSize) * readSize
+    sizeB = ((numBSubtiles * tileInfoB.subtileSize + readSize-1) // readSize) * readSize
     writer.ldsStartOffsetA = 0
-    writer.ldsStartOffsetB = ((numASubtiles * tileInfoA.subtileSize + readSize-1) // readSize) * readSize
+    writer.ldsStartOffsetB = sizeA
+
+    # Scale LDS regions
+    if tileInfoMXSA and tileInfoMXSB:
+        numWaves = kernel["MIWaveGroup"][0] * kernel["MIWaveGroup"][1]
+        sizeMXSA = tileInfoMXSA.loadWidthGR * WAVESIZE * numWaves
+        sizeMXSB = tileInfoMXSB.loadWidthGR * WAVESIZE * numWaves
+        writer.ldsStartOffsetMXSA = sizeA + sizeB
+        writer.ldsStartOffsetMXSB = sizeA + sizeB + sizeMXSA
+        writer.ldsTotalSize = sizeA + sizeB + sizeMXSA + sizeMXSB
+    else:
+        writer.ldsTotalSize = sizeA + sizeB
 
     return writer, kernel, tileInfoA, tileInfoB
 
