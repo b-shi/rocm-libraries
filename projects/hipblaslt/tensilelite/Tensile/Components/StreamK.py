@@ -197,6 +197,10 @@ class StreamK(Component):
             _DepthU = (_DepthU * 16)
         elif (tP["isSwizzled"] and tc == 'B'):
             _DepthU = (_DepthU * 16)
+        elif tc in ("MXSA", "MXSB"):
+            # MX swizzled(pre shuffle) case, swizzled block size is 32 * 256
+            # Number of block is DepthU // 256 (assuming DepthU is multiple of 256)
+            _DepthU = (_DepthU * 32)
 
         tileStart = sTmp + 2
         # StreamK partial tile - offset to tile start index
