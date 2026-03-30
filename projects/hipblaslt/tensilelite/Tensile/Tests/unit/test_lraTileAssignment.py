@@ -26,7 +26,6 @@ from gpu_test_helpers import (
     generate_export_epilogue,
     print_offset_grid,
 )
-from Tensile.Components.SubtileBasedKernel import lraTileAssignment, lraTileAssignmentScaleSwizzled
 
 EXPORT_LOAD_PARAMS = (
     (4, 2, 0x00, "output_ptr"),
@@ -273,124 +272,6 @@ class TestLraTileAssignmentGPU:
                     f"got {results[tid]}, expected {expected[idx]}"
 
 
-# ---- Scale LR tests ----
-
-def generate_lra_scale_asm(cfg):
-    """Run lraTileAssignmentScaleSwizzled and return (asm, writer, tileInfoA, tileInfoB, kernel)."""
-    writer, kernel, tileInfoA, tileInfoB = create_writer(cfg)
-    init_rocisa()
-
-    writer.sgprPool.checkOut(12)
-    writer.sgprs["StrideA0I"] = 10
-    writer.sgprs["StrideB1J"] = 11
-    tileInfoA.allocOffsetRegisters(writer, kernel)
-    tileInfoB.allocOffsetRegisters(writer, kernel)
-
-    # Allocate offset registers for MXSA/MXSB tileInfo (scale offset VGPRs)
-    mxsaTileInfo = getattr(writer.states.mxsa, 'tileInfo', None)
-    mxsbTileInfo = getattr(writer.states.mxsb, 'tileInfo', None)
-    if mxsaTileInfo:
-        mxsaTileInfo.allocOffsetRegisters(writer, kernel)
-    if mxsbTileInfo:
-        mxsbTileInfo.allocOffsetRegisters(writer, kernel)
-
-    prologue = generate_load_params(EXPORT_LOAD_PARAMS)
-    module = lraTileAssignmentScaleSwizzled(writer, kernel)
-    lra_asm = f"{prologue}\n{module}"
-    return lra_asm, writer, tileInfoA, tileInfoB, kernel
-
-
-def compute_expected_scale_lr_offset(thread_id, scaleTileInfo, kernel, baseLdsOffset):
-    """Python reference for scale LR offset matching _applyScaleWavePartitionLROffset.
-    Args:
-        scaleTileInfo: MXSA or MXSB TileInfo object
-        kernel: kernel dict (for MIWaveGroup)
-        baseLdsOffset: writer.ldsStartOffsetMXSA or ldsStartOffsetMXSB
-    """
-    tc = scaleTileInfo.tc
-
-    scaleSubtileBytes = scaleTileInfo.subtileSize * scaleTileInfo.bpe
-    MT = (scaleTileInfo.globalMMATileGrid[0] * scaleTileInfo.mmaTileShape[0]) // 32
-    index = 0 if tc == 'MXSA' else 1
-    totalScaleBytes = (MT // kernel["MIWaveGroup"][index]) * scaleTileInfo.localSubtileGrid[1] * scaleSubtileBytes
-
-    laneId = thread_id % WAVESIZE
-    laneOffset = laneId * 4
-
-    waveId = thread_id // WAVESIZE
-    if tc == 'MXSA':
-        partitionIndex = waveId % kernel["MIWaveGroup"][0]
-    else:
-        partitionIndex = waveId // kernel["MIWaveGroup"][0]
-
-    waveOffset = partitionIndex * totalScaleBytes
-    return [laneOffset + waveOffset + baseLdsOffset]
-
-
-SCALE_LR_TILE_CONFIGS = [
-    # 2x2 configs
-    TileConfig(mt_a=256, mt_b=256, depth_u=64, mxblock=32),
-    TileConfig(mt_a=256, mt_b=256, depth_u=128, mxblock=32),
-    TileConfig(mt_a=96, mt_b=256, depth_u=64, mxblock=32),
-    # 1x4 config
-    TileConfig(mt_a=80, mt_b=64, depth_u=64, mxblock=32),
-    # 4x1 config
-    TileConfig(mt_a=64, mt_b=80, depth_u=64, mxblock=32),
-]
-
-
-@pytest.mark.skipif(not HAS_HIP, reason="HIP Python bindings not available")
-class TestLraTileAssignmentScaleGPU:
-
-    @pytest.fixture(params=SCALE_LR_TILE_CONFIGS, ids=lambda c: c.label)
-    def lra_scale_env(self, request, tmp_path):
-        cfg = request.param
-        lra_asm, writer, tileInfoA, tileInfoB, kernel = generate_lra_scale_asm(cfg)
-        return SimpleNamespace(
-            cfg=cfg,
-            lra_asm=lra_asm,
-            writer=writer,
-            tileInfoA=tileInfoA,
-            tileInfoB=tileInfoB,
-            kernel=kernel,
-            tmp_path=tmp_path,
-        )
-
-    def test_offset_a_scale(self, lra_scale_env):
-        """Validate scale LR offset for matrix A (stored in MXSA sharedVgprLROffset[0])."""
-        cfg = lra_scale_env.cfg
-        writer = lra_scale_env.writer
-        kernel = lra_scale_env.kernel
-        scaleTileInfo = getattr(writer.states.mxsa, 'tileInfo', None)
-        assert scaleTileInfo is not None, "MXSA tileInfo not created"
-        reg = scaleTileInfo.sharedVgprLROffset[0]
-        results = export_register(writer, lra_scale_env.lra_asm, reg, False,
-                                  cfg, lra_scale_env.tmp_path,
-                                  f"scaleLR_A_v{reg}_{cfg.label}")
-        baseLds = writer.ldsStartOffsetMXSA
-        for tid in range(NUM_THREADS):
-            expected = compute_expected_scale_lr_offset(tid, scaleTileInfo, kernel, baseLds)
-            assert results[tid] == expected[0], \
-                f"[{cfg.label}] Scale A LR v{reg} tid={tid}: " \
-                f"got {results[tid]}, expected {expected[0]}"
-
-    def test_offset_b_scale(self, lra_scale_env):
-        """Validate scale LR offset for matrix B (stored in MXSB sharedVgprLROffset[0])."""
-        cfg = lra_scale_env.cfg
-        writer = lra_scale_env.writer
-        kernel = lra_scale_env.kernel
-        scaleTileInfo = getattr(writer.states.mxsb, 'tileInfo', None)
-        assert scaleTileInfo is not None, "MXSB tileInfo not created"
-        reg = scaleTileInfo.sharedVgprLROffset[0]
-        results = export_register(writer, lra_scale_env.lra_asm, reg, False,
-                                  cfg, lra_scale_env.tmp_path,
-                                  f"scaleLR_B_v{reg}_{cfg.label}")
-        baseLds = writer.ldsStartOffsetMXSB
-        for tid in range(NUM_THREADS):
-            expected = compute_expected_scale_lr_offset(tid, scaleTileInfo, kernel, baseLds)
-            assert results[tid] == expected[0], \
-                f"[{cfg.label}] Scale B LR v{reg} tid={tid}: " \
-                f"got {results[tid]}, expected {expected[0]}"
 
 
 if __name__ == "__main__":

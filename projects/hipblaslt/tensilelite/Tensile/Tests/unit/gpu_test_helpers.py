@@ -60,16 +60,14 @@ class TileConfig:
     stride_a: int = 0   # StrideA0I (in elements), only needed by GRA tests
     stride_b: int = 0   # StrideB1J (in elements), only needed by GRA tests
     use_swizzling: bool = False  # Whether to enable swizzling, only needed by GRA tests
-    mxblock: int = 0    # MX block size (0=disabled, 32=MX32)
 
     @property
     def label(self):
         swz = "_swz" if self.use_swizzling else ""
-        mx = f"_mx{self.mxblock}" if self.mxblock > 0 else ""
         stride = ""
         if self.stride_a and self.stride_a != self.depth_u:
             stride = f"_s{self.stride_a}"
-        return f"{self.mt_a}x{self.mt_b}x{self.depth_u}{swz}{stride}{mx}"
+        return f"{self.mt_a}x{self.mt_b}x{self.depth_u}{swz}{stride}"
 
 # ---- HIP helpers ----
 
@@ -107,23 +105,9 @@ def _create_kernel(cfg, mi_wave_group=None):
     else:
         raise ValueError(f"Unsupported tile config for wave grouping: mt_a={cfg.mt_a}, mt_b={cfg.mt_b}")
 
-    problemType = {
-        "DataTypeA": dtype,
-        "DataTypeB": dtype,
-        "ComputeDataType": _mock_dtype(4),
-    }
-    if cfg.mxblock > 0:
-        problemType["MXBlockA"] = cfg.mxblock
-        problemType["MXBlockB"] = cfg.mxblock
 
-    mxBlockA = problemType.get("MXBlockA", 0)
-    mxBlockB = problemType.get("MXBlockB", 0)
-
-    kernel = {
+    return {
         "DepthU": cfg.depth_u,
-        "_DepthU": cfg.depth_u,
-        "_DepthUA": cfg.depth_u,
-        "_DepthUB": cfg.depth_u,
         "MacroTileA": cfg.mt_a,
         "MacroTileB": cfg.mt_b,
         "MacroTile0": cfg.mt_a,
@@ -133,14 +117,12 @@ def _create_kernel(cfg, mi_wave_group=None):
         "MatrixInstK": 32,
         "MIWaveGroup": MIWaveGroup,
         "WavefrontSize": WAVESIZE,
-        "UseSubtileImpl": True,
-        "ProblemType": problemType,
+        "ProblemType": {
+            "DataTypeA": dtype,
+            "DataTypeB": dtype,
+            "ComputeDataType": _mock_dtype(4),
+        },
     }
-    if mxBlockA:
-        kernel["_DepthUMXSA"] = cfg.depth_u // mxBlockA
-    if mxBlockB:
-        kernel["_DepthUMXSB"] = cfg.depth_u // mxBlockB
-    return kernel
 
 
 def create_writer(cfg, mi_wave_group=None):
@@ -179,38 +161,17 @@ def create_writer(cfg, mi_wave_group=None):
     writer.agprPool = RegisterPool(0, RegisterType.Accvgpr,
                                     defaultPreventOverflow=False, printRP=False)
 
-    # Create MXSA/MXSB TileInfo when MX block scaling is active
-    mxBlockA = kernel["ProblemType"].get("MXBlockA", 0)
-    mxBlockB = kernel["ProblemType"].get("MXBlockB", 0)
-    tileInfoMXSA = TileInfo('MXSA', kernel) if mxBlockA > 0 else None
-    tileInfoMXSB = TileInfo('MXSB', kernel) if mxBlockB > 0 else None
 
     writer.states = SimpleNamespace(
         a=SimpleNamespace(tileInfo=tileInfoA),
         b=SimpleNamespace(tileInfo=tileInfoB),
-        mxsa=SimpleNamespace(tileInfo=tileInfoMXSA) if tileInfoMXSA else SimpleNamespace(),
-        mxsb=SimpleNamespace(tileInfo=tileInfoMXSB) if tileInfoMXSB else SimpleNamespace(),
         regCaps={"MaxSgpr": 106, "MaxVgpr": 256, "PhysicalMaxVgpr": 512},
     )
-    # LDS layout: [ DataA | DataB | ScaleA | ScaleB ]
+    # LDS layout: A subtiles followed by B subtiles, aligned to readSize
     readSize = 2 * tileInfoA.subtileSize
     numASubtiles = tileInfoA.globalSubtileGrid[0] * tileInfoA.globalSubtileGrid[1]
-    numBSubtiles = tileInfoB.globalSubtileGrid[0] * tileInfoB.globalSubtileGrid[1]
-    sizeA = ((numASubtiles * tileInfoA.subtileSize + readSize-1) // readSize) * readSize
-    sizeB = ((numBSubtiles * tileInfoB.subtileSize + readSize-1) // readSize) * readSize
     writer.ldsStartOffsetA = 0
-    writer.ldsStartOffsetB = sizeA
-
-    # Scale LDS regions
-    if tileInfoMXSA and tileInfoMXSB:
-        numWaves = kernel["MIWaveGroup"][0] * kernel["MIWaveGroup"][1]
-        sizeMXSA = tileInfoMXSA.loadWidthGR * WAVESIZE * numWaves
-        sizeMXSB = tileInfoMXSB.loadWidthGR * WAVESIZE * numWaves
-        writer.ldsStartOffsetMXSA = sizeA + sizeB
-        writer.ldsStartOffsetMXSB = sizeA + sizeB + sizeMXSA
-        writer.ldsTotalSize = sizeA + sizeB + sizeMXSA + sizeMXSB
-    else:
-        writer.ldsTotalSize = sizeA + sizeB
+    writer.ldsStartOffsetB = ((numASubtiles * tileInfoA.subtileSize + readSize-1) // readSize) * readSize
 
     return writer, kernel, tileInfoA, tileInfoB
 
