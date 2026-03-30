@@ -117,6 +117,7 @@ def _create_kernel(cfg, mi_wave_group=None):
         "MatrixInstK": 32,
         "MIWaveGroup": MIWaveGroup,
         "WavefrontSize": WAVESIZE,
+        "UseSubtileImpl": True,
         "ProblemType": {
             "DataTypeA": dtype,
             "DataTypeB": dtype,
@@ -160,7 +161,6 @@ def create_writer(cfg, mi_wave_group=None):
 
     writer.agprPool = RegisterPool(0, RegisterType.Accvgpr,
                                     defaultPreventOverflow=False, printRP=False)
-
 
     writer.states = SimpleNamespace(
         a=SimpleNamespace(tileInfo=tileInfoA),
