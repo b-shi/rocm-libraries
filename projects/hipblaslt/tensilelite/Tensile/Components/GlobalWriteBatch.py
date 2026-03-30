@@ -1174,6 +1174,7 @@ class GlobalWriteBatchWriter:
           and (self.kernel["ProblemType"]["DestDataType"].isBFloat16() or
                self.kernel["ProblemType"]["DestDataType"].isHalf())
           and self.kernel["ProblemType"]["HighPrecisionAccumulate"]
+          and self.kernel["_GlobalAccumulation"] != "MultipleBufferSingleKernel"
         )
         if self.kernel["ProblemType"]["DestDataType"].isHalf():
           # For UseSubtileImpl non-edge: paired dwordx4 path handles packing in _emit16bitSubtilePairedStore.

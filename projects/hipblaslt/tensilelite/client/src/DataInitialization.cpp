@@ -1797,8 +1797,7 @@ namespace TensileLite
             // the scale tensor into the GPU kernel's expected memory layout
             std::vector<size_t> preSwizzleA, preTileA, preSwizzleB, preTileB;
 
-            if(m_mxScaleFormat > 0 && m_currentSolution != nullptr
-               && !m_currentSolution->problemType.useScaleAB.empty())
+            if(m_mxScaleFormat > 0 && m_currentSolution != nullptr)
             {
                 auto const&      mi            = m_currentSolution->sizeMapping.matrixInstruction;
                 size_t           MiK           = static_cast<size_t>(mi[2]);

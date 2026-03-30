@@ -177,6 +177,7 @@ void mfma_inst(nb::module_ m_mfma)
                       const std::shared_ptr<rocisa::RegisterContainer>&,
                       const std::shared_ptr<rocisa::RegisterContainer>&,
                       const std::shared_ptr<rocisa::RegisterContainer>&,
+                      const std::optional<rocisa::VOP3PModifiers>&,
                       const std::string&>(),
              nb::arg("instType"),
              nb::arg("accType"),
@@ -187,6 +188,7 @@ void mfma_inst(nb::module_ m_mfma)
              nb::arg("acc2")    = nullptr,
              nb::arg("mxsa")    = nullptr,
              nb::arg("mxsb")    = nullptr,
+             nb::arg("vop3")    = std::nullopt,
              nb::arg("comment") = "")
         .def_rw("a", &rocisa::MXMFMAInstruction::a)
         .def_rw("b", &rocisa::MXMFMAInstruction::b)
@@ -194,6 +196,7 @@ void mfma_inst(nb::module_ m_mfma)
         .def_rw("acc2", &rocisa::MXMFMAInstruction::acc2)
         .def_rw("mxsa", &rocisa::MXMFMAInstruction::mxsa)
         .def_rw("mxsb", &rocisa::MXMFMAInstruction::mxsb)
+        .def_rw("vop3", &rocisa::MXMFMAInstruction::vop3)
         .def("getParams", &rocisa::MXMFMAInstruction::getParams)
         .def("getIssueLatency", &rocisa::MXMFMAInstruction::getIssueLatency)
         .def("__str__", &rocisa::MXMFMAInstruction::toString)
