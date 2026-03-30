@@ -317,8 +317,10 @@ class StateValues:
   savedLocalReadDoCntMXSB: int           = 0
   savedLocalReadDoCntMetadata: int       = 0
 
-  ldsStartOffsetA: int                   = 0
-  ldsStartOffsetB: int                   = 0
+  ldsStartOffsetA: int                   = -1
+  ldsStartOffsetB: int                   = -1
+  ldsStartOffsetMXSA: int                = -1
+  ldsStartOffsetMXSB: int                = -1
   ldsTotalSize: int                      = 0
 
   dtvKIntervalA: int                     = 1
@@ -3759,6 +3761,13 @@ class KernelWriter(metaclass=abc.ABCMeta):
     skComponent = Component.StreamK.find(self)
     module.add(skComponent.preLoop(self, kernel))
 
+    # Should check for is swizzled instead of usesubtileimpl
+    # TODO: Move this calculation to host-side?
+    if kernel["ProblemType"]["MXBlockA"] and kernel["ProblemType"]["MXBlockA"] and kernel["UseSubtileImpl"]:
+      module.addComment("Scale StridesMXSA by 32")
+      module.add(SLShiftLeftB32(sgpr("StridesMXSA"), 5, sgpr("StridesMXSA")))
+      module.add(SLShiftLeftB32(sgpr("StridesMXSB"), 5, sgpr("StridesMXSB")))
+
     # Open persistent loop
     loopComponent = Component.PersistentLoop.find(self)
 
@@ -3772,12 +3781,21 @@ class KernelWriter(metaclass=abc.ABCMeta):
     #self.removeSgprVarFromPool("SrdD")
     #self.removeSgprVarFromPool("SrdC")
 
+    atileInfo = self.states.a.tileInfo
+    btileInfo = self.states.b.tileInfo
+    # TODO: Need corresponding ctileInfo for GSU/StreamK
+    dtileInfo = self.states.d.tileInfo
+    mxsatileInfo = self.states.mxsa.tileInfo if kernel["ProblemType"].get("MXBlockA", 0) else None
+    mxsbtileInfo = self.states.mxsb.tileInfo if kernel["ProblemType"].get("MXBlockB", 0) else None
+
     ##
     # TODOBS: need to add init c code, and also init sum unroll code.
     #
 
     module.add(globalReadDTLInitCommonSgpr(self, kernel))
 
+    if mxsatileInfo != None and mxsbtileInfo != None:
+      module.add(globalReadScaleSwizzledDTLInitCommonSgpr(self, kernel))
 
     # TODOBS: globalWriteWorkGroupInit can be emitted here or later on, check..
     if self.states.doShadowInit:
@@ -3796,33 +3814,44 @@ class KernelWriter(metaclass=abc.ABCMeta):
 
     module.addComment1("global read addresses: addresses a")
     module.add(self.graAddresses(kernel, tensorParametersA))
+    if kernel["ProblemType"]["MXBlockA"]:
+      module.addComment1("global read addresses: addresses mxsa")
+      module.add(self.graAddresses(kernel, tensorParametersA["MX"]))
     module.addComment1("global read addresses: addresses b")
     module.add(self.graAddresses(kernel, tensorParametersB))
+    if kernel["ProblemType"]["MXBlockB"]:
+      module.addComment1("global read addresses: addresses mxsb")
+      module.add(self.graAddresses(kernel, tensorParametersB["MX"]))
+
+
+
+    # List of tiles that need to be read form
+    readtileInfoList = [atileInfo, btileInfo, mxsatileInfo, mxsbtileInfo]
+
+    # Printout tile info
+    for tileInfo in [atileInfo, btileInfo, mxsatileInfo, mxsbtileInfo, dtileInfo]:
+      if tileInfo != None:
+        module.addComment0(str(tileInfo))
 
     # Allocate registers for GR/LR
-    self.states.a.tileInfo.allocOffsetRegisters(self, kernel)
-    self.states.b.tileInfo.allocOffsetRegisters(self, kernel)
+    for tileInfo in [atileInfo, btileInfo, mxsatileInfo, mxsbtileInfo]:
+      if tileInfo != None:
+        tileInfo.allocOffsetRegisters(self, kernel)
+        module.addComment("Allocating v%s for %s GR"%(str(tileInfo.sharedVgprGROffset), tileInfo.tc))
+        module.addComment("Allocating v%s for %s LR"%(str(tileInfo.sharedVgprLROffset), tileInfo.tc))
+        module.addComment("Allocating v%s for %s LR Swap"%(str(tileInfo.sharedVgprLROffsetSwap), tileInfo.tc))
 
-    atile = self.states.a.tileInfo
-    btile = self.states.b.tileInfo
-
-    module.addComment("Allocating v%s for A GR"%(str(self.states.a.tileInfo.sharedVgprGROffset)))
-    module.addComment("Allocating v%s for B GR"%(str(self.states.b.tileInfo.sharedVgprGROffset)))
-    module.addComment("Allocating v%s for A LR"%(str(self.states.a.tileInfo.sharedVgprLROffset)))
-    module.addComment("Allocating v%s for B LR"%(str(self.states.b.tileInfo.sharedVgprLROffset)))
-
-    for st in atile.localSubtiles:
-      linearId = atile.localSubtiles.index(st)
-      sId0, sId1 = atile.getLocalSubtileIdFromLinearId(linearId)
-      regstr = 's' if st.useSgpr else 'v'
-      module.addComment0("Using %s%s for A GR, subtile: [%u, %u]"%(regstr, str(atile.localSubtilesRegister[st.regListId]), sId0, sId1))
-
-
-    for st in btile.localSubtiles:
-      linearId = btile.localSubtiles.index(st)
-      sId0, sId1 = btile.getLocalSubtileIdFromLinearId(linearId)
-      regstr = 's' if st.useSgpr else 'v'
-      module.addComment0("Using %s%s for B GR, subtile: [%u, %u]"%(regstr, str(btile.localSubtilesRegister[st.regListId]), sId0, sId1))
+    for tileInfo in [atileInfo, btileInfo, mxsatileInfo, mxsbtileInfo]:
+      if tileInfo != None:
+        for st in tileInfo.localSubtiles:
+          # Print out, only if register is allocated
+          if len(tileInfo.localSubtilesRegister):
+            linearId = tileInfo.localSubtiles.index(st)
+            sId0, sId1 = tileInfo.getLocalSubtileIdFromLinearId(linearId)
+            regstr = 's' if st.useSgpr else 'v'
+            module.addComment0("Using %s%s for %s GR, subtile: [%u, %u]"%(\
+                               tileInfo.tc, \
+                               regstr, str(tileInfo.localSubtilesRegister[st.regListId]), sId0, sId1))
 
 
     module.add(graTileAssignment(self, kernel))
@@ -3836,27 +3865,22 @@ class KernelWriter(metaclass=abc.ABCMeta):
 
     module.add(self.calculateLoopNumIter(kernel, tensorParametersA, tensorParametersB, self.states.unrollIdx))
 
-
-
     # Allocate registers for VGPR tiles
-    self.states.a.tileInfo.allocVgprTileRegisters(self, kernel)
-    self.states.b.tileInfo.allocVgprTileRegisters(self, kernel)
-    self.states.d.tileInfo.allocVgprTileRegisters(self, kernel)
-    module.add(initVgprTilesToZero(self, kernel,self.states.d.tileInfo))
+    for tileInfo in [atileInfo, btileInfo, dtileInfo]:
+      tileInfo.allocVgprTileRegisters(self, kernel)
 
-    self.states.scheduleInfo = ScheduleInfo(self.states.a.tileInfo, self.states.b.tileInfo)
+    for tileInfo in [mxsatileInfo, mxsbtileInfo]:
+      if tileInfo:
+        tileInfo.allocVgprTileRegisters(self, kernel)
+    module.add(initVgprTilesToZero(self, kernel, dtileInfo))
 
-    for vtiles in self.states.a.tileInfo.vgprTiles:
-      regStr = "Vgpr" if vtiles.regList.regPool == self.vgprPool else "Agpr" # shouldn't this only be vgpr pool?
-      module.addComment("%ss used for A mma tile %u: %s"%(regStr, self.states.a.tileInfo.vgprTiles.index(vtiles), str(vtiles)))
+    self.states.scheduleInfo = ScheduleInfo(atileInfo, btileInfo)
 
-    for vtiles in self.states.b.tileInfo.vgprTiles:
-      regStr = "Vgpr" if vtiles.regList.regPool == self.vgprPool else "Agpr" # shouldn't this only be vgpr pool?
-      module.addComment("%ss used for B mma tile %u: %s"%(regStr, self.states.b.tileInfo.vgprTiles.index(vtiles), str(vtiles)))
-
-    for vtiles in self.states.d.tileInfo.vgprTiles:
-      regStr = "Vgpr" if vtiles.regList.regPool == self.vgprPool else "Agpr"
-      module.addComment("%ss used for D mma tile %u: %s"%(regStr, self.states.d.tileInfo.vgprTiles.index(vtiles), str(vtiles)))
+    for tileInfo in [atileInfo, btileInfo, mxsatileInfo, mxsbtileInfo, dtileInfo]:
+      if tileInfo:
+        for vtiles in tileInfo.vgprTiles:
+          regStr = "Vgpr" if vtiles.regList.regPool == self.vgprPool else "Agpr" # shouldn't this only be vgpr pool?
+          module.addComment("%ss used for %s mma tile %u: %s"%(regStr, tileInfo.tc, tileInfo.vgprTiles.index(vtiles), str(vtiles)))
 
 
     vtmp = self.vgprPool.checkOut(1)
@@ -3869,16 +3893,16 @@ class KernelWriter(metaclass=abc.ABCMeta):
     #module.add(preLoop(self, kernel))
     module.add(mainLoop(self, kernel))
 
-    atileInfo = self.states.a.tileInfo
-    btileInfo = self.states.b.tileInfo
-    dtileInfo = self.states.d.tileInfo
 
     # Deallocate registers used for GR/LR offsets
-    self.states.a.tileInfo.deallocOffsetRegisters(self, kernel)
-    self.states.b.tileInfo.deallocOffsetRegisters(self, kernel)
-    # Deallocate registers used for VGPR A/Btiles
-    self.states.a.tileInfo.deallocVgprTileRegisters(self, kernel)
-    self.states.b.tileInfo.deallocVgprTileRegisters(self, kernel)
+    for tileInfo in [atileInfo, btileInfo, mxsatileInfo, mxsbtileInfo]:
+      if tileInfo != None:
+        tileInfo.deallocOffsetRegisters(self, kernel)
+
+    # Deallocate registers used for VGPR A/B/MXS tiles
+    for tileInfo in [atileInfo, btileInfo, mxsatileInfo, mxsbtileInfo]:
+      if tileInfo:
+        tileInfo.deallocVgprTileRegisters(self, kernel)
 
     # Start of post-loop code
     if 1:
@@ -3920,7 +3944,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
       self.vgprPool.checkIn(self.states.c.startVgprValu)
 
     # Deallocate registers used for C/D tiles after store code instructions are emitted
-    self.states.d.tileInfo.deallocVgprTileRegisters(self, kernel)
+    dtileInfo.deallocVgprTileRegisters(self, kernel)
 
 
 
@@ -5000,24 +5024,28 @@ class KernelWriter(metaclass=abc.ABCMeta):
     print("================= Macro Tile config: %u x %u x %u ========================"%(kernel["MacroTile0"], kernel["MacroTile1"], kernel["DepthU"]))
 
     def initSubTileInfo(tc):
-
-      if tc == 'A':
-        self.states.a.tileInfo = TileInfo(tc, kernel)
-        tileInfo = self.states.a.tileInfo
-      elif tc == 'B':
-        self.states.b.tileInfo = TileInfo(tc, kernel)
-        tileInfo = self.states.b.tileInfo
-      elif tc == 'D':
-        self.states.d.tileInfo = TileInfo(tc, kernel)
-        tileInfo = self.states.d.tileInfo
-
-      print(tileInfo)
+      tileMap = {
+        'A' : self.states.a,
+        'B' : self.states.b,
+        'D' : self.states.d,
+        'MXSA' : self.states.mxsa,
+        'MXSB' : self.states.mxsb,
+      }
+      matrixInfo = tileMap[tc]
+      matrixInfo.tileInfo = TileInfo(tc, kernel)
+      tileInfo = matrixInfo.tileInfo
+      #print(tileInfo)
 
 
     if kernel["UseSubtileImpl"]:
       initSubTileInfo('A')
       initSubTileInfo('B')
       initSubTileInfo('D')
+
+      if kernel["ProblemType"].get("MXBlockA", 0) > 0:
+        initSubTileInfo('MXSA')
+      if kernel["ProblemType"].get("MXBlockB", 0) > 0:
+        initSubTileInfo('MXSB')
 
       self.ldsStartOffsetA = 0
       aTileInfo = self.states.a.tileInfo
@@ -5029,8 +5057,22 @@ class KernelWriter(metaclass=abc.ABCMeta):
       sizeA = ((numASubtiles * aTileInfo.subtileSize + readSize-1) // readSize) * readSize
       sizeB = ((numBSubtiles * bTileInfo.subtileSize + readSize-1) // readSize) * readSize
       self.ldsStartOffsetB = sizeA
-      self.ldsTotalSize = sizeA + sizeB
-      kernel["LdsNumBytes"] = int((sizeA + sizeB) * kernel["NumLdsBlk"])
+      sizeMXSA = 0
+      sizeMXSB = 0
+      if kernel["ProblemType"].get("MXBlockA", 0) > 0 and kernel["ProblemType"].get("MXBlockB", 0) > 0:
+        mxsaTileInfo = self.states.mxsa.tileInfo
+        mxsbTileInfo = self.states.mxsb.tileInfo
+
+        # For Swizzled scale we use extra LDS space for now to allow wider DTL loads
+        numWaves = kernel["MIWaveGroup"][0] * kernel["MIWaveGroup"][1]
+        sizeMXSA = mxsaTileInfo.loadWidthGR * kernel["WavefrontSize"] * numWaves
+        sizeMXSB = mxsbTileInfo.loadWidthGR * kernel["WavefrontSize"] * numWaves
+        self.ldsStartOffsetMXSA = sizeA + sizeB
+        self.ldsStartOffsetMXSB = sizeA + sizeB + sizeMXSA
+
+      self.ldsTotalSize = sizeA + sizeB + sizeMXSA + sizeMXSB
+
+      kernel["LdsNumBytes"] = max(1, int(self.ldsTotalSize * kernel["NumLdsBlk"]))
 
 
     #print(self.states.a.tileInfo.getLocalSubtileId(1,0))
@@ -5358,8 +5400,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
     tensorParametersB["PackedIndices"] = kernel["PackedC%uIndicesX"%tensorParametersB["tile01Idx"]]
 
     tensorParametersMXSA = None
-    tensorParametersA["MX"] = None
-    if kernel["ProblemType"]["MXBlockA"] and not kernel["UseSubtileImpl"]:
+    if kernel["ProblemType"]["MXBlockA"]:
       itP["MXSA"] = readWriteVectors("MXSA", vwmxsa, kernel)
       tensorParametersMXSA = {}
       self.getTensorParameters(tensorParametersMXSA, kernel, itP, "MXSA")
@@ -5367,8 +5408,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
       tensorParametersA["MX"] = tensorParametersMXSA
 
     tensorParametersMXSB = None
-    tensorParametersB["MX"] = None
-    if kernel["ProblemType"]["MXBlockB"] and not kernel["UseSubtileImpl"]:
+    if kernel["ProblemType"]["MXBlockB"]:
       itP["MXSB"] = readWriteVectors("MXSB", vwmxsb, kernel)
       tensorParametersMXSB = {}
       self.getTensorParameters(tensorParametersMXSB, kernel, itP, "MXSB")
@@ -5790,7 +5830,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
           self.states.a.numVgprG2LAllocated *= int(bpeA // bpeGRA)
 
       # num vgprs: global -> local elements : MXSA
-      if kernel["ProblemType"]["MXBlockA"] and not kernel["UseSubtileImpl"]:
+      if kernel["ProblemType"]["MXBlockA"]:
         self.states.mxsa.numVgprG2L = 0
         numVgprG2LMXSAllocatedLocal = 0
 
@@ -5866,7 +5906,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
           self.states.b.numVgprG2LAllocated *= int(bpeB // bpeGRB)
 
       # num vgprs: global -> local elements : MXSB
-      if kernel["ProblemType"]["MXBlockB"] and not kernel["UseSubtileImpl"]:
+      if kernel["ProblemType"]["MXBlockB"]:
         self.states.mxsb.numVgprG2L = 0
         numVgprG2LMXSBllocatedLocal = 0
 
@@ -6062,7 +6102,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
         numVgprGlobalReadIncsA = 0
 
       # num vgprs: global read addresses MXSA
-      if kernel["ProblemType"]["MXBlockA"] and not kernel["UseSubtileImpl"]:
+      if kernel["ProblemType"]["MXBlockA"]:
         numGlobalReadsMXSA = kernel["NumLoadsCoalescedMXSA"] \
             * kernel["NumLoadsPerpendicularMXSA"] * kernel["GlobalReadVectorWidthMXSA"]
         numGlobalReadInstructionsMXSA = int(numGlobalReadsMXSA / \
@@ -6095,7 +6135,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
       else:
         numVgprGlobalReadIncsB = 0
 
-      if kernel["ProblemType"]["MXBlockB"] and not kernel["UseSubtileImpl"]:
+      if kernel["ProblemType"]["MXBlockB"]:
         numGlobalReadsMXSB = kernel["NumLoadsCoalescedMXSB"] \
             * kernel["NumLoadsPerpendicularMXSB"] * kernel["GlobalReadVectorWidthMXSB"]
         numGlobalReadInstructionsMXSB = int(numGlobalReadsMXSB / \
@@ -7151,6 +7191,12 @@ class KernelWriter(metaclass=abc.ABCMeta):
       self.defineSgpr("LocalWriteBaseAddrB", 1)
       self.defineSgpr("LocalWriteSwapA", 1)
       self.defineSgpr("LocalWriteSwapB", 1)
+      if kernel["ProblemType"]["MXBlockA"]:
+        self.defineSgpr("LocalWriteBaseAddrMXSA", 1)
+        self.defineSgpr("LocalWriteSwapMXSA", 1)
+      if kernel["ProblemType"]["MXBlockB"]:
+        self.defineSgpr("LocalWriteBaseAddrMXSB", 1)
+        self.defineSgpr("LocalWriteSwapMXSB", 1)
 
     # Allocate registers to swap between lds buffers
     if self.states.useCommonSgprSwap:
@@ -7288,7 +7334,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
         numA = numA // kernel["VectorWidthA"]
       if kernel["ForceUnrollSubIter"]:
         numA = numA // factorSubIterA
-      if kernel["ProblemType"]["MXBlockA"] and not kernel["UseSubtileImpl"]:
+      if kernel["ProblemType"]["MXBlockA"]:
         self.states.numReadsPerUnrollMXSA = 1
         numMXSA = kernel["InnerUnroll"] * kernel["MIWaveTile"][0] // tensorParametersMXSA["localReadInstruction"].numOffsets
         if self.states.lrvwTileMXSA > 1:
@@ -7317,7 +7363,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
         numB = numB // kernel["VectorWidthB"]
       if kernel["ForceUnrollSubIter"]:
         numB = numB // factorSubIterB
-      if kernel["ProblemType"]["MXBlockB"] and not kernel["UseSubtileImpl"]:
+      if kernel["ProblemType"]["MXBlockB"]:
         self.states.numReadsPerUnrollMXSB = 1
         numMXSB = kernel["InnerUnroll"] * kernel["MIWaveTile"][1] // tensorParametersMXSB["localReadInstruction"].numOffsets
         if self.states.lrvwTileMXSB > 1:
@@ -7328,7 +7374,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
       # 2. using larger PLR to read more iterations, same number local reads in 1 iteration
       if kernel["InnerUnroll"] >= self.states.numReadsIterCoalescedA:
         numA //= self.states.numReadsIterCoalescedA
-      if kernel["ProblemType"]["MXBlockA"] and not kernel["UseSubtileImpl"]:
+      if kernel["ProblemType"]["MXBlockA"]:
         if kernel["InnerUnroll"] >= self.states.numReadsIterCoalescedMXSA:
           numMXSA //= self.states.numReadsIterCoalescedMXSA
       if kernel["ProblemType"]["Sparse"] and not kernel["DirectToVgprSparseMetadata"]:
@@ -7336,7 +7382,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
           numM //= self.states.numReadsIterCoalescedMetadata
       if kernel["InnerUnroll"] >= self.states.numReadsIterCoalescedB:
         numB //= self.states.numReadsIterCoalescedB
-      if kernel["ProblemType"]["MXBlockB"] and not kernel["UseSubtileImpl"]:
+      if kernel["ProblemType"]["MXBlockB"]:
         if kernel["InnerUnroll"] >= self.states.numReadsIterCoalescedMXSB:
           numMXSB //= self.states.numReadsIterCoalescedMXSB
 
@@ -7351,18 +7397,18 @@ class KernelWriter(metaclass=abc.ABCMeta):
 
     if not kernel["DirectToVgprA"]:
       self.states.numReadsPerIterA = numA
-      if kernel["ProblemType"]["MXBlockA"] and not kernel["UseSubtileImpl"]:
+      if kernel["ProblemType"]["MXBlockA"]:
         self.states.numReadsPerIterMXSA = numMXSA
     if not kernel["DirectToVgprB"]:
       self.states.numReadsPerIterB = numB
-      if kernel["ProblemType"]["MXBlockB"] and not kernel["UseSubtileImpl"]:
+      if kernel["ProblemType"]["MXBlockB"]:
         self.states.numReadsPerIterMXSB = numMXSB
 
     self.states.localReadDoCntA = 0
-    if kernel["ProblemType"]["MXBlockA"] and not kernel["UseSubtileImpl"]:
+    if kernel["ProblemType"]["MXBlockA"]:
       self.states.localReadDoCntMXSA = 0
     self.states.localReadDoCntB = 0
-    if kernel["ProblemType"]["MXBlockB"] and not kernel["UseSubtileImpl"]:
+    if kernel["ProblemType"]["MXBlockB"]:
       self.states.localReadDoCntMXSB = 0
     if kernel["ProblemType"]["Sparse"] and not kernel["DirectToVgprSparseMetadata"]:
       self.states.numReadsPerIterMetadata = numM
