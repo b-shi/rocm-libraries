@@ -3760,6 +3760,12 @@ class KernelWriter(metaclass=abc.ABCMeta):
     skComponent = Component.StreamK.find(self)
     module.add(skComponent.preLoop(self, kernel))
 
+    # Scale strides are in data-element units; multiply by mxBlock (32) for scale-element addressing.
+    if kernel["ProblemType"].get("MXBlockA", 0) and kernel["ProblemType"].get("MXBlockB", 0) and kernel["UseSubtileImpl"]:
+      module.addComment("Scale StridesMXSA/B by mxBlock (32) for GR offset calc")
+      module.add(SLShiftLeftB32(sgpr("StridesMXSA"), 5, sgpr("StridesMXSA")))
+      module.add(SLShiftLeftB32(sgpr("StridesMXSB"), 5, sgpr("StridesMXSB")))
+
     # Open persistent loop
     loopComponent = Component.PersistentLoop.find(self)
 

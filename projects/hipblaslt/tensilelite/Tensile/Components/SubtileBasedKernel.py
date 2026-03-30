@@ -1593,12 +1593,14 @@ def emitMfmaCode(writer, kernel):
   atileInfo = writer.states.a.tileInfo
   btileInfo = writer.states.b.tileInfo
   dtileInfo = writer.states.d.tileInfo
+  mxsatileInfo = writer.states.mxsa.tileInfo if kernel["ProblemType"].get("MXBlockA", 0) else None
+  mxsbtileInfo = writer.states.mxsb.tileInfo if kernel["ProblemType"].get("MXBlockB", 0) else None
 
-
-
-  # Use loaded scale VGPRs when allocated; matches localReadDoScaleSubtile guard
-  hasScaleA = atileInfo.mxBlock > 0 and len(atileInfo.scaleVgprTiles) > 0
-  hasScaleB = btileInfo.mxBlock > 0 and len(btileInfo.scaleVgprTiles) > 0
+  # Use loaded scale VGPRs when MX block scaling is active.
+  # Note: scaleVgprTiles is only populated by the scheduler path;
+  # in the non-scheduler path we use vgprTiles (populated by localReadDoScaleSubtile).
+  hasScaleA = mxsatileInfo is not None and mxsatileInfo.mxBlock > 0
+  hasScaleB = mxsbtileInfo is not None and mxsbtileInfo.mxBlock > 0
 
   for mmak in range(atileInfo.localMMATileGrid[1]):
     for mma1 in range(btileInfo.localMMATileGrid[0]):
@@ -1619,12 +1621,15 @@ def emitMfmaCode(writer, kernel):
           scaleAVgpr = mxsatileInfo.vgprTiles[4 * mxsaLinearId].regList.regValues[0] if mxsatileInfo.mxBlock else -1
           scaleBVgpr = mxsbtileInfo.vgprTiles[4 * mxsbLinearId].regList.regValues[0] if mxsbtileInfo.mxBlock else -1
 
-          sAsel = mma0 + 2 * mmak
-          sBsel = mma1 + 2 * mmak
+          _mma0 = mma0 % 2
+          _mma1 = mma1 % 2
+          _mmak = mmak % 2
+          sAsel = _mma0 + 2 * _mmak
+          sBsel = _mma1 + 2 * _mmak
         else:
           scaleAVgpr = -1
           scaleBVgpr = -1
-          sAsel = -1
+          sAsel = sBsel = 0
           sBsel = -1
 
         module.add(emitMfmaInstruction(writer, kernel, atiles, btiles, dtiles, dtiles,
