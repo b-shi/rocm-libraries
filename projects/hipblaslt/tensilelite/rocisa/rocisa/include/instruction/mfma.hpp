@@ -499,6 +499,7 @@ namespace rocisa
         std::shared_ptr<RegisterContainer> mxsa;
         std::shared_ptr<RegisterContainer> mxsb;
         int                                block;
+        std::optional<VOP3PModifiers>      vop3;
 
         MXMFMAInstruction(InstType                                  instType,
                           InstType                                  accType,
@@ -512,6 +513,7 @@ namespace rocisa
                           InstType                                  mxScaleAType = InstType::INST_F32,
                           InstType                                  mxScaleBType = InstType::INST_F32,
                           int                                       block        = 0,
+                          const std::optional<VOP3PModifiers>&      vop3         = std::nullopt,
                           const std::string&                        comment      = "")
             : Instruction(instType, comment)
             , accType(accType)
@@ -525,6 +527,7 @@ namespace rocisa
             , mxsa(mxsa)
             , mxsb(mxsb)
             , block(block)
+            , vop3(vop3)
         {
         }
 
@@ -541,6 +544,7 @@ namespace rocisa
             , mxsa(other.mxsa ? other.mxsa->clone2() : nullptr)
             , mxsb(other.mxsb ? other.mxsb->clone2() : nullptr)
             , block(other.block)
+            , vop3(other.vop3)
         {
         }
 
@@ -805,9 +809,14 @@ namespace rocisa
             {
                 std::string mxsaStr = mxsa ? mxsa->toString() : "";
                 std::string mxsbStr = mxsb ? mxsb->toString() : "";
-                return acc->toString() + ", " + a->toString() + ", " + b->toString() + ", "
-                       + acc2->toString() + ", " + mxsaStr + ", " + mxsbStr
-                       + mfmaInputPermuteStr();
+                std::string result  = acc->toString() + ", " + a->toString() + ", " + b->toString()
+                                    + ", " + acc2->toString() + ", " + mxsaStr + ", " + mxsbStr;
+                if(vop3)
+                {
+                    result += vop3->toString();
+                }
+                result += mfmaInputPermuteStr();
+                return result;
             }
             else
             {

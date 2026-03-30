@@ -858,14 +858,15 @@ namespace TensileLite
             {
                 m_currentGemmProblem
                     = dynamic_cast<ContractionProblemGemm const*>(problem);
+                m_currentSolution = nullptr;
             }
             virtual void postProblem() override {}
             virtual void preSolution(ContractionSolution* const solution) override
             {
                 m_currentSolution = solution;
-                // Re-init MX scale with preSwizzle now that solution (useScaleAB) is available
+                // Re-init MX scale with preSwizzle now that solution is available
                 if(m_currentSolution != nullptr
-                   && !m_currentSolution->problemType.useScaleAB.empty()
+                   && m_mxScaleFormat > 0
                    && m_currentGemmProblem != nullptr
                    && !m_gpuPtrs.empty())
                 {

@@ -640,7 +640,7 @@ class Solution(collections.abc.Mapping):
 
     # Only enable for GFX950 for now.
     state["UseSubtileImpl"] = state["UseSubtileImpl"] and state["ISA"] == IsaVersion(9,5,0)
-    
+
     if state["UseSubtileImpl"]:
       state["VectorWidthA"] = 1
       state["VectorWidthB"] = 1
@@ -661,7 +661,8 @@ class Solution(collections.abc.Mapping):
   @staticmethod
   def setGlobalReadVectorWidth(state, tc, totalVectors, grvw, printRejectionReason: bool):
     validDepthU = True
-    if grvw not in [1,2,4,8,16,32]:
+    # Skip GRVW range check for subtile impl: scale uses serial*loadWidth DTL addressing, not standard GRVW chunks
+    if grvw not in [1,2,4,8,16,32] and not state["UseSubtileImpl"]:
       validDepthU = False
     if totalVectors % state["NumThreads"] != 0:
       reject(None, printRejectionReason, "totalVectors%s %u %% NumThreads %u != 0" \
@@ -1702,7 +1703,9 @@ class Solution(collections.abc.Mapping):
       and ((numBytesB == 1 and isaInfoMap[isa].asmCaps["HasGLTr8B64"]) \
         or (numBytesB == 2 and isaInfoMap[isa].asmCaps["HasGLTr16B128"]) \
       )
-	  
+
+    state["enableLDSTrMXSA"] = False
+    state["enableLDSTrMXSB"] = False
     if state["enableLDSTrA"] or state["enableGLTrA"]:
       state["VectorWidthA"] = 1
 
@@ -1840,7 +1843,6 @@ class Solution(collections.abc.Mapping):
 
     if state["ProblemType"]["MXBlockA"]:
       if state["UseSubtileImpl"]:
-        # Subtile impl handles scale loading separately; disable classic MXS path
         state["DirectToVgprMXSA"] = False
         state["DirectToLdsMXSA"] = False
         state["LocalWriteUseSgprMXSA"] = False
@@ -1877,7 +1879,6 @@ class Solution(collections.abc.Mapping):
 
     if state["ProblemType"]["MXBlockB"]:
       if state["UseSubtileImpl"]:
-        # Subtile impl handles scale loading separately; disable classic MXS path
         state["DirectToVgprMXSB"] = False
         state["DirectToLdsMXSB"] = False
         state["LocalWriteUseSgprMXSB"] = False
@@ -2658,7 +2659,7 @@ class Solution(collections.abc.Mapping):
         # If the LRVW is set by the user, validate the configuration and rejects if,
         #   - state["LocalReadVectorWidth{tc}"] * state["ProblemType"]["MacDataType{tc}"].numRegisters() < 1 if not sparse
         #   - state["LocalReadVectorWidth{tc}"] // 2 * state["ProblemType"]["MacDataType{tc}"].numRegisters() < 1 is sparse
-        #   - state["LocalReadVectorWidth{tc}"] > state["MIInputPerThread"] and LDS is not transposed 
+        #   - state["LocalReadVectorWidth{tc}"] > state["MIInputPerThread"] and LDS is not transposed
         def isAutoLRVW(tc) -> bool:
           autoLRVW = False
           if state[f"LocalReadVectorWidth{tc}"] != -1:
@@ -2700,7 +2701,7 @@ class Solution(collections.abc.Mapping):
                 = calcLdsNumBytes(padA, ldsBlockSizePerPadA, padB, ldsBlockSizePerPadB)
               ldsNumBytes = ldsNumBytesAlignedA + ldsNumBytesAlignedB + \
                             ldsNumBytesAlignedMXSA + ldsNumBytesAlignedMXSB + \
-                            ldsNumBytesAlignedMetadata 
+                            ldsNumBytesAlignedMetadata
               if ldsNumBytes > state["MaxLDS"]:
                 if wlrA > 1:
                   state["LocalReadVectorWidthA"] //= 2
@@ -2781,7 +2782,9 @@ class Solution(collections.abc.Mapping):
       if state["ISA"] == IsaVersion(9,5,0) and (state["ProblemType"]["MXBlockA"] or state["ProblemType"]["MXBlockB"]):
         calLRVWFor950MX()
       else:
-        calLRVW()
+        calLRVWForNonMX()
+        state["LocalReadVectorWidthA"] = state["LocalReadVectorWidth"]
+        state["LocalReadVectorWidthB"] = state["LocalReadVectorWidth"]
 
       def calcOptGRVW(lrvw: int, unrollMajorLDS: bool, datatype: DataType) -> int:
         # with UnrollMajorLDS, GRVW need to less or equal than LRVW to have conflict free LDS read with padding.
@@ -2808,7 +2811,7 @@ class Solution(collections.abc.Mapping):
             if state["ProblemType"]["SwizzleTensorA"]:
               state["GlobalReadVectorWidthA"] = state["MIInputPerThreadA"] * calSwizzlePackK(state, "A")
             elif state["ProblemType"]["DataTypeA"].is6bitFloat():
-              state["GlobalReadVectorWidthA"] = 32	  
+              state["GlobalReadVectorWidthA"] = 32
             elif state["enableGLTrA"]:
               state["GlobalReadVectorWidthA"] = 8
             else:
@@ -3381,7 +3384,7 @@ class Solution(collections.abc.Mapping):
         totalVectorsCoalescedA, totalElementsPerpA, state["_DepthUA"], printRejectionReason):
       return
 
-    if state["ProblemType"]["MXBlockA"] and not state["UseSubtileImpl"]:
+    if state["ProblemType"]["MXBlockA"]:
       if not Solution.setGlobalLoadTileDimClassic(state, "MXSA", state["NumLoadsMXSA"], \
           totalVectorsCoalescedMXSA, totalElementsPerpMXSA, state["_DepthUMXSA"], printRejectionReason):
         return
@@ -3393,7 +3396,7 @@ class Solution(collections.abc.Mapping):
           totalVectorsCoalescedMXSB, totalElementsPerpMXSB, state["_DepthUMXSB"], printRejectionReason):
         return
 
-    if state["ProblemType"]["MXBlockB"] and not state["UseSubtileImpl"]:
+    if state["ProblemType"]["MXBlockB"]:
       if not Solution.setGlobalLoadTileDimClassic(state, "MXSB", state["NumLoadsMXSB"], \
           totalVectorsCoalescedMXSB, totalElementsPerpMXSB, state["_DepthUMXSB"], printRejectionReason):
         return
@@ -3461,14 +3464,14 @@ class Solution(collections.abc.Mapping):
     state["LVCA"] = roundupRatio(state["LSCA"] , state["GlobalReadVectorWidthA"])
     state["LVPA"] = roundupRatio(state["LSPA"] , state["GlobalReadVectorWidthA"])
 
-    if state["ProblemType"]["MXBlockA"] and not state["UseSubtileImpl"]:
+    if state["ProblemType"]["MXBlockA"]:
       state["LVCMXSA"] = roundupRatio(state["LSCMXSA"] , state["GlobalReadVectorWidthMXSA"])
       state["LVPMXSA"] = roundupRatio(state["LSPMXSA"] , state["GlobalReadVectorWidthMXSA"])
 
     state["LVCB"] = roundupRatio(state["LSCB"] , state["GlobalReadVectorWidthB"])
     state["LVPB"] = roundupRatio(state["LSPB"] , state["GlobalReadVectorWidthB"])
 
-    if state["ProblemType"]["MXBlockB"] and not state["UseSubtileImpl"]:
+    if state["ProblemType"]["MXBlockB"]:
       state["LVCMXSB"] = roundupRatio(state["LSCMXSB"] , state["GlobalReadVectorWidthMXSB"])
       state["LVPMXSB"] = roundupRatio(state["LSPMXSB"] , state["GlobalReadVectorWidthMXSB"])
 
@@ -3526,7 +3529,6 @@ class Solution(collections.abc.Mapping):
     state["NoTailLoop"] = False
     if state["AssertSummationElementMultiple"] % state["DepthU"] == 0:
       state["NoTailLoop"] = True
-		
     # TailloopInNll optimization check
     if state["TailloopInNll"]:
       # Disable TailloopInNll
@@ -3632,7 +3634,7 @@ class Solution(collections.abc.Mapping):
       #1LDS buffer must be 0 for DirectToLdsA
       state["1LDSBuffer"] = 0
     # MX case
-    if (state["ProblemType"]["MXBlockA"] or state["ProblemType"]["MXBlockB"]) and not state["UseSubtileImpl"]:
+    if (state["ProblemType"]["MXBlockA"] or state["ProblemType"]["MXBlockB"]):
       if state["DirectToLdsA"] != state["DirectToLdsMXSA"] or state["DirectToLdsB"] != state["DirectToLdsMXSB"]:
           reject(state, printRejectionReason, "DirectToLdsA/B and DirectToLdsMXSA/B should match")
       if state["DirectToLdsA"] != state["DirectToLdsB"]:

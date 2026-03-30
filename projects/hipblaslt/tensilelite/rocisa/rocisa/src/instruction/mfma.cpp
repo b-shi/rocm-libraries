@@ -179,6 +179,7 @@ void mfma_inst(nb::module_ m_mfma)
                       rocisa::InstType,
                       rocisa::InstType,
                       int,
+                      const std::optional<rocisa::VOP3PModifiers>&,
                       const std::string&>(),
              nb::kw_only(),
              nb::arg("instType"),
@@ -193,6 +194,7 @@ void mfma_inst(nb::module_ m_mfma)
              nb::arg("mxScaleAType") = rocisa::InstType::INST_F32,
              nb::arg("mxScaleBType") = rocisa::InstType::INST_F32,
              nb::arg("block")        = 0,
+             nb::arg("vop3")         = std::nullopt,
              nb::arg("comment")      = "")
         .def_rw("a", &rocisa::MXMFMAInstruction::a)
         .def_rw("b", &rocisa::MXMFMAInstruction::b)
@@ -200,6 +202,8 @@ void mfma_inst(nb::module_ m_mfma)
         .def_rw("mxsb", &rocisa::MXMFMAInstruction::mxsb)
         .def_rw("acc", &rocisa::MXMFMAInstruction::acc)
         .def_rw("acc2", &rocisa::MXMFMAInstruction::acc2)
+        .def_rw("block", &rocisa::MXMFMAInstruction::block)
+        .def_rw("vop3", &rocisa::MXMFMAInstruction::vop3)
         .def("getParams", &rocisa::MXMFMAInstruction::getParams)
         .def("getIssueLatency", &rocisa::MXMFMAInstruction::getIssueLatency)
         .def("__str__", &rocisa::MXMFMAInstruction::toString)
@@ -239,4 +243,5 @@ void mfma_inst(nb::module_ m_mfma)
         .def("__deepcopy__", [](const rocisa::SMFMAInstruction& self, const nb::dict&) {
             return new rocisa::SMFMAInstruction(self);
         });
+
 }
