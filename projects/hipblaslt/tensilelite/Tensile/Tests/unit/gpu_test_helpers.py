@@ -108,6 +108,9 @@ def _create_kernel(cfg, mi_wave_group=None):
 
     return {
         "DepthU": cfg.depth_u,
+        "_DepthU": cfg.depth_u,
+        "_DepthUA": cfg.depth_u,
+        "_DepthUB": cfg.depth_u,
         "MacroTileA": cfg.mt_a,
         "MacroTileB": cfg.mt_b,
         "MacroTile0": cfg.mt_a,
