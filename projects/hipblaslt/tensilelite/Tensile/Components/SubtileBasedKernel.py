@@ -197,9 +197,7 @@ class TileInfo:
       miWaveGroupSize1 = 1
 
       macroTile = kernel["MacroTileA"] if isA else kernel["MacroTileB"]
-      depthU = kernel["DepthU"]
-      if isMXSAB:
-        depthU //= kernel["ProblemType"].get("MXBlock%s"%_tc)
+      depthU = kernel["_DepthU%s"%tc]
       # TODO: Need to update ProblemType to query scale size?
       bpe = kernel["ProblemType"]["DataType%s"%tc].numBytes() if isAB else 1
       self.bpe = bpe
@@ -1060,7 +1058,9 @@ def _applyScaleWavePartitionLROffset(module, writer, kernel, tileInfo, waveId):
   if tc == 'MXSA':
     module.add(VAndB32(dst=vgpr(tmp), src0=kernel["MIWaveGroup"][0]-1, src1=vgpr(waveId), comment="scale%s: waveId %% 2"%tc))
   else:
-    module.add(VLShiftRightB32(dst=vgpr(tmp), shiftHex=int(math.log2(kernel["MIWaveGroup"][1])), src=vgpr(waveId), comment="scale%s: waveId / 2"%tc))
+    # N-direction wave index = waveId / numWavesInM (MIWaveGroup[0])
+    # Using MIWaveGroup[0] (not [1]) correctly handles asymmetric configs like 4x1.
+    module.add(VLShiftRightB32(dst=vgpr(tmp), shiftHex=int(math.log2(kernel["MIWaveGroup"][0])), src=vgpr(waveId), comment="scale%s: waveId / numWavesM"%tc))
 
   module.add(SMovB32(dst=sgpr(tmpSgpr), src=totalScaleBytes, comment="scale%s: scale region"%tc))
   module.add(VMulLOU32(dst=vgpr(tileInfo.sharedVgprLROffset[0]), src0=sgpr(tmpSgpr), src1=vgpr(tmp), comment="scale%s: partition offset"%tc))
@@ -1128,6 +1128,17 @@ def lraTileAssignmentScaleSwizzled(writer, kernel):
 
   module.add(SMovB32(dst=sgpr(tmpSgpr), src=hex(writer.ldsStartOffsetMXSB), comment="scale: LDS offset for B scale"))
   module.add(VAddU32(dst=vgpr(mxsbTileInfo.sharedVgprLROffset[0]), src0=vgpr(mxsbTileInfo.sharedVgprLROffset[0]), src1=sgpr(tmpSgpr), comment="scaleB: +=LDS offset"))
+
+  # Init scale LR swap VGPRs here, after the LR offsets are fully computed.
+  # (Must NOT be done in localReadDTLInitCommonSwapVgpr, which runs before this function.)
+  module.add(SMovB32(dst=sgpr(tmpSgpr), src=writer.ldsTotalSize, comment="scale: total LDS size for swap"))
+  for tileInfo in [mxsaTileInfo, mxsbTileInfo]:
+    for i in range(len(tileInfo.sharedVgprLROffset)):
+      vgprId     = tileInfo.sharedVgprLROffset[i]
+      vgprSwapId = tileInfo.sharedVgprLROffsetSwap[i]
+      module.add(VAddU32(dst=vgpr(vgprSwapId), src0=vgpr(vgprId), src1=sgpr(tmpSgpr), comment="scale%s: LR swap"%tileInfo.tc))
+      module.add(VXorB32(dst=vgpr(vgprSwapId), src0=vgpr(vgprId), src1=vgpr(vgprSwapId), comment="scale%s: LR swap"%tileInfo.tc))
+
   writer.sgprPool.checkIn(tmpSgpr)
 
   return module
