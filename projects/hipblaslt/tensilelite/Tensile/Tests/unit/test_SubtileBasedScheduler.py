@@ -31,7 +31,7 @@ def create_kernel(MT0=256, MT1=256):
     return {
         "DepthU": 64,
         "_DepthUA": 64,
-        "_DepthUB": 64,                
+        "_DepthUB": 64,
         "MacroTileA": MT0,
         "MacroTileB": MT1,
         "MacroTile0": MT0,
