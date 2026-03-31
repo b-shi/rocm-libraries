@@ -35,6 +35,8 @@
 #include "Rotating.hpp"
 
 #include <cstddef>
+#include <cstdlib>
+#include <cstring>
 #include <random>
 
 #include "RunListener.hpp"
@@ -88,6 +90,9 @@ namespace TensileLite
             TrigIndCos, // 24
             TrigIndAbsSin, // 25
             TrigIndAbsCos, // 26
+            MXScaleBlockSerial, // 27 - each 32x8 scale tile gets incrementing constant
+            MXScaleSparseBlock, // 28 - one tile (env MXSCALE_BLOCK_I/J) = 0x7F, rest = 0x00
+            MXScaleSparseBlockRandom, // 29 - one tile = random 0x00/0x7F, rest = 0x00
             Count
         };
 
@@ -103,7 +108,10 @@ namespace TensileLite
             return mode == InitMode::SerialIdx || mode == InitMode::SerialDim0
                    || mode == InitMode::SerialDim1 || mode == InitMode::Identity
                    || mode == InitMode::TrigSin || mode == InitMode::TrigCos
-                   || mode == InitMode::TrigAbsSin || mode == InitMode::TrigAbsCos;
+                   || mode == InitMode::TrigAbsSin || mode == InitMode::TrigAbsCos
+                   || mode == InitMode::MXScaleBlockSerial
+                   || mode == InitMode::MXScaleSparseBlock
+                   || mode == InitMode::MXScaleSparseBlockRandom;
         }
 
         std::string ToString(InitMode mode);
@@ -530,6 +538,9 @@ namespace TensileLite
                 case InitMode::TrigIndCos:
                 case InitMode::TrigIndAbsSin:
                 case InitMode::TrigIndAbsCos:
+                case InitMode::MXScaleBlockSerial:
+                case InitMode::MXScaleSparseBlock:
+                case InitMode::MXScaleSparseBlockRandom:
                 case InitMode::Count:
                     throw std::runtime_error("Invalid InitMode.");
                 }
@@ -620,6 +631,11 @@ namespace TensileLite
                 case InitMode::TrigIndAbsCos:
                     initArrayTrig<T, true, true>(array, elements);
                     break;
+                case InitMode::MXScaleBlockSerial:
+                case InitMode::MXScaleSparseBlock:
+                case InitMode::MXScaleSparseBlockRandom:
+                    throw std::runtime_error(
+                        "MXScale-specific init modes require tensor descriptor.");
                 case InitMode::Count:
                     throw std::runtime_error("Invalid InitMode.");
                 }
@@ -709,6 +725,15 @@ namespace TensileLite
                 case InitMode::RandomNegPosLimited:
                     initArray<T, InitMode::RandomNegPosLimited>(array, tensor);
                     break;
+                case InitMode::MXScaleBlockSerial:
+                    initArrayMXScaleBlockSerial<T>(array, tensor);
+                    break;
+                case InitMode::MXScaleSparseBlock:
+                    initArrayMXScaleSparseBlock<T>(array, tensor);
+                    break;
+                case InitMode::MXScaleSparseBlockRandom:
+                    initArrayMXScaleSparseBlockRandom<T>(array, tensor);
+                    break;
                 case InitMode::Free:
                 case InitMode::Count:
                     throw std::runtime_error("Invalid InitMode.");
@@ -772,6 +797,98 @@ namespace TensileLite
                     size_t tensorIndex = tensor.index(coord) / TypeInfo<T>::Packing;
                     array[tensorIndex] = ConvertTo<T>(coord[dim]);
                 }
+            }
+
+            // MX scale tile dimensions: 32 rows x 8 cols = 256 bytes per tile
+            static constexpr size_t kMXScaleTileRows = 32;
+            static constexpr size_t kMXScaleTileCols = 8;
+
+            // Each 32x8 tile in the scale tensor gets a constant MXScale byte value
+            // that increments across consecutive tiles (wraps at 0xFE, skipping NaN=0xFF).
+            template <typename T>
+            void initArrayMXScaleBlockSerial(T* array, TensorDescriptor const& tensor)
+            {
+                static_assert(std::is_same_v<T, MXScale>,
+                              "MXScaleBlockSerial only valid for MXScale.");
+
+                auto const& sizes     = tensor.sizes();
+                size_t      scaleRows = sizes[0];
+                size_t      scaleCols = sizes[1];
+                size_t      stride1   = tensor.strides()[1];
+
+                size_t numTileRows = (scaleRows + kMXScaleTileRows - 1) / kMXScaleTileRows;
+                size_t numTileCols = (scaleCols + kMXScaleTileCols - 1) / kMXScaleTileCols;
+
+                uint8_t tileValue = 0;
+                for(size_t tr = 0; tr < numTileRows; tr++)
+                {
+                    for(size_t tc = 0; tc < numTileCols; tc++)
+                    {
+                        size_t rEnd = std::min((tr + 1) * kMXScaleTileRows, scaleRows);
+                        size_t cEnd = std::min((tc + 1) * kMXScaleTileCols, scaleCols);
+                        for(size_t r = tr * kMXScaleTileRows; r < rEnd; r++)
+                            for(size_t c = tc * kMXScaleTileCols; c < cEnd; c++)
+                                array[r + c * stride1] = MXScale(tileValue);
+                        tileValue = (tileValue >= 0xFE) ? 0 : tileValue + 1;
+                    }
+                }
+            }
+
+            // Fills a single 32x8 tile in the scale tensor using m_mxScaleBlockI/J.
+            // fillFn(r, c) returns the MXScale value for element (r, c) within the tile.
+            template <typename FillFn>
+            void fillMXScaleSparseTile(MXScale*                   array,
+                                       TensorDescriptor const&    tensor,
+                                       FillFn                     fillFn)
+            {
+                auto const& sizes     = tensor.sizes();
+                size_t      scaleRows = sizes[0];
+                size_t      scaleCols = sizes[1];
+                size_t      stride1   = tensor.strides()[1];
+                size_t      totalElems = tensor.totalAllocatedElements();
+
+                // Clamp tile indices to valid range
+                size_t maxI    = scaleRows / kMXScaleTileRows;
+                size_t maxJ    = scaleCols / kMXScaleTileCols;
+                size_t targetI = (m_mxScaleBlockI >= 0) ? static_cast<size_t>(m_mxScaleBlockI) : 0;
+                size_t targetJ = (m_mxScaleBlockJ >= 0) ? static_cast<size_t>(m_mxScaleBlockJ) : 0;
+                if(targetI >= maxI)
+                    targetI = (maxI > 0) ? maxI - 1 : 0;
+                if(targetJ >= maxJ)
+                    targetJ = (maxJ > 0) ? maxJ - 1 : 0;
+
+                std::memset(array, 0x00, totalElems * sizeof(MXScale));
+
+                size_t rStart = targetI * kMXScaleTileRows;
+                size_t cStart = targetJ * kMXScaleTileCols;
+                size_t rEnd   = std::min(rStart + kMXScaleTileRows, scaleRows);
+                size_t cEnd   = std::min(cStart + kMXScaleTileCols, scaleCols);
+                for(size_t r = rStart; r < rEnd; r++)
+                    for(size_t c = cStart; c < cEnd; c++)
+                        array[r + c * stride1] = fillFn(r, c);
+            }
+
+            // All scale bytes 0x00 except one 32x8 tile (m_mxScaleBlockI/J) = 0x7F.
+            template <typename T>
+            void initArrayMXScaleSparseBlock(T* array, TensorDescriptor const& tensor)
+            {
+                static_assert(std::is_same_v<T, MXScale>,
+                              "MXScaleSparseBlock only valid for MXScale.");
+                fillMXScaleSparseTile(array, tensor,
+                    [](size_t, size_t) { return MXScale(static_cast<uint8_t>(0x7F)); });
+            }
+
+            // All scale bytes 0x00 except one 32x8 tile = random 0x00 or 0x7F per element.
+            template <typename T>
+            void initArrayMXScaleSparseBlockRandom(T* array, TensorDescriptor const& tensor)
+            {
+                static_assert(std::is_same_v<T, MXScale>,
+                              "MXScaleSparseBlockRandom only valid for MXScale.");
+                fillMXScaleSparseTile(array, tensor,
+                    [](size_t, size_t) {
+                        uint8_t val = (getThreadLocalRandInt() % 2 == 0) ? 0x00 : 0x7F;
+                        return MXScale(val);
+                    });
             }
 
             template <>
@@ -1086,6 +1203,9 @@ namespace TensileLite
             /// and must be reinitialized for each problem. Pristine copy on GPU
             /// cannot be used with problem dependent data.
             bool m_problemDependentData = false;
+
+            int m_mxScaleBlockI = 0;
+            int m_mxScaleBlockJ = 0;
 
             int64_t                         m_rotatingBuffer = 0;
             std::shared_ptr<RotatingMemory> m_rm;
@@ -2573,6 +2693,21 @@ namespace TensileLite
         inline MXScale DataInitialization::getValue<MXScale, InitMode::BadOutput>()
         {
             return MXScale(0xff);
+        }
+        template <>
+        inline MXScale DataInitialization::getValue<MXScale, InitMode::MXScaleBlockSerial>()
+        {
+            throw std::runtime_error("MXScaleBlockSerial requires tensor descriptor.");
+        }
+        template <>
+        inline MXScale DataInitialization::getValue<MXScale, InitMode::MXScaleSparseBlock>()
+        {
+            throw std::runtime_error("MXScaleSparseBlock requires tensor descriptor.");
+        }
+        template <>
+        inline MXScale DataInitialization::getValue<MXScale, InitMode::MXScaleSparseBlockRandom>()
+        {
+            throw std::runtime_error("MXScaleSparseBlockRandom requires tensor descriptor.");
         }
 
         template <>

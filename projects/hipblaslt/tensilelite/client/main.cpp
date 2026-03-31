@@ -243,6 +243,8 @@ namespace TensileLite
                 ("init-scaleAlphaVec",       po::value<InitMode>()->default_value(InitMode::One), "Initialization for scaleAlphaVec")
                 ("init-mxScaleA",            po::value<InitMode>()->default_value(InitMode::One), "Initialization for MX Scale for A")
                 ("init-mxScaleB",            po::value<InitMode>()->default_value(InitMode::One), "Initialization for MX Scale for B")
+                ("mx-scale-block-i",         po::value<int>()->default_value(0), "MX scale sparse block tile row index")
+                ("mx-scale-block-j",         po::value<int>()->default_value(0), "MX scale sparse block tile col index")
                 ("pristine-on-gpu",          po::value<bool>()->default_value(true), "Keep a pristine copy of inputs on GPU for performance")
                 ("c-equal-d",                po::value<bool>()->default_value(false), "C equals D")
                 ("offset-a",                 po::value<size_t>()->default_value(0), "buffer a start offset")
