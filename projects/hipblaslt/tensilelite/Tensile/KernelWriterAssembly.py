@@ -13430,7 +13430,8 @@ class KernelWriterAssembly(KernelWriter):
     # TODO: Which of DataType or DestDataType is in a better sense? 0114: Check Using DestDataType + HSS
     destType = kernel["ProblemType"]["DestDataType"]
     srcType  = kernel["ProblemType"]["DataType"]
-    if (srcType.isHalf() or srcType.isBFloat16() or destType.isHalf() or destType.isBFloat16()):
+    subtileImplDest16b = kernel.get("UseSubtileImpl") and (destType.isHalf() or destType.isBFloat16())
+    if (srcType.isHalf() or srcType.isBFloat16() or subtileImplDest16b):
       # only do an even number of halves - since these share hi/lo pieces of some registers?
       if numElementsPerBatch > 1:
         numElementsPerBatch = int(numElementsPerBatch/2)*2
