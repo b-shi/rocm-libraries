@@ -806,15 +806,15 @@ class GlobalWriteBatchWriter:
         module.add(VMovB32(vgpr(self.cvtVgprStruct.vgprFp32Nan), "0x7fff0000", comment="fp32 Nan" ))
         module.add(VMovB32(vgpr(self.cvtVgprStruct.vgprBf16Inc), "0x7fff", comment="rounding bias for bfloat16" ))
     # is16bitSubtile: controls partner-lane address setup for dwordx4 paired-subtile stores.
-    # Must match is16bitSubtilePaired (per-element store dispatch) exactly — both exclude only
-    # "MultipleBufferSingleKernel" (MBSK workspace writes).  "MultipleBuffer" (StreamK partial-tile
-    # path that writes directly to D) must NOT be excluded: it also needs the paired bf16 store.
+    # Must match is16bitSubtilePaired (per-element store dispatch) exactly.
+    # Excluded for "MultipleBufferSingleKernel" and "MultipleBuffer" (StreamK partial-tile
+    # workspace path) — both write float32 to workspace, not 16bit to D output.
     is16bitSubtile = (
       self.kernel.get("UseSubtileImpl") and not self.edge
       and (self.kernel["ProblemType"]["DestDataType"].isBFloat16() or
            self.kernel["ProblemType"]["DestDataType"].isHalf())
       and self.kernel["ProblemType"]["HighPrecisionAccumulate"]
-      and self.kernel["_GlobalAccumulation"] != "MultipleBufferSingleKernel"
+      and self.kernel["_GlobalAccumulation"] not in ("MultipleBufferSingleKernel", "MultipleBuffer")
     )
     if is16bitSubtile:
       assert self.kernel["BufferStore"], \
@@ -1174,7 +1174,7 @@ class GlobalWriteBatchWriter:
           and (self.kernel["ProblemType"]["DestDataType"].isBFloat16() or
                self.kernel["ProblemType"]["DestDataType"].isHalf())
           and self.kernel["ProblemType"]["HighPrecisionAccumulate"]
-          and self.kernel["_GlobalAccumulation"] != "MultipleBufferSingleKernel"
+          and self.kernel["_GlobalAccumulation"] not in ("MultipleBufferSingleKernel", "MultipleBuffer")
         )
         if self.kernel["ProblemType"]["DestDataType"].isHalf():
           # For UseSubtileImpl non-edge: paired dwordx4 path handles packing in _emit16bitSubtilePairedStore.
@@ -1252,7 +1252,7 @@ class GlobalWriteBatchWriter:
           and (self.kernel["ProblemType"]["DestDataType"].isBFloat16() or
                self.kernel["ProblemType"]["DestDataType"].isHalf())
           and self.kernel["ProblemType"]["HighPrecisionAccumulate"]
-          and self.kernel["_GlobalAccumulation"] != "MultipleBufferSingleKernel"
+          and self.kernel["_GlobalAccumulation"] not in ("MultipleBufferSingleKernel", "MultipleBuffer")
         )
         storeCodeModule = storeCode if self.kernel["GroupLoadStore"] else module
         if is16bitSubtilePaired:
