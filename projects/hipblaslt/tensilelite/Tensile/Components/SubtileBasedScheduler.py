@@ -439,7 +439,10 @@ class SubtileBasedScheduler:
         preloopOps.append(SyncOp(comment="Barrier: wait for GR data before LR"))
         preloopOps.extend(lrOps)
         preloopOps.append(WaitLROp())
-        preloopOps.append(SkipOp(compare="LE", value=1, target="NLL"))
+        # With double-buffered scale VGPRs, counterL<=1 skips to a separate NLL
+        # that reads from scale set 0 (where the preloop LR wrote).
+        nllTarget = "NLLEarly" if self.hasScale else "NLL"
+        preloopOps.append(SkipOp(compare="LE", value=1, target=nllTarget))
         mt1Complete = (set(preloadMT1_A) == set(allA) and set(preloadMT1_B) == set(allB))
         preloopOps.append(GROp(mtIteration="1",
                                subtileA=preloadMT1_A, subtileB=preloadMT1_B,
@@ -447,6 +450,11 @@ class SubtileBasedScheduler:
         if mt1Complete:
             preloopOps.append(GR_INCOp())
         preloopOps.append(SkipOp(compare="LE", value=2, target="NGLL"))
+        # With double-buffered scale VGPRs, the mainloop is 2x unrolled.
+        # counterL == 3 means only 1 mainloop iteration is needed, which can't
+        # fill a 2x unrolled body. Skip directly to NGLL (which handles it).
+        if self.hasScale:
+            preloopOps.append(SkipOp(compare="LE", value=3, target="NGLL"))
         preloopSik = SubIterKSchedule(subIterK=0)
         preloopSik.ops = preloopOps
         self.preloopSteps: List[PartitionSchedule] = [
@@ -1113,9 +1121,12 @@ class SubtileBasedScheduler:
             self.vgprTiles.append(tile)
 
         # Allocate scale VGPRs: 1 VGPR per scale tile (each covers 2 M-adjacent subtiles)
-        self.scaleVgprTiles = []
+        # Double-buffer: two sets (ping/pong) so MFMA can read one set while ds_read writes the other
+        self.scaleVgprTiles = []     # set 0
+        self.scaleVgprTilesAlt = []  # set 1
         for _ in range(self.allocator.totalScaleVGPRTiles):
             self.scaleVgprTiles.append(writer.vgprPool.checkOut(1))
+            self.scaleVgprTilesAlt.append(writer.vgprPool.checkOut(1))
 
 
     def deallocVgprTiles(self, writer):
@@ -1127,14 +1138,18 @@ class SubtileBasedScheduler:
                     pool.checkIn(val)
         self.vgprTiles = []
 
-        for vgpr in self.scaleVgprTiles:
-            writer.vgprPool.checkIn(vgpr)
+        for v in self.scaleVgprTiles:
+            writer.vgprPool.checkIn(v)
         self.scaleVgprTiles = []
+        for v in self.scaleVgprTilesAlt:
+            writer.vgprPool.checkIn(v)
+        self.scaleVgprTilesAlt = []
 
 
-    def emitMFMA(self, writer, kernel, op, dtileInfo):
+    def emitMFMA(self, writer, kernel, op, dtileInfo, scaleSet=0):
         """Emit MFMA instructions for a single MFMAOp."""
         module = Module()
+        scaleTiles = self.scaleVgprTiles if scaleSet == 0 else self.scaleVgprTilesAlt
 
         for (a, b) in op.subtiles:
             aTile = self.vgprTiles[op.vgprTileMapA[a]]
@@ -1144,8 +1159,8 @@ class SubtileBasedScheduler:
             if self.hasScale:
                 scaleGroupA = a // 2
                 scaleGroupB = b // 2
-                scaleAVgpr = self.scaleVgprTiles[op.scaleMapA[scaleGroupA]]
-                scaleBVgpr = self.scaleVgprTiles[op.scaleMapB[scaleGroupB]]
+                scaleAVgpr = scaleTiles[op.scaleMapA[scaleGroupA]]
+                scaleBVgpr = scaleTiles[op.scaleMapB[scaleGroupB]]
                 sAsel = (a % 2) + 2 * (op.subIterK % 2)
                 sBsel = (b % 2) + 2 * (op.subIterK % 2)
             else:
@@ -1160,9 +1175,10 @@ class SubtileBasedScheduler:
 
         return module
 
-    def emitLR(self, writer, kernel, op):
+    def emitLR(self, writer, kernel, op, scaleSet=0):
         """Emit LR (Local Read) ds_load instructions for a single LROp.
-        Scale LRs (DSLoadB32) are also emitted here, using scheduler-managed VGPRs."""
+        Scale LRs (DSLoadB32) are also emitted here, using scheduler-managed VGPRs.
+        scaleSet selects which scale VGPR set the ds_reads write to."""
         module = Module()
         for tA, vgprTileId in op.lrLoadA.items():
             dstTile = self.vgprTiles[vgprTileId]
@@ -1172,23 +1188,23 @@ class SubtileBasedScheduler:
             dstTile = self.vgprTiles[vgprTileId]
             module.add(emitSingleDsRead(
                 self.tileInfoB, tB, op.subIterK, dstTile))
-        # Emit scale ds_reads using scheduler-allocated VGPRs
         if op.lrScaleA:
-            self._emitScaleDsReads(module, writer, 'MXSA', op.lrScaleA)
+            self._emitScaleDsReads(module, writer, 'MXSA', op.lrScaleA, scaleSet=scaleSet)
         if op.lrScaleB:
-            self._emitScaleDsReads(module, writer, 'MXSB', op.lrScaleB)
+            self._emitScaleDsReads(module, writer, 'MXSB', op.lrScaleB, scaleSet=scaleSet)
         return module
 
-    def _emitScaleDsReads(self, module, writer, tc, lrScale):
+    def _emitScaleDsReads(self, module, writer, tc, lrScale, scaleSet=0):
         """Emit DSLoadB32 for scale groups using scheduler-managed VGPRs."""
         tileInfo = self.scaleTileInfoA if tc == 'MXSA' else self.scaleTileInfoB
+        scaleTiles = self.scaleVgprTiles if scaleSet == 0 else self.scaleVgprTilesAlt
         # Each scale group covers 2 M-adjacent [1,2] subtiles = 4 bytes per lane.
         # dsOffset stride per group = 2 * tileInfo.subtileSize (since [1,2] subtileSize
         # covers 1 subtile, and a group is 2 subtiles).
         groupStride = 2 * tileInfo.subtileSize
         for scaleGroupIdx, scaleVgprTileId in lrScale.items():
             dsOffset = groupStride * scaleGroupIdx
-            vdst = self.scaleVgprTiles[scaleVgprTileId]
+            vdst = scaleTiles[scaleVgprTileId]
             module.add(DSLoadB32(dst=vgpr(vdst),
                                  src=vgpr(tileInfo.sharedVgprLROffset[0]),
                                  ds=DSModifiers(offset=dsOffset),
@@ -1229,8 +1245,12 @@ class SubtileBasedScheduler:
                 module.add(emitSingleBufferLoad(tileInfo, sId0, 0))
         return module
 
-    def _emitSubIterK(self, writer, kernel, pss, dus):
-        """Emit a single subIterK step into a Module."""
+    def _emitSubIterK(self, writer, kernel, pss, dus, scaleSet=0, scaleLRSet=None):
+        """Emit a single subIterK step into a Module.
+        scaleSet: which scale VGPR set MFMA reads from.
+        scaleLRSet: which scale VGPR set LR writes to (defaults to scaleSet if None)."""
+        if scaleLRSet is None:
+            scaleLRSet = scaleSet
         dtileInfo = writer.states.d.tileInfo
         module = Module()
         module.addComment0(f"Partition {pss.partitionId}: subIterK={dus.subIterK}")
@@ -1250,7 +1270,7 @@ class SubtileBasedScheduler:
                     module.add(globalReadScalePtrUpdates('MXSA', writer, kernel))
                     module.add(globalReadScalePtrUpdates('MXSB', writer, kernel))
             elif isinstance(op, MFMAOp):
-                module.add(self.emitMFMA(writer, kernel, op, dtileInfo))
+                module.add(self.emitMFMA(writer, kernel, op, dtileInfo, scaleSet=scaleSet))
             elif isinstance(op, WaitGROp):
                 module.add(self.emitWaitGR(op.inflightLoadsA, op.inflightLoadsB, hasScale))
             elif isinstance(op, WaitLROp):
@@ -1264,7 +1284,7 @@ class SubtileBasedScheduler:
                     module.add(localReadLDSBufferSwap('MXSA', writer, kernel))
                     module.add(localReadLDSBufferSwap('MXSB', writer, kernel))
             elif isinstance(op, LROp):
-                module.add(self.emitLR(writer, kernel, op))
+                module.add(self.emitLR(writer, kernel, op, scaleSet=scaleLRSet))
             elif isinstance(op, SkipOp):
                 skipLabel = Label(f"SkipTo{op.target}", "")
                 cmpMap = {"EQ": SCmpEQU32, "LE": SCmpLeU32}
@@ -1325,11 +1345,10 @@ class SubtileBasedScheduler:
 
         def classify(slot):
             first = slot[0]
-            # DSLoadB32 = scale LR (ds_read_b32): treat as OTHER_SLOT so no MFMAs
-            # interleave with it. Scale VGPRs must complete (via WaitLROp) before
-            # subsequent MFMAs read them; interleaving would create a race condition.
+            # DSLoadB32 = scale LR (ds_read_b32): with double-buffered scale VGPRs,
+            # MFMA reads from one set while ds_read writes to another, so interleaving is safe.
             if isinstance(first, DSLoadB32):
-                return OTHER_SLOT
+                return LR_SLOT
             if isinstance(first, LocalReadInstruction):
                 return LR_SLOT
             if isinstance(first, SWaitCnt):
@@ -1410,17 +1429,21 @@ class SubtileBasedScheduler:
 
         return result
 
-    def _emitLoop(self, writer, kernel, label, steps):
+    def _emitLoop(self, writer, kernel, label, steps, scaleSet=0, scaleLRSet=None):
         """Emit a loop module (mainloop, NGLL, or NLL).
 
         Emits each subIterK step as a separate module, applies instruction
         interleaving, then combines into the final loop module.
         All waits (WAIT_LR, WAIT_GR, SyncOp) are explicit schedule ops.
+
+        scaleSet: which scale VGPR set MFMA reads from.
+        scaleLRSet: which scale VGPR set LR writes to (defaults to scaleSet if None).
         """
         module = Module(label)
         for pss in steps:
             for dus in pss.subIterKSteps:
-                subModule = self._emitSubIterK(writer, kernel, pss, dus)
+                subModule = self._emitSubIterK(writer, kernel, pss, dus,
+                                               scaleSet=scaleSet, scaleLRSet=scaleLRSet)
                 subModule = self.instructionSchedule(subModule)
                 module.add(subModule)
         return module

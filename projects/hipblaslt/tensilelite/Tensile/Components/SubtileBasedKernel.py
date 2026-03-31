@@ -1723,31 +1723,75 @@ def mainLoop(writer, kernel):
     scheduler.allocVgprTiles(writer)
 
     # Preloop (includes SKIP_IF_EQ(1,NLL) and SKIP_IF_LE(2,NGLL))
-    module.add(scheduler._emitLoop(writer, kernel, "PRELOOP", scheduler.preloopSteps))
+    if scheduler.hasScale:
+      # Preloop LR writes directly to scale set 0 (no double-buffer flip).
+      # scaleSet=0 for MFMA (no MFMAs in preloop), scaleLRSet=0 for LR writes.
+      module.add(scheduler._emitLoop(writer, kernel, "PRELOOP", scheduler.preloopSteps,
+                                     scaleSet=0, scaleLRSet=0))
+    else:
+      module.add(scheduler._emitLoop(writer, kernel, "PRELOOP", scheduler.preloopSteps))
 
     # Mainloop
     skipMainloop = Label("SkipMainloop", "")
     loopBegin = Label("LoopBeginL", "")
     module.addComment0("MAINLOOP")
-    module.add(loopBegin)
-    module.add(scheduler._emitLoop(writer, kernel, "MAINLOOP", scheduler.mainloopSteps))
-    module.add(SSubU32(dst=sgpr("LoopCounterL"), src0=sgpr("LoopCounterL"), src1=1,
-                       comment="dec counterL"))
-    module.add(SCmpEQU32(src0=sgpr("LoopCounterL"), src1=2,
-                         comment="counterL == 2?"))
-    module.add(SCBranchSCC0(labelName=loopBegin.getLabelName(),
-                            comment="restart mainloop"))
+
+    if scheduler.hasScale:
+      # Double-buffered scale VGPRs: 2x unrolled mainloop.
+      # Copy 1: MFMA reads scale set 0, LR writes scale set 1
+      # Copy 2: MFMA reads scale set 1, LR writes scale set 0
+      # Preloop skip guard LE 3 → NGLL ensures counterL >= 4 here.
+      module.add(loopBegin)
+      module.add(scheduler._emitLoop(writer, kernel, "MAINLOOP_C1", scheduler.mainloopSteps,
+                                     scaleSet=0, scaleLRSet=1))
+      module.add(SSubU32(dst=sgpr("LoopCounterL"), src0=sgpr("LoopCounterL"), src1=1,
+                         comment="dec counterL (copy 1)"))
+      module.add(scheduler._emitLoop(writer, kernel, "MAINLOOP_C2", scheduler.mainloopSteps,
+                                     scaleSet=1, scaleLRSet=0))
+      module.add(SSubU32(dst=sgpr("LoopCounterL"), src0=sgpr("LoopCounterL"), src1=1,
+                         comment="dec counterL (copy 2)"))
+      module.add(SCmpEQU32(src0=sgpr("LoopCounterL"), src1=2,
+                           comment="counterL == 2?"))
+      module.add(SCBranchSCC0(labelName=loopBegin.getLabelName(),
+                              comment="restart mainloop"))
+    else:
+      module.add(loopBegin)
+      module.add(scheduler._emitLoop(writer, kernel, "MAINLOOP", scheduler.mainloopSteps))
+      module.add(SSubU32(dst=sgpr("LoopCounterL"), src0=sgpr("LoopCounterL"), src1=1,
+                         comment="dec counterL"))
+      module.add(SCmpEQU32(src0=sgpr("LoopCounterL"), src1=2,
+                           comment="counterL == 2?"))
+      module.add(SCBranchSCC0(labelName=loopBegin.getLabelName(),
+                              comment="restart mainloop"))
 
     # NGLL
     module.add(skipMainloop)
     module.addComment0("NGLL")
     module.add(Label("SkipToNGLL", ""))
-    module.add(scheduler._emitLoop(writer, kernel, "NGLL", scheduler.ngllSteps))
+    if scheduler.hasScale:
+      # After mainloop copy 2 (LR wrote set 0) or preloop skip (LR wrote set 0).
+      # NGLL: MFMA reads set 0, LR writes set 1.
+      module.add(scheduler._emitLoop(writer, kernel, "NGLL", scheduler.ngllSteps,
+                                     scaleSet=0, scaleLRSet=1))
+    else:
+      module.add(scheduler._emitLoop(writer, kernel, "NGLL", scheduler.ngllSteps))
 
     # NLL
     module.addComment0("NLL")
     module.add(Label("SkipToNLL", ""))
-    module.add(scheduler._emitLoop(writer, kernel, "NLL", scheduler.nllSteps))
+    if scheduler.hasScale:
+      # After NGLL (LR wrote set 1). NLL: MFMA reads set 1 (no LR in NLL).
+      module.add(scheduler._emitLoop(writer, kernel, "NLL", scheduler.nllSteps, scaleSet=1))
+      # NLLEarly: reached when counterL<=1 (preloop skip, no NGLL).
+      # Preloop LR wrote scale set 0, so MFMA reads set 0.
+      endLabel = Label("SkipToEnd", "")
+      module.add(SBranch(labelName=endLabel.getLabelName(), comment="skip NLLEarly"))
+      module.addComment0("NLLEarly")
+      module.add(Label("SkipToNLLEarly", ""))
+      module.add(scheduler._emitLoop(writer, kernel, "NLLEarly", scheduler.nllSteps, scaleSet=0))
+      module.add(endLabel)
+    else:
+      module.add(scheduler._emitLoop(writer, kernel, "NLL", scheduler.nllSteps))
 
     scheduler.deallocVgprTiles(writer)
 
