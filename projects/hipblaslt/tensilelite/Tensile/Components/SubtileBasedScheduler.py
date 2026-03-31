@@ -450,11 +450,6 @@ class SubtileBasedScheduler:
         if mt1Complete:
             preloopOps.append(GR_INCOp())
         preloopOps.append(SkipOp(compare="LE", value=2, target="NGLL"))
-        # With double-buffered scale VGPRs, the mainloop is 2x unrolled.
-        # counterL == 3 means only 1 mainloop iteration is needed, which can't
-        # fill a 2x unrolled body. Skip directly to NGLL (which handles it).
-        if self.hasScale:
-            preloopOps.append(SkipOp(compare="LE", value=3, target="NGLL"))
         preloopSik = SubIterKSchedule(subIterK=0)
         preloopSik.ops = preloopOps
         self.preloopSteps: List[PartitionSchedule] = [
