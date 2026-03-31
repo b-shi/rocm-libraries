@@ -104,6 +104,8 @@ Reuse: ACROSS_SUBGROUP
 hasDuplicatedReads: False
 needsUnrolling: False
 totalVGPRTiles: 8 (32 VGPRs)
+totalScaleVGPRTiles: 0
+hasScale: False
 
 Ordering grid (COLUMN_MAJOR):
    0
@@ -214,6 +216,8 @@ Reuse: ACROSS_SUBGROUP
 hasDuplicatedReads: False
 needsUnrolling: False
 totalVGPRTiles: 8 (32 VGPRs)
+totalScaleVGPRTiles: 0
+hasScale: False
 
 Ordering grid (COLUMN_MAJOR):
    0   2

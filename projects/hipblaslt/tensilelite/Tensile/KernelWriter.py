@@ -3877,7 +3877,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
 
     for tileInfo in [mxsatileInfo, mxsbtileInfo]:
       if tileInfo:
-        tileInfo.allocVgprTileRegisters(self, kernel)
+        tileInfo.allocVgprTileRegisters(self, kernel, schedulerManaged=(pgr == 2))
     module.add(initVgprTilesToZero(self, kernel, dtileInfo))
 
     if pgr != 2:
