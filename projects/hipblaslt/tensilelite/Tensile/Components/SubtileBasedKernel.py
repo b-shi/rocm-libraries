@@ -1223,7 +1223,8 @@ def globalReadScalePtrUpdates(tc, writer, kernel):
   module.add(SAddU32(dst=sgpr("Srd%s" % tc), src0=sgpr("Srd%s" % tc), src1=inc))
   module.add(SAddCU32(dst=sgpr("Srd%s+1" % tc), src0=sgpr("Srd%s+1" % tc), src1=0))
 
-  module.add(SSubU32(dst=sgpr("Srd%s+2"%tc), src0=sgpr("Srd%s+2"%tc), src1=inc))
+  # No need to decrement Srd+2
+  # We use fixed value for Srd+2
 
   return module
 
