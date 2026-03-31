@@ -6554,10 +6554,10 @@ class KernelWriter(metaclass=abc.ABCMeta):
         and kernel["MIArchVgpr"] \
         and (kernel["_GlobalAccumulation"] == 'SingleBuffer' or kernel["_GlobalAccumulation"] == None):
 
-      # need proper alignment
-      vgprIdx = ((vgprIdx+2 - 1)//2)*2
-      self.states.startVgprAlphaTmp = vgprIdx
-      vgprIdx += kernel["ProblemType"]["MacDataTypeA"].numRegisters()
+        # need proper alignment
+        vgprIdx = ((vgprIdx+2 - 1)//2)*2
+        self.states.startVgprAlphaTmp = vgprIdx
+        vgprIdx += kernel["ProblemType"]["MacDataTypeA"].numRegisters()
 
       # for swapping vgpr offsets of different lds buffers
       if self.states.a.numVgprLocalReadSwapAddr > 0:
