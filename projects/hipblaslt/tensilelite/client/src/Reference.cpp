@@ -2465,7 +2465,7 @@ namespace TensileLite
             }
             case TypedGemm_F4_B_S::TypeId():
             {
-                return ReferenceSolution<TypedGemm_F4_B_S>::SolveCPU(
+                return ReferenceSolution<TypedGemm_F4_B_S, float>::SolveCPU(
                     problem, inputs, elementsToValidate);
             }
 #endif //TENSILE_USE_FP4
