@@ -4244,7 +4244,7 @@ class KernelWriterAssembly(KernelWriter):
             for i in range(0, numDim):
               idx = indices[i]
               if idx == kernel["ProblemType"]["Index0"] or idx == kernel["ProblemType"]["Index1"]:
-                size = self.sizeRef(indices[idx])
+                size = self.sizeRef(idx)
                 module.add(SAddU32(dst=sgpr(stmp+0), src0=size, src1=(mxSwizzleSize0 - 1), comment="size + %u - 1"%mxSwizzleSize0))
                 module.add(SLShiftRightB32(dst=sgpr(stmp+0), src=sgpr(stmp+0), shiftHex=log2(mxSwizzleSize0), comment="roundup(size/%u)"%mxSwizzleSize0))
                 module.add(SSubU32(dst=sgpr(stmp+0), src0=sgpr(stmp+0), src1=sgpr(tileStart+0), comment="numBlkToEnd = roundUp(size/%u) - (WorkGroup[01] * roundup(MT/%u))"%(mxSwizzleSize0,mxSwizzleSize0)))
