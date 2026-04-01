@@ -105,12 +105,12 @@ class _VGPRPool:
 
 
 class VGPRTileAllocator:
-    """Maps (subtileIdx, subIterK) to shared integer VGPR tile IDs, with free-list reuse.
+    """VGPR tile allocator with free-list reuse, backed by two _VGPRPool instances.
 
-    Also tracks scale VGPR tile IDs separately. Scale tiles use a separate ID space
-    and free list because they are 1 VGPR each (vs 4 for A/B tiles).
-    Scale key is just scaleGroupIdx (= subtileIdx // 2), since one ds_read_b32 loads
-    4 bytes covering 2 M-adjacent subtiles, and scale data is constant across subIterK.
+    Tile pool: keyed by (subtileIdx, subIterK), one allocation per subtile per K step.
+    Scale pool: keyed by scaleGroupIdx (= subtileIdx // 2), since one ds_read_b32 loads
+    4 bytes covering 2 M-adjacent subtiles and scale data is constant across subIterK.
+    Both pools use the same subtileIdx-based API; the // 2 grouping is handled internally.
     """
 
     def __init__(self):
@@ -137,17 +137,36 @@ class VGPRTileAllocator:
             vid = allocMap.pop(k)
             self._tiles._freeList.append(vid)
 
-    def allocateScale(self, tc: str, scaleGroupIdx: int) -> int:
-        return self._scales.allocate(tc, scaleGroupIdx)
+    def allocateScale(self, tc: str, subtileIdx: int) -> Tuple[int, int, bool]:
+        """Allocate a scale VGPR for the group containing subtileIdx.
+        Returns (scaleGroupIdx, vgprTileId, isNew)."""
+        gid = subtileIdx // 2
+        if self._scales.isAllocated(tc, gid):
+            return gid, self._scales.get(tc, gid), False
+        return gid, self._scales.allocate(tc, gid), True
 
-    def releaseScale(self, tc: str, scaleGroupIdx: int) -> None:
-        self._scales.release(tc, scaleGroupIdx)
+    def getScaleVGPRTileId(self, tc: str, subtileIdx: int) -> Tuple[int, int]:
+        """Look up scale VGPR tile ID for the group containing subtileIdx.
+        Returns (scaleGroupIdx, vgprTileId)."""
+        gid = subtileIdx // 2
+        return gid, self._scales.get(tc, gid)
 
-    def isScaleAllocated(self, tc: str, scaleGroupIdx: int) -> bool:
-        return self._scales.isAllocated(tc, scaleGroupIdx)
+    def releaseScale(self, tc: str, subtileIdx: int) -> None:
+        """Release the scale group containing subtileIdx."""
+        self._scales.release(tc, subtileIdx // 2)
 
-    def getScaleVGPRTileId(self, tc: str, scaleGroupIdx: int) -> int:
-        return self._scales.get(tc, scaleGroupIdx)
+    def isScaleAllocated(self, tc: str, subtileIdx: int) -> bool:
+        return self._scales.isAllocated(tc, subtileIdx // 2)
+
+    def releaseScales(self, tc: str, currentTiles, futureTiles) -> None:
+        """Release scale groups used by currentTiles but not needed by futureTiles."""
+        futureGroups = {t // 2 for t in futureTiles}
+        released = set()
+        for t in currentTiles:
+            gid = t // 2
+            if gid not in futureGroups and gid not in released and self._scales.isAllocated(tc, gid):
+                self._scales.release(tc, gid)
+                released.add(gid)
 
     @property
     def totalVGPRTiles(self) -> int:
@@ -396,13 +415,13 @@ class SubtileBasedScheduler:
             lrScaleB = {}
             if self.hasScale and sik == 0:
                 for tA in first.tileAIndices:
-                    gid = tA // 2
-                    if not self.allocator.isScaleAllocated('A', gid):
-                        lrScaleA[gid] = self.allocator.allocateScale('A', gid)
+                    gid, vid, isNew = self.allocator.allocateScale('A', tA)
+                    if isNew:
+                        lrScaleA[gid] = vid
                 for tB in first.tileBIndices:
-                    gid = tB // 2
-                    if not self.allocator.isScaleAllocated('B', gid):
-                        lrScaleB[gid] = self.allocator.allocateScale('B', gid)
+                    gid, vid, isNew = self.allocator.allocateScale('B', tB)
+                    if isNew:
+                        lrScaleB[gid] = vid
 
             lrOps.append(LROp(mtIteration="0", subIterK=sik,
                               lrLoadA=lrLoadA, lrLoadB=lrLoadB,
@@ -483,13 +502,13 @@ class SubtileBasedScheduler:
                 scaleMapB = {}
                 if self.hasScale:
                     for tA in partition.tileAIndices:
-                        gid = tA // 2
+                        gid, vid = self.allocator.getScaleVGPRTileId('A', tA)
                         if gid not in scaleMapA:
-                            scaleMapA[gid] = self.allocator.getScaleVGPRTileId('A', gid)
+                            scaleMapA[gid] = vid
                     for tB in partition.tileBIndices:
-                        gid = tB // 2
+                        gid, vid = self.allocator.getScaleVGPRTileId('B', tB)
                         if gid not in scaleMapB:
-                            scaleMapB[gid] = self.allocator.getScaleVGPRTileId('B', gid)
+                            scaleMapB[gid] = vid
 
                 # LOAD: determined by prefetch mode
                 loadATiles, loadBTiles, loadSubIterK = self._getLoadTargets(pi, sik, numPartitions)
@@ -522,18 +541,14 @@ class SubtileBasedScheduler:
                 if self.hasScale and loadSubIterK == 0:
                     if loadATiles is not None:
                         for tA in loadATiles:
-                            gid = tA // 2
-                            if not self.allocator.isScaleAllocated('A', gid):
-                                lrScaleA[gid] = self.allocator.allocateScale('A', gid)
-                            elif isWrapAround:
-                                lrScaleA[gid] = self.allocator.getScaleVGPRTileId('A', gid)
+                            gid, vid, isNew = self.allocator.allocateScale('A', tA)
+                            if isNew or isWrapAround:
+                                lrScaleA[gid] = vid
                     if loadBTiles is not None:
                         for tB in loadBTiles:
-                            gid = tB // 2
-                            if not self.allocator.isScaleAllocated('B', gid):
-                                lrScaleB[gid] = self.allocator.allocateScale('B', gid)
-                            elif isWrapAround:
-                                lrScaleB[gid] = self.allocator.getScaleVGPRTileId('B', gid)
+                            gid, vid, isNew = self.allocator.allocateScale('B', tB)
+                            if isNew or isWrapAround:
+                                lrScaleB[gid] = vid
 
                 # Check MFMA and LOAD VGPRTile IDs don't overlap
                 mfmaIds = set(vgprTileMapA.values()) | set(vgprTileMapB.values())
@@ -729,16 +744,8 @@ class SubtileBasedScheduler:
 
         # Release scale VGPRs for scale groups not needed by any future partition
         if self.hasScale:
-            futureScaleA = {t // 2 for t in futureA}
-            futureScaleB = {t // 2 for t in futureB}
-            for tA in currentPartition.tileAIndices:
-                gid = tA // 2
-                if gid not in futureScaleA and self.allocator.isScaleAllocated('A', gid):
-                    self.allocator.releaseScale('A', gid)
-            for tB in currentPartition.tileBIndices:
-                gid = tB // 2
-                if gid not in futureScaleB and self.allocator.isScaleAllocated('B', gid):
-                    self.allocator.releaseScale('B', gid)
+            self.allocator.releaseScales('A', currentPartition.tileAIndices, futureA)
+            self.allocator.releaseScales('B', currentPartition.tileBIndices, futureB)
 
     def _releasePartitionTiles(self, partition: Partition):
         """WITHIN_SUBGROUP: release all tiles (all subIterK) of this partition."""
