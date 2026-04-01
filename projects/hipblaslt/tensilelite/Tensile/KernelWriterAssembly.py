@@ -4155,19 +4155,23 @@ class KernelWriterAssembly(KernelWriter):
     moduleLoadStridedBatch = Module("computeLoadSrd-StridedBatch")
     use64bShadowLimit = self.states.use64bShadowLimitMX if tc in ["MXSA", "MXSB"] else self.states.use64bShadowLimit
     isMX = tc in ("MXSA", "MXSB")
+    useFixedSrd2 = False # True means use fixed Srd+2 value. No need to calculate tensor2dSize, ShadowLimit
     if isMX:
+      useFixedSrd2 = True
       tcab = "A" if tc == "MXSA" else "B"
       mxBlock = kernel["ProblemType"]["MXBlock%s"%tcab]
       mxSwizzleSize0 = 32 # M,N direction
       mxSwizzleSize1 = 256 # K direction
+      mxSwizzleBlockSize = mxSwizzleSize0 * mxSwizzleSize1 // mxBlock
+    allocateTensor2dSize = use64bShadowLimit and not isMX
     numDim = len(indices)
-    with self.allocTmpSgpr(2 + 2 + (0 if use64bShadowLimit else 2)) as tmpSgprInfo:
+    with self.allocTmpSgpr(2 + 2 + (0 if allocateTensor2dSize else 2)) as tmpSgprInfo:
       stmp = tmpSgprInfo.idx
       tileStart = stmp+2
       if use64bShadowLimit:
         tensor2dSize0 = "ShadowLimit%s+0"%tc
         tensor2dSize1 = "ShadowLimit%s+1"%tc
-      else:
+      elif not useFixedSrd2:
         tensor2dSize0 = stmp+4
         tensor2dSize1 = stmp+5
       wroteTileStart = False
@@ -4239,17 +4243,18 @@ class KernelWriterAssembly(KernelWriter):
             # MX (pre shuffle) case, stride = (roundup(sizeL/mxSwizzleSize1) * (mxSwizzleSize0*mxSwizzleSize1/mxBlock))
             for i in range(0, numDim):
               idx = indices[i]
-              if (idx in kernel["ProblemType"]["IndicesSummation"]):
-                sizeL = self.sizeRef(indices[0])
-                module.add(SAddU32(dst=sgpr(stmp+0), src0=sizeL, src1=(mxSwizzleSize1 - 1), comment="sizeL + %u - 1"%mxSwizzleSize1))
-                module.add(SLShiftRightB32(dst=sgpr(stmp+0), src=sgpr(stmp+0), shiftHex=log2(mxSwizzleSize1), comment="roundup(size/%u)"%mxSwizzleSize1))
-                module.add(SLShiftLeftB32(dst=sgpr(stmp+0), src=sgpr(stmp+0), shiftHex=log2((mxSwizzleSize0*mxSwizzleSize1)//mxBlock), \
-                                          comment="roundup(size/%u) * ((%u*%u)/%u)"%(mxSwizzleSize1, mxSwizzleSize0, mxSwizzleSize1, mxBlock)))
-                module.addModuleAsFlatItems(self.s_mul_u64_u32(sgpr(tileStart), sgpr(tileStart+1), sgpr(tileStart+0), \
-                          sgpr(stmp+0), comment="tlu=0, MX pre shuffled: * (roundup(sizeL/%u) * (%u/%u)"%(mxSwizzleSize1, mxSwizzleSize1, mxBlock)))
-          else:
-            module.addModuleAsFlatItems(self.s_mul_u64_u32(sgpr(tileStart), sgpr(tileStart+1), sgpr(tileStart+0), \
-                      strideF, comment="tlu=0, scaled tile-offset by stride"))
+              if idx == kernel["ProblemType"]["Index0"] or idx == kernel["ProblemType"]["Index1"]:
+                size = self.sizeRef(indices[idx])
+                module.add(SAddU32(dst=sgpr(stmp+0), src0=size, src1=(mxSwizzleSize0 - 1), comment="size + %u - 1"%mxSwizzleSize0))
+                module.add(SLShiftRightB32(dst=sgpr(stmp+0), src=sgpr(stmp+0), shiftHex=log2(mxSwizzleSize0), comment="roundup(size/%u)"%mxSwizzleSize0))
+                module.add(SSubU32(dst=sgpr(stmp+0), src0=sgpr(stmp+0), src1=sgpr(tileStart+0), comment="numBlkToEnd = roundUp(size/%u) - (WorkGroup[01] * roundup(MT/%u))"%(mxSwizzleSize0,mxSwizzleSize0)))
+                module.add(SMinU32(dst=sgpr(stmp+0), src0=sgpr(stmp+0), src1=mt, comment="min (numBlkToEnd, roundup(MT/%u))"%(mxSwizzleSize0)))
+                module.add(SSubU32(dst=sgpr(stmp+0), src0=sgpr(stmp+0), src1=1, comment="numLine = min (numBlkToEnd, roundup(MT/%u)) - 1"%(mxSwizzleSize0)))
+                module.addModuleAsFlatItems(self.s_mul_u64_u32(sgpr(stmp+0), sgpr(stmp+1), sgpr(stmp+0), \
+                          strideF, comment="scaled by stride"))
+                module.add(SAddU32(dst=sgpr("Srd%s+2"%tc), src0=sgpr(stmp+0), src1=mxSwizzleBlockSize * (kernel["DepthU"]//mxSwizzleSize1), comment="buffer_load limit for %s"%tc))
+          module.addModuleAsFlatItems(self.s_mul_u64_u32(sgpr(tileStart), sgpr(tileStart+1), sgpr(tileStart+0), \
+                    strideF, comment="tlu=0, scaled tile-offset by stride"))
 
         skComponent = Component.StreamK.find(self)
         module.add(skComponent.computeLoadSrd(self, kernel, tP, stmp))
@@ -4278,6 +4283,9 @@ class KernelWriterAssembly(KernelWriter):
           module.add(SMovB32(dst=sgpr(tensor2dSize1), src=0x0, comment="init tensor size"))
 
       for i in range(0, numDim):
+        if useFixedSrd2:
+          # fixed Srd2 case, skip tensor2dSize0/1 calculation
+          continue
         idx = indices[i]
         if idx == kernel["ProblemType"]["Index0"] \
             or idx == kernel["ProblemType"]["Index1"] \
@@ -4317,60 +4325,42 @@ class KernelWriterAssembly(KernelWriter):
             else:
               module.add(SSubU32(dst=sgpr(stmp), src0=size, src1=0x1, comment="(size-1)"))
           elif (idx in kernel["ProblemType"]["IndicesSummation"]):
-            if isMX:
-              module.add(SAddU32(dst=sgpr(stmp+0), src0=size, src1=(mxSwizzleSize1 - 1), comment="size + %u - 1"%mxSwizzleSize1))
-              module.add(SLShiftRightB32(dst=sgpr(stmp+0), src=sgpr(stmp+0), shiftHex=log2(mxSwizzleSize1), comment="roundup(size/%u)"%mxSwizzleSize1))
-              module.add(SLShiftLeftB32(dst=sgpr(tensor2dSize0), src=sgpr(stmp+0), shiftHex=log2((mxSwizzleSize0*mxSwizzleSize1)//mxBlock), \
-                                      comment="roundup(size/%u) * ((%u*%u)/%u)"%(mxSwizzleSize1, mxSwizzleSize0, mxSwizzleSize1, mxBlock)))
-            else:
-              module.add(SSubU32(dst=sgpr(stmp), src0=size, src1=0x1, comment="(size-1)"))
+            module.add(SSubU32(dst=sgpr(stmp), src0=size, src1=0x1, comment="(size-1)"))
           else:
-            if isMX:
-              module.add(SAddU32(dst=sgpr(stmp+0), src0=size, src1=(mxSwizzleSize0 - 1), comment="size + %u - 1"%mxSwizzleSize0))
-              module.add(SLShiftRightB32(dst=sgpr(stmp+0), src=sgpr(stmp+0), shiftHex=log2(mxSwizzleSize0), comment="roundup(size/%u)"%mxSwizzleSize0))
-              module.addModuleAsFlatItems(self.s_mul_u64_u32(sgpr(tensor2dSize0), sgpr(tensor2dSize1), sgpr(tensor2dSize0), \
-                      sgpr(stmp), comment=" *= size"))
-            else:
-              module.add(SSubU32(dst=sgpr(stmp), src0=size, src1=0x1, comment="(size-1)"))
-          if not isMX:
-            module.addModuleAsFlatItems(self.s_mul_u64_u32(sgpr(stmp), sgpr(stmp+1), stride, \
-                      sgpr(stmp), comment="stride x (size-1)"))
-            module.add(SAddU32(dst=sgpr(tensor2dSize0), src0=sgpr(tensor2dSize0), src1=sgpr(stmp+0), comment="sum tensor size"))
-            module.add(SAddCU32(dst=sgpr(tensor2dSize1), src0=sgpr(tensor2dSize1), src1=sgpr(stmp+1), comment="sum tensor size"))
+            module.add(SSubU32(dst=sgpr(stmp), src0=size, src1=0x1, comment="(size-1)"))
+          module.addModuleAsFlatItems(self.s_mul_u64_u32(sgpr(stmp), sgpr(stmp+1), stride, \
+                    sgpr(stmp), comment="stride x (size-1)"))
+          module.add(SAddU32(dst=sgpr(tensor2dSize0), src0=sgpr(tensor2dSize0), src1=sgpr(stmp+0), comment="sum tensor size"))
+          module.add(SAddCU32(dst=sgpr(tensor2dSize1), src0=sgpr(tensor2dSize1), src1=sgpr(stmp+1), comment="sum tensor size"))
 
-      if use64bShadowLimit:
-        limitTmp0 = "ShadowLimit%s+0"%tc
-        limitTmp1 = "ShadowLimit%s+1"%tc
-      else:
-        limitTmp0 = stmp+0
-        limitTmp1 = stmp+1
+      if not useFixedSrd2:
+        if use64bShadowLimit:
+          limitTmp0 = "ShadowLimit%s+0"%tc
+          limitTmp1 = "ShadowLimit%s+1"%tc
+        else:
+          limitTmp0 = stmp+0
+          limitTmp1 = stmp+1
 
-      module.add(SSubU32(dst=sgpr(limitTmp0), src0=sgpr(tensor2dSize0), src1=sgpr(tileStart+0), comment="sub tileStart"))
-      module.add(SSubBU32(dst=sgpr(limitTmp1), src0=sgpr(tensor2dSize1), src1=sgpr(tileStart+1), comment="sub tileStart"))
+        module.add(SSubU32(dst=sgpr(limitTmp0), src0=sgpr(tensor2dSize0), src1=sgpr(tileStart+0), comment="sub tileStart"))
+        module.add(SSubBU32(dst=sgpr(limitTmp1), src0=sgpr(tensor2dSize1), src1=sgpr(tileStart+1), comment="sub tileStart"))
 
-      if use64bShadowLimit:
-        # Set initial buffer limit
-        # if the limit is >64bit, incrementSrd decrements the shadow as the SRD increments,
-        # and when we get within 32-bit we start to step down the SRD
-        # if the limit is <32bits, set it accurately here:
-        # Note lshl_b64 the higher-numbered SGPR has the upper 32-bits
-        module.add(scalarMultiply64Bpe("ShadowLimit%s"%tc, "ShadowLimit%s"%tc, tP["bpeGR"], stmp, "Set limit to use bytes"))
-        if prePad:
-          module.add(SAddU32(dst=sgpr("ShadowLimit%s+0"%tc), src0=sgpr("ShadowLimit%s+0"%tc), src1=prePad, comment="extend limit for pre-pad"))
-          module.add(SAddCU32(dst=sgpr("ShadowLimit%s+1"%tc), src0=sgpr("ShadowLimit%s+1"%tc), src1=0, comment="extend limit for pre-pad"))
+        if use64bShadowLimit:
+          module.add(scalarMultiply64Bpe("ShadowLimit%s"%tc, "ShadowLimit%s"%tc, tP["bpeGR"], stmp, "Set limit to use bytes"))
+          if prePad:
+            module.add(SAddU32(dst=sgpr("ShadowLimit%s+0"%tc), src0=sgpr("ShadowLimit%s+0"%tc), src1=prePad, comment="extend limit for pre-pad"))
+            module.add(SAddCU32(dst=sgpr("ShadowLimit%s+1"%tc), src0=sgpr("ShadowLimit%s+1"%tc), src1=0, comment="extend limit for pre-pad"))
 
-        if kernel["DirectToLds%s"%tc] and kernel["UseInstOffsetForGRO"]:
-          module.add(SAddU32(dst=sgpr("ShadowLimit%s+0"%tc), src0=sgpr("ShadowLimit%s+0"%tc), src1=self.buff_load_inst_offset_max, comment="extend limit for directToLDS instruction offset"))
-          module.add(SAddCU32(dst=sgpr("ShadowLimit%s+1"%tc), src0=sgpr("ShadowLimit%s+1"%tc), src1=0, comment="extend limit for directToLDS instruction offset"))
+          if kernel["DirectToLds%s"%tc] and kernel["UseInstOffsetForGRO"]:
+            module.add(SAddU32(dst=sgpr("ShadowLimit%s+0"%tc), src0=sgpr("ShadowLimit%s+0"%tc), src1=self.buff_load_inst_offset_max, comment="extend limit for directToLDS instruction offset"))
+            module.add(SAddCU32(dst=sgpr("ShadowLimit%s+1"%tc), src0=sgpr("ShadowLimit%s+1"%tc), src1=0, comment="extend limit for directToLDS instruction offset"))
 
-        module.add(SCmpEQU32(src0=sgpr("ShadowLimit%s+1"%tc), src1=0, comment="are we within 2^32?"))
-        module.add(SCSelectB32(dst=sgpr("Srd%s+2"%tc), src0=sgpr("ShadowLimit%s+0"%tc), src1="BufferLimit", comment="Move shadow to real if we are within 2^32"))
-        module.add(self.shiftSrd(tc))
-      else:
-        # put limit directly into SRD:
-        module.add(scalarMultiplyBpe("Srd%s+2"%tc, stmp, float(tP["bpeGR"]), comment="Set limit to use bytes"))
-        if prePad:
-          module.add(SAddU32(dst=sgpr("Srd%s+2"%tc), src0=sgpr("Srd%s+2"%tc), src1=prePad, comment="extend limit for pre-pad"))
+          module.add(SCmpEQU32(src0=sgpr("ShadowLimit%s+1"%tc), src1=0, comment="are we within 2^32?"))
+          module.add(SCSelectB32(dst=sgpr("Srd%s+2"%tc), src0=sgpr("ShadowLimit%s+0"%tc), src1="BufferLimit", comment="Move shadow to real if we are within 2^32"))
+          module.add(self.shiftSrd(tc))
+        else:
+          module.add(scalarMultiplyBpe("Srd%s+2"%tc, stmp, float(tP["bpeGR"]), comment="Set limit to use bytes"))
+          if prePad:
+            module.add(SAddU32(dst=sgpr("Srd%s+2"%tc), src0=sgpr("Srd%s+2"%tc), src1=prePad, comment="extend limit for pre-pad"))
 
       # Apply any high-order address components to the tileStart and eventually the SRD - batch idx for batched gemm
       wg=2 # TODO - refactor since only WG2 is supported and this is always batch
