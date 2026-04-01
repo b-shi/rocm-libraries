@@ -129,9 +129,9 @@ MAINLOOP:
         - USING  A: {0: 0, 1: 1}  B: {0: 2, 1: 3}
         before: [none]  after: [none]
       LR (MT n, subIterK 1) A: {0: 4, 1: 5}  B: {0: 6, 1: 7}
-        before: [none]  after: [WaitLROp]
+        before: [none]  after: [none]
       GR (MT n+2):  A: [0]  B: [0]
-        before: [LR(MT n, sik 1), SyncOp]  after: [none]
+        before: [LR(MT n, sik 1), WaitLROp, SyncOp]  after: [none]
     subIterK=1:
       MFMAs (MT n, subIterK 1):
         - [(0, 0), (0, 1), (1, 0), (1, 1)]
@@ -290,9 +290,9 @@ MAINLOOP:
         - USING  A: {1: 4}  B: {1: 6}
         before: [none]  after: [none]
       LR (MT n, subIterK 1) A: {}  B: {}
-        before: [none]  after: [WaitLROp]
+        before: [none]  after: [none]
       GR (MT n+2):  A: [0]  B: [0]
-        before: [LR(MT n, sik 1), SyncOp]  after: [none]
+        before: [LR(MT n, sik 1), WaitLROp, SyncOp]  after: [none]
     subIterK=1:
       MFMAs (MT n, subIterK 1):
         - [(1, 1)]
@@ -456,6 +456,12 @@ if __name__ == "__main__":
     s.printSchedule(mode="initial")
     print("\n=== ANNOTATED ===")
     s.printSchedule(mode="annotated")
+
+    s.allocVgprTiles(writer)
+    s.printEmittedModules(writer, kernel, "MAINLOOP", s.mainloopSteps)
+    s.printEmittedModules(writer, kernel, "NGLL", s.ngllSteps)
+    s.printEmittedModules(writer, kernel, "NLL", s.nllSteps)
+    s.deallocVgprTiles(writer)
 
     # s.generateCode(writer, kernel)
     # kernel = create_kernel()

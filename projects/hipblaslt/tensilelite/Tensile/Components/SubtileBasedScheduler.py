@@ -868,13 +868,14 @@ class SubtileBasedScheduler:
                             lrMod.before.append(DepEdge(op=LR_INCOp()))
                         lrMod.after.append(DepEdge(op=WaitLROp()))
                 elif hasGRn2 and lrMod:
-                    # GR depends on LR: LR must complete (+ WAIT_LR) before GR(n+2) writes
-                    # Order: MFMAs → LR_INC? → LR → WAIT_LR → SYNC → GR → GR_INC?
+                    # GR depends on LR: LR must complete, then WAIT_LR + SYNC before GR(n+2)
+                    # WaitLROp on GR.before so instructionSchedule can interleave MFMAs freely
+                    # Order: MFMAs → LR_INC? → LR → ... MFMAs ... → WAIT_LR → SYNC → GR → GR_INC?
                     if lastLRmt is not None and lrOp.mtIteration != lastLRmt:
                         lrMod.before.append(DepEdge(op=LR_INCOp()))
-                    lrMod.after.append(DepEdge(op=WaitLROp()))
                     for grMod in grMods:
                         grMod.before.append(DepEdge(module=lrMod))
+                        grMod.before.append(DepEdge(op=WaitLROp()))
                         grMod.before.append(DepEdge(op=SyncOp(comment="Barrier: all waves done with LR before GR(n+2) writes")))
                         if grMod.op.lastForMT:
                             grMod.after.append(DepEdge(op=GR_INCOp()))
@@ -911,12 +912,12 @@ class SubtileBasedScheduler:
             newPss = PartitionSchedule(partitionId=pss.partitionId)
             for dus in pss.subIterKSteps:
                 newDus = SubIterKSchedule(subIterK=dus.subIterK, conflict=dus.conflict)
-                orphaned_syncs = []
+                orphaned_deps = []
                 for mod in dus.modules:
                     if isinstance(mod.op, GROp) and mod.op.mtIteration == "n+2":
                         for e in mod.before:
-                            if e.op and isinstance(e.op, SyncOp):
-                                orphaned_syncs.append(e)
+                            if e.op and isinstance(e.op, (WaitLROp, SyncOp)):
+                                orphaned_deps.append(e)
                         continue
                     # Clone module: filter out module refs to removed GR(n+2), zero inflight on WaitGR
                     newBefore = []
@@ -933,8 +934,8 @@ class SubtileBasedScheduler:
                     newAfter = self._filterDepEdges(mod.after, (GR_INCOp,))
                     newDus.modules.append(AnnotatedModule(
                         op=mod.op, before=newBefore, after=newAfter))
-                if orphaned_syncs and newDus.modules:
-                    newDus.modules[-1].after.extend(orphaned_syncs)
+                if orphaned_deps and newDus.modules:
+                    newDus.modules[-1].after.extend(orphaned_deps)
                 newPss.subIterKSteps.append(newDus)
             ngll.append(newPss)
         return ngll
@@ -949,9 +950,14 @@ class SubtileBasedScheduler:
                 newDus = SubIterKSchedule(subIterK=dus.subIterK, conflict=dus.conflict)
                 # Track which modules are being removed (for filtering module refs)
                 removedMods = set()
+                orphaned_waitlr = []
                 for mod in dus.modules:
                     if isinstance(mod.op, GROp):
                         removedMods.add(id(mod))
+                        # Collect WaitLROp from removed GR's before deps
+                        for e in mod.before:
+                            if e.op and isinstance(e.op, WaitLROp):
+                                orphaned_waitlr.append(e)
                     elif isinstance(mod.op, LROp) and mod.op.mtIteration == "n+1":
                         removedMods.add(id(mod))
 
@@ -984,8 +990,12 @@ class SubtileBasedScheduler:
                     newAfter = self._filterDepEdges(mod.after, (GR_INCOp,))
                     newDus.modules.append(AnnotatedModule(
                         op=mod.op, before=newBefore, after=newAfter))
-                # Remove orphaned WAIT_LR only when no LROp exists in this subIterK
+                # Attach orphaned WaitLROp to last LR module's after list
                 hasLR = any(isinstance(m.op, LROp) for m in newDus.modules)
+                if orphaned_waitlr and hasLR:
+                    lrMods = [m for m in newDus.modules if isinstance(m.op, LROp)]
+                    lrMods[-1].after.extend(orphaned_waitlr)
+                # Remove orphaned WAIT_LR only when no LROp exists in this subIterK
                 if not hasLR:
                     for m in newDus.modules:
                         m.after = self._filterDepEdges(m.after, (WaitLROp,))
@@ -1111,6 +1121,25 @@ class SubtileBasedScheduler:
         print()
         print("NLL (No Load Loop):")
         self._printLoopSteps(self.nllSteps, indent="  ", mode=mode)
+
+    def printEmittedModules(self, writer, kernel, label, steps):
+        """Print EmittedModules for a loop section (before instructionSchedule).
+
+        Emits each AnnotatedModule into an EmittedModule and prints its
+        opType, dependsOn, and instruction counts for before/core/after.
+        """
+        dtileInfo = writer.states.d.tileInfo
+        print(f"\n{label} EmittedModules:")
+        for pss in steps:
+            print(f"  Partition {pss.partitionId}:")
+            for dus in pss.subIterKSteps:
+                print(f"    subIterK={dus.subIterK}:")
+                for mod in dus.modules:
+                    em = self._emitAnnotatedModule(writer, kernel, mod, dtileInfo)
+                    dep_str = ", ".join(em.dependsOn) if em.dependsOn else "none"
+                    print(f"      {em.opType}: dependsOn=[{dep_str}]  "
+                          f"before={len(em.before)} insts, core={len(em.core)} insts, "
+                          f"after={len(em.after)} insts")
 
     # Allocate totalVGPRTiles vpgrTile
     def allocVgprTiles(self, writer):
