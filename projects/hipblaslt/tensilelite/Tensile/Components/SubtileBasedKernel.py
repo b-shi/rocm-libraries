@@ -1234,26 +1234,26 @@ def globalReadScalePtrUpdates(tc, writer, kernel):
 ##################################################
 # Subroutine to generate GR load code
 #
-def emitSubtileBufferLoad(tc, writer, kernel, subtileId):
+def emitSingleBufferLoad(tileInfo, kernel, sId0, sId1):
+  """Emit buffer_load instructions for a single subtile (sId0, sId1).
+
+  Args:
+      tileInfo: TileInfo for the tensor component
+      sId0:     Subtile row index
+      sId1:     Subtile column index (K-dimension)
+  """
   module = Module()
-  sId0 = subtileId[0]
-  sId1 = subtileId[1]
+  tc = tileInfo.tc
 
   isGlc = bool(kernel["NonTemporal%s"%tc] & 0x1)
   isSlc = bool(kernel["NonTemporal%s"%tc] & 0x2)
   isNT  = bool(kernel["NonTemporal%s"%tc] & 0x4)
 
-  tileInfo = writer.states.a.tileInfo if tc == 'A' else writer.states.b.tileInfo
-
-  loadWidth = tileInfo.loadWidthGR
-  numWaves = kernel["MIWaveGroup"][0] * kernel["MIWaveGroup"][1]
-
-  tileInfo = writer.states.a.tileInfo if tc == 'A' else writer.states.b.tileInfo
   subtileInfo = tileInfo.localSubtiles[tileInfo.getLocalSubtileLinearId(sId0, sId1)]
   regList = tileInfo.localSubtilesRegister[subtileInfo.regListId]
 
   offsetK = sId1 * int(tileInfo.mmaTileShape[1] * tileInfo.subtileShape[1] * tileInfo.bpe)
-  grBaseId = tileInfo.localSubtiles[tileInfo.getLocalSubtileLinearId(sId0, sId1)].globalReadMap[0]
+  grBaseId = subtileInfo.globalReadMap[0]
 
   subtileOffset = math.ceil(tileInfo.loadRatioGR*tileInfo.subtileSize)
   WriteBaseAddr = "LocalWriteBaseAddr%s"%tc
@@ -1272,6 +1272,11 @@ def emitSubtileBufferLoad(tc, writer, kernel, subtileId):
     module.add(BufferLoadB128(dst=None, vaddr=vgpr(voff), saddr=sgpr("Srd%s"%tc, 4), soffset=soffset, mubuf=mubuf, comment="grBaseId = %u, i= %u"%(grBaseId , i)))
 
   return module
+
+
+def emitSubtileBufferLoad(tc, writer, kernel, subtileId):
+  tileInfo = writer.states.a.tileInfo if tc == 'A' else writer.states.b.tileInfo
+  return emitSingleBufferLoad(tileInfo, kernel, subtileId[0], subtileId[1])
 
 ##################################################
 # Subroutine to generate GR load code
@@ -1296,6 +1301,40 @@ def globalReadDoSubtile(tc, writer, kernel):
 
   return module
 
+def emitSingleDsRead(tileInfo, sId0, du, dstTile, interleaved = False):
+  """Emit a single DSLoadB128 for one MMA tile within a subtile.
+
+  Args:
+      tileInfo:  TileInfo (for subtileSize, loadRatioGR, sharedVgprLROffset, tc)
+      sId0:      Subtile row index (used for offset computation)
+      du:        DU index within the subtile (maps to mfmaC; subtileShape[0]=1 so mfmaR=0)
+      dstTile:   RegisterTileInfo — destination vgpr tile for the load
+  """
+
+  # du maps to mfmaC, mfmaR is always 0 (subtileShape[0]=1)
+  mfmaId = tileInfo.getSubtileShapeLinearId(du, 0)
+  addrVgpr = tileInfo.sharedVgprLROffset[mfmaId]
+
+  offsetStride = tileInfo.subtileSize
+  if interleaved:
+    if tileInfo.loadRatioGR == 2.0:
+      offset = sId0*offsetStride
+    elif tileInfo.loadRatioGR == 0.5:
+      offset = sId0*4*offsetStride
+    else:
+      offset = sId0*2*offsetStride
+  else:
+    offset = sId0*offsetStride
+
+  dstVgpr = dstTile.regList.regValues[0]
+  numRegs = len(dstTile.regList.regValues)
+  return DSLoadB128(
+      dst=vgpr(dstVgpr, numRegs),
+      src=vgpr(addrVgpr),
+      ds=DSModifiers(offset=offset),
+      comment="Subtile%s[%u] du=%u" % (tileInfo.tc, sId0, du))
+
+
 def emitSubtileDsRead(writer, kernel, tileInfo, subtileId):
 
   module = Module()
@@ -1304,31 +1343,11 @@ def emitSubtileDsRead(writer, kernel, tileInfo, subtileId):
 
   linearId = tileInfo.getLocalSubtileLinearId(sId0, sId1)
   subtileInfo = tileInfo.localSubtiles[linearId]
-  offsetStride = tileInfo.subtileSize
 
-  # Reads mma tiles in a subtile row-major
-  # TODO: Check if this ordering can be used for TLU=1
-  for mfmaC in range(tileInfo.subtileShape[1]):
-    for mfmaR in range(tileInfo.subtileShape[0]):
-      mfmaId = tileInfo.getSubtileShapeLinearId(mfmaC, mfmaR)
-      addrVgpr = tileInfo.sharedVgprLROffset[mfmaId]
-      dstTile = tileInfo.vgprTiles[subtileInfo.localReadMap[mfmaId]]
-      dstVgpr = dstTile.regList.regValues[0]
-      numRegs = len(dstTile.regList.regValues)
-
-      interleaved = False#True
-      if interleaved:
-        if tileInfo.loadRatioGR == 2.0:
-          offset = sId0*offsetStride
-        elif tileInfo.loadRatioGR == 0.5:
-          offset = sId0*4*offsetStride
-        else:
-          offset = sId0*2*offsetStride
-      else:
-        offset = sId0*offsetStride
-
-      module.add(DSLoadB128(dst=vgpr(dstVgpr, numRegs), src=vgpr(addrVgpr), ds=DSModifiers(offset=offset),
-                            comment="Subtile%s[%u,%u] mfmaId=[%u,%u]"%(tileInfo.tc, sId0, sId1, mfmaR, mfmaC)))
+  for du in range(tileInfo.subtileShape[1]):
+    mfmaId = tileInfo.getSubtileShapeLinearId(du, 0)
+    dstTile = tileInfo.vgprTiles[subtileInfo.localReadMap[mfmaId]]
+    module.add(emitSingleDsRead(tileInfo, sId0, du, dstTile))
 
   return module
 
@@ -1346,7 +1365,6 @@ def localReadDoSubtile(tc, writer, kernel):
         module.add(emitSubtileDsRead(writer, kernel, tileInfo, [i, j]))
 
   return module
-
 
 ##################################################
 # Subroutine to generate DTL M0 LDS buffer swap
@@ -1627,7 +1645,7 @@ def emitMfmaCode(writer, kernel):
 #
 # Scheduling logic would be introduced here
 #
-def mainLoopImpl(writer, kernel, isNLL = False):
+def mainLoopImplPGR0(writer, kernel, isNLL = False):
   module = Module()
   module.addComment0("REMOVE WHEN IMPLEMNTED: Placeholder for subtile based main loop impl")
 
@@ -1728,9 +1746,8 @@ def preLoop(writer, kernel):
 #
 def mainLoop(writer, kernel):
   module = Module()
-  module.addComment0("MAINLOOP")
-  module.add(mainLoopImpl(writer, kernel))
-  module.addComment("")
+  pgr = kernel["PrefetchGlobalRead"]
+  assert pgr in (0, 2), "SubtileBasedKernel only supports PGR=0 and PGR=2, got PGR=%d" % pgr
 
   # new path for PGR=2 pipelining with SubtileBasedScheduler
   if pgr == 2:
