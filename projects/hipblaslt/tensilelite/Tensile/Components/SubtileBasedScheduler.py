@@ -1204,12 +1204,10 @@ class SubtileBasedScheduler:
                 module.add(emitSingleBufferLoad(tileInfo, sId0, 0))
         return module
 
-    def _emitSubIterK(self, writer, kernel, pss, dus, scaleSet=0, scaleLRSet=None):
+    def _emitSubIterK(self, writer, kernel, pss, dus, scaleSet=0, scaleLRSet=0):
         """Emit a single subIterK step into a Module.
         scaleSet: which scale VGPR set MFMA reads from.
-        scaleLRSet: which scale VGPR set LR writes to (defaults to scaleSet if None)."""
-        if scaleLRSet is None:
-            scaleLRSet = scaleSet
+        scaleLRSet: which scale VGPR set LR writes to."""
         dtileInfo = writer.states.d.tileInfo
         module = Module()
         module.addComment0(f"Partition {pss.partitionId}: subIterK={dus.subIterK}")
@@ -1395,16 +1393,23 @@ class SubtileBasedScheduler:
         interleaving, then combines into the final loop module.
         All waits (WAIT_LR, WAIT_GR, SyncOp) are explicit schedule ops.
 
-        scaleSet: which scale VGPR set MFMA reads from.
-        scaleLRSet: which scale VGPR set LR writes to (defaults to scaleSet if None).
+        scaleSet: which scale VGPR set MFMA reads from (starting set for first partition).
+        scaleLRSet: which scale VGPR set LR writes to (defaults to 1-scaleSet if None).
+            Both rotate per partition so each partition's MFMA reads the scales
+            that the previous partition's LR loaded.
         """
+        if scaleLRSet is None:
+            scaleLRSet = 1 - scaleSet if self.hasScale else scaleSet
         module = Module(label)
+        module.addComment0(f"{label} start")
         for pss in steps:
             for dus in pss.subIterKSteps:
                 subModule = self._emitSubIterK(writer, kernel, pss, dus,
                                                scaleSet=scaleSet, scaleLRSet=scaleLRSet)
                 subModule = self.instructionSchedule(subModule)
                 module.add(subModule)
+            if self.hasScale:
+                scaleSet, scaleLRSet = scaleLRSet, scaleSet
         return module
 
     def generateCode(self, writer, kernel):
