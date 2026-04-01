@@ -433,16 +433,12 @@ class TileInfo:
   def allocVgprTileRegisters(self, writer, kernel, schedulerManaged=False):
     self.vgprTiles = []
 
-    # When scheduler manages scale VGPRs (PGR=2), skip TileInfo allocation
-    if self.tc in ['MXSA', 'MXSB'] and schedulerManaged:
-      return
-
     numMMATiles = self.localMMATileGrid[0] * self.localMMATileGrid[1]
     numMMATilesPerReg = max(1, int(1//self.mmaTileRegCount))
 
     for i in range(int(self.vgprTileFactor * numMMATiles)):
       # Determine which pool to allocate registers from
-      if self.tc in ['A', 'B']:
+      if self.tc in ['A', 'B', 'MXSA', 'MXSB']:
         self.vgprTiles.append(TileInfo.RegisterTileInfo(writer.vgprPool))
       else:
         useAgpr = True
@@ -1711,10 +1707,8 @@ def mainLoop(writer, kernel):
     from Tensile.Components.SubtileBasedScheduler import SubtileBasedScheduler, SchedulerConfig, PrefetchMode, VGPRTileReUseStrategy
     tiA = writer.states.a.tileInfo
     tiB = writer.states.b.tileInfo
-    scaleTiA = getattr(writer.states, 'mxsa', None)
-    scaleTiB = getattr(writer.states, 'mxsb', None)
-    scaleTiA = scaleTiA.tileInfo if scaleTiA and hasattr(scaleTiA, 'tileInfo') and scaleTiA.tileInfo.mxBlock > 0 else None
-    scaleTiB = scaleTiB.tileInfo if scaleTiB and hasattr(scaleTiB, 'tileInfo') and scaleTiB.tileInfo.mxBlock > 0 else None
+    scaleTiA = writer.states.mxsa.tileInfo if kernel["ProblemType"].get("MXBlockA", 0) else None
+    scaleTiB = writer.states.mxsb.tileInfo if kernel["ProblemType"].get("MXBlockB", 0) else None
     # Use a single partition for now. TODO
     cfg = SchedulerConfig(tiA.localSubtileGrid[0], tiB.localSubtileGrid[0],
                           PrefetchMode.HALF_PREFETCH, VGPRTileReUseStrategy.ACROSS_SUBGROUP)
