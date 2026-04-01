@@ -1887,15 +1887,14 @@ namespace TensileLite
                                 -1.0f,
                                 1.0f);
 
-                // Overwrite scale buffer if user specified a non-default init mode
+                // Always overwrite scale buffer with user-specified init mode.
+                // generateMXInput() sets its own scale values; we replace them
+                // so A and scaleA can be initialized independently.
                 auto mxsaInit = m_vdata[ContractionProblemGemm::TENSOR::MXSA].init;
-                if(mxsaInit != InitMode::One)
-                {
-                    initArray(problem.mxsa().dataType(),
-                              mxsaInit,
-                              pristineMXScaleA.cpuInput.valid.get(),
-                              problem.mxsa());
-                }
+                initArray(problem.mxsa().dataType(),
+                          mxsaInit,
+                          pristineMXScaleA.cpuInput.valid.get(),
+                          problem.mxsa());
             }
 
             if(isMXFP4Tensor(problem.b(), problem.mxBlockB()))
@@ -1929,15 +1928,12 @@ namespace TensileLite
                                 -1.0f,
                                 1.0f);
 
-                // Overwrite scale buffer if user specified a non-default init mode
+                // Always overwrite scale buffer with user-specified init mode.
                 auto mxsbInit = m_vdata[ContractionProblemGemm::TENSOR::MXSB].init;
-                if(mxsbInit != InitMode::One)
-                {
-                    initArray(problem.mxsb().dataType(),
-                              mxsbInit,
-                              pristineMXScaleB.cpuInput.valid.get(),
-                              problem.mxsb());
-                }
+                initArray(problem.mxsb().dataType(),
+                          mxsbInit,
+                          pristineMXScaleB.cpuInput.valid.get(),
+                          problem.mxsb());
             }
         }
 
