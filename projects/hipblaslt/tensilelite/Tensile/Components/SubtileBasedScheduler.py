@@ -63,6 +63,47 @@ class Partition:
 AllocKey = Tuple[int, int]
 
 
+class _VGPRPool:
+    """Free-list VGPR tile allocator with separate A/B maps and peak tracking."""
+
+    def __init__(self):
+        self._nextId: int = 0
+        self._peak: int = 0
+        self._freeList: List[int] = []
+        self._mapA: Dict = {}
+        self._mapB: Dict = {}
+
+    def _map(self, tc: str) -> Dict:
+        return self._mapA if tc == 'A' else self._mapB
+
+    def _updatePeak(self):
+        self._peak = max(self._peak, len(self._mapA) + len(self._mapB))
+
+    def allocate(self, tc: str, key) -> int:
+        if self._freeList:
+            vid = self._freeList.pop(0)
+        else:
+            vid = self._nextId
+            self._nextId += 1
+        self._map(tc)[key] = vid
+        self._updatePeak()
+        return vid
+
+    def release(self, tc: str, key) -> None:
+        vid = self._map(tc).pop(key)
+        self._freeList.append(vid)
+
+    def isAllocated(self, tc: str, key) -> bool:
+        return key in self._map(tc)
+
+    def get(self, tc: str, key) -> int:
+        return self._map(tc)[key]
+
+    @property
+    def peak(self) -> int:
+        return self._peak
+
+
 class VGPRTileAllocator:
     """Maps (subtileIdx, subIterK) to shared integer VGPR tile IDs, with free-list reuse.
 
@@ -73,94 +114,48 @@ class VGPRTileAllocator:
     """
 
     def __init__(self):
-        self._nextId: int = 0
-        self._peak: int = 0
-        self._freeList: List[int] = []
-        self._allocMapA: Dict[AllocKey, int] = {}
-        self._allocMapB: Dict[AllocKey, int] = {}
-
-        # Scale allocations: separate ID space (1 VGPR per tile vs 4 for A/B)
-        self._nextScaleId: int = 0
-        self._scalePeak: int = 0
-        self._scaleFreeList: List[int] = []
-        self._allocMapScaleA: Dict[int, int] = {}  # scaleGroupIdx → scaleVgprTileId
-        self._allocMapScaleB: Dict[int, int] = {}
-
-    def _allocMap(self, tc: str) -> Dict[AllocKey, int]:
-        return self._allocMapA if tc == 'A' else self._allocMapB
-
-    def _scaleAllocMap(self, tc: str) -> Dict[int, int]:
-        return self._allocMapScaleA if tc == 'A' else self._allocMapScaleB
-
-    def _updatePeak(self):
-        current = len(self._allocMapA) + len(self._allocMapB)
-        self._peak = max(self._peak, current)
-
-    def _updateScalePeak(self):
-        current = len(self._allocMapScaleA) + len(self._allocMapScaleB)
-        self._scalePeak = max(self._scalePeak, current)
+        self._tiles = _VGPRPool()
+        self._scales = _VGPRPool()
 
     def allocate(self, tc: str, subtileIdx: int, subIterK: int) -> int:
-        key = (subtileIdx, subIterK)
-        if self._freeList:
-            vid = self._freeList.pop(0)
-        else:
-            vid = self._nextId
-            self._nextId += 1
-        self._allocMap(tc)[key] = vid
-        self._updatePeak()
-        return vid
+        return self._tiles.allocate(tc, (subtileIdx, subIterK))
 
     def release(self, tc: str, subtileIdx: int, subIterK: int) -> None:
-        key = (subtileIdx, subIterK)
-        vid = self._allocMap(tc).pop(key)
-        self._freeList.append(vid)
+        self._tiles.release(tc, (subtileIdx, subIterK))
 
     def isAllocated(self, tc: str, subtileIdx: int, subIterK: int) -> bool:
-        return (subtileIdx, subIterK) in self._allocMap(tc)
+        return self._tiles.isAllocated(tc, (subtileIdx, subIterK))
 
     def getVGPRTileId(self, tc: str, subtileIdx: int, subIterK: int) -> int:
-        return self._allocMap(tc)[(subtileIdx, subIterK)]
+        return self._tiles.get(tc, (subtileIdx, subIterK))
 
     def releaseAllForTile(self, tc: str, subtileIdx: int) -> None:
         """Release all subIterK allocations for a given subtile index."""
-        allocMap = self._allocMap(tc)
+        allocMap = self._tiles._map(tc)
         keys = [k for k in allocMap if k[0] == subtileIdx]
         for k in keys:
             vid = allocMap.pop(k)
-            self._freeList.append(vid)
-
-    # ── Scale allocation ──────────────────────────────────────
+            self._tiles._freeList.append(vid)
 
     def allocateScale(self, tc: str, scaleGroupIdx: int) -> int:
-        allocMap = self._scaleAllocMap(tc)
-        if self._scaleFreeList:
-            vid = self._scaleFreeList.pop(0)
-        else:
-            vid = self._nextScaleId
-            self._nextScaleId += 1
-        allocMap[scaleGroupIdx] = vid
-        self._updateScalePeak()
-        return vid
+        return self._scales.allocate(tc, scaleGroupIdx)
 
     def releaseScale(self, tc: str, scaleGroupIdx: int) -> None:
-        allocMap = self._scaleAllocMap(tc)
-        vid = allocMap.pop(scaleGroupIdx)
-        self._scaleFreeList.append(vid)
+        self._scales.release(tc, scaleGroupIdx)
 
     def isScaleAllocated(self, tc: str, scaleGroupIdx: int) -> bool:
-        return scaleGroupIdx in self._scaleAllocMap(tc)
+        return self._scales.isAllocated(tc, scaleGroupIdx)
 
     def getScaleVGPRTileId(self, tc: str, scaleGroupIdx: int) -> int:
-        return self._scaleAllocMap(tc)[scaleGroupIdx]
+        return self._scales.get(tc, scaleGroupIdx)
 
     @property
     def totalVGPRTiles(self) -> int:
-        return self._peak
+        return self._tiles.peak
 
     @property
     def totalScaleVGPRTiles(self) -> int:
-        return self._scalePeak
+        return self._scales.peak
 
 
 
