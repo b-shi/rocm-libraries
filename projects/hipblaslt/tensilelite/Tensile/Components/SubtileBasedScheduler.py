@@ -1190,13 +1190,9 @@ class SubtileBasedScheduler:
                                     (" dscnt=0 (scale DTL)" if hasScale else "")))
         return module
 
-    def emitGR(self, writer, kernel, op, skipScale = False):
+    def emitGR(self, writer, kernel, op):
         """Emit GR (Global Read) buffer_load instructions for a single GROp."""
         module = Module()
-        # Scale DTL loads after A/B (buffer_load lds=True → lgkmcnt)
-        if kernel["ProblemType"].get("MXBlockA", 0) and kernel["ProblemType"].get("MXBlockB", 0) and not skipScale:
-            module.add(globalReadDoScaleSubtile('MXSA', writer, kernel))
-            module.add(globalReadDoScaleSubtile('MXSB', writer, kernel))
         # A and B data loads
         for subtileList, tileInfo in [(op.subtileA, self.tileInfoA),
                                       (op.subtileB, self.tileInfoB)]:
@@ -1219,7 +1215,7 @@ class SubtileBasedScheduler:
                     kernel["ProblemType"].get("MXBlockB", 0))
         for op in dus.ops:
             if isinstance(op, GROp):
-                module.add(self.emitGR(writer, kernel, op, dus.subIterK != 0))
+                module.add(self.emitGR(writer, kernel, op))
             elif isinstance(op, GR_INCOp):
                 module.add(globalReadPtrUpdates('A', writer, kernel))
                 module.add(globalReadPtrUpdates('B', writer, kernel))
