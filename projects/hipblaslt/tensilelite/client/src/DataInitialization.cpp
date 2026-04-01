@@ -27,6 +27,8 @@
 #include "DataInitialization.hpp"
 #include "TensorDataManipulation.hpp"
 #include "Utility.hpp"
+
+#include <mxDataGenerator/PreSwizzle.hpp>
 // #include "DataInitializationTyped.hpp"
 
 #include <Tensile/Utils.hpp>
@@ -1895,6 +1897,19 @@ namespace TensileLite
                           mxsaInit,
                           pristineMXScaleA.cpuInput.valid.get(),
                           problem.mxsa());
+
+                // Re-apply pre-swizzle to the overwritten scale buffer so the
+                // layout matches what the GPU kernel expects when MXScaleFormat=1.
+                if(preSwizzleA.size() == 3)
+                {
+                    size_t scaleRows = rows / problem.mxBlockA();
+                    size_t scaleCols = cols;
+                    size_t scaleSize = problem.mxsa().totalAllocatedElements();
+                    auto*  scalePtr  = static_cast<uint8_t*>(pristineMXScaleA.cpuInput.valid.get());
+                    std::vector<uint8_t> scaleVec(scalePtr, scalePtr + scaleSize);
+                    scaleVec = DGen::preSwizzleScalesGFX950(scaleVec, {scaleCols, scaleRows});
+                    std::memcpy(scalePtr, scaleVec.data(), scaleVec.size());
+                }
             }
 
             if(isMXFP4Tensor(problem.b(), problem.mxBlockB()))
@@ -1934,6 +1949,19 @@ namespace TensileLite
                           mxsbInit,
                           pristineMXScaleB.cpuInput.valid.get(),
                           problem.mxsb());
+
+                // Re-apply pre-swizzle to the overwritten scale buffer so the
+                // layout matches what the GPU kernel expects when MXScaleFormat=1.
+                if(preSwizzleB.size() == 3)
+                {
+                    size_t scaleRows = rows / problem.mxBlockB();
+                    size_t scaleCols = cols;
+                    size_t scaleSize = problem.mxsb().totalAllocatedElements();
+                    auto*  scalePtr  = static_cast<uint8_t*>(pristineMXScaleB.cpuInput.valid.get());
+                    std::vector<uint8_t> scaleVec(scalePtr, scalePtr + scaleSize);
+                    scaleVec = DGen::preSwizzleScalesGFX950(scaleVec, {scaleCols, scaleRows});
+                    std::memcpy(scalePtr, scaleVec.data(), scaleVec.size());
+                }
             }
         }
 
