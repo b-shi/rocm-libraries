@@ -8,11 +8,11 @@ from Tensile.Components.SubtileBasedKernel import emitMfmaInstruction
 from Tensile.Components.SubtileBasedKernel import emitSingleDsRead
 from Tensile.Components.SubtileBasedKernel import emitSingleBufferLoad
 from Tensile.Components.SubtileBasedKernel import globalReadPtrUpdates, globalReadLDSBufferSwap, localReadLDSBufferSwap
-from Tensile.Components.SubtileBasedKernel import globalReadDoScaleSubtile, localReadDoScaleSubtile, globalReadScalePtrUpdates, emitSubtileScaleDsRead
+from Tensile.Components.SubtileBasedKernel import globalReadDoScaleSubtile, globalReadScalePtrUpdates
 from rocisa.code import Module, Label
 from rocisa.instruction import SWaitCnt, SBarrier, SCmpEQU32, SCmpLeU32, SCBranchSCC1, MFMAInstruction, \
     MXMFMAInstruction, GlobalReadInstruction, LocalReadInstruction, DSLoadB32
-from rocisa.container import sgpr
+from rocisa.container import sgpr, vgpr, DSModifiers
 
 
 class PrefetchMode(Enum):
@@ -63,56 +63,79 @@ class Partition:
 AllocKey = Tuple[int, int]
 
 
-class VGPRTileAllocator:
-    """Maps (subtileIdx, subIterK) to shared integer VGPR tile IDs, with free-list reuse."""
+class _VGPRPool:
+    """Free-list VGPR tile allocator with separate A/B maps and peak tracking."""
 
     def __init__(self):
         self._nextId: int = 0
         self._peak: int = 0
         self._freeList: List[int] = []
-        self._allocMapA: Dict[AllocKey, int] = {}
-        self._allocMapB: Dict[AllocKey, int] = {}
+        self._mapA: Dict = {}
+        self._mapB: Dict = {}
 
-    def _allocMap(self, tc: str) -> Dict[AllocKey, int]:
-        return self._allocMapA if tc == 'A' else self._allocMapB
+    def _map(self, tc: str) -> Dict:
+        return self._mapA if tc == 'A' else self._mapB
 
     def _updatePeak(self):
-        current = len(self._allocMapA) + len(self._allocMapB)
-        self._peak = max(self._peak, current)
+        self._peak = max(self._peak, len(self._mapA) + len(self._mapB))
 
-    def allocate(self, tc: str, subtileIdx: int, subIterK: int) -> int:
-        key = (subtileIdx, subIterK)
+    def allocate(self, tc: str, key) -> int:
         if self._freeList:
             vid = self._freeList.pop(0)
         else:
             vid = self._nextId
             self._nextId += 1
-        self._allocMap(tc)[key] = vid
+        self._map(tc)[key] = vid
         self._updatePeak()
         return vid
 
-    def release(self, tc: str, subtileIdx: int, subIterK: int) -> None:
-        key = (subtileIdx, subIterK)
-        vid = self._allocMap(tc).pop(key)
+    def release(self, tc: str, key) -> None:
+        vid = self._map(tc).pop(key)
         self._freeList.append(vid)
 
+    def isAllocated(self, tc: str, key) -> bool:
+        return key in self._map(tc)
+
+    def get(self, tc: str, key) -> int:
+        return self._map(tc)[key]
+
+    @property
+    def peak(self) -> int:
+        return self._peak
+
+
+class VGPRTileAllocator:
+    """VGPR tile allocator with free-list reuse, backed by a _VGPRPool.
+
+    Keyed by (subtileIdx, subIterK), one allocation per subtile per K step.
+    """
+
+    def __init__(self):
+        self._tiles = _VGPRPool()
+
+    def allocate(self, tc: str, subtileIdx: int, subIterK: int) -> int:
+        return self._tiles.allocate(tc, (subtileIdx, subIterK))
+
+    def release(self, tc: str, subtileIdx: int, subIterK: int) -> None:
+        self._tiles.release(tc, (subtileIdx, subIterK))
+
     def isAllocated(self, tc: str, subtileIdx: int, subIterK: int) -> bool:
-        return (subtileIdx, subIterK) in self._allocMap(tc)
+        return self._tiles.isAllocated(tc, (subtileIdx, subIterK))
 
     def getVGPRTileId(self, tc: str, subtileIdx: int, subIterK: int) -> int:
-        return self._allocMap(tc)[(subtileIdx, subIterK)]
+        return self._tiles.get(tc, (subtileIdx, subIterK))
 
     def releaseAllForTile(self, tc: str, subtileIdx: int) -> None:
         """Release all subIterK allocations for a given subtile index."""
-        allocMap = self._allocMap(tc)
+        allocMap = self._tiles._map(tc)
         keys = [k for k in allocMap if k[0] == subtileIdx]
         for k in keys:
             vid = allocMap.pop(k)
-            self._freeList.append(vid)
+            self._tiles._freeList.append(vid)
 
     @property
     def totalVGPRTiles(self) -> int:
-        return self._peak
+        return self._tiles.peak
 
 
 
@@ -123,6 +146,8 @@ class MFMAOp:
     subtiles: List[Tuple[int, int]]
     vgprTileMapA: Dict[int, int]
     vgprTileMapB: Dict[int, int]
+    scaleMapA: Dict[int, int] = field(default_factory=dict)  # scaleGroupIdx → scaleVgprTileId
+    scaleMapB: Dict[int, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -158,6 +183,8 @@ class LROp:
     subIterK: int
     lrLoadA: Dict[int, int]
     lrLoadB: Dict[int, int]
+    lrScaleA: Dict[int, int] = field(default_factory=dict)  # scaleGroupIdx → scaleVgprTileId
+    lrScaleB: Dict[int, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -207,9 +234,13 @@ class PartitionSchedule:
 
 
 class SubtileBasedScheduler:
-    def __init__(self, tileInfoA, tileInfoB, config: SchedulerConfig):
+    def __init__(self, tileInfoA, tileInfoB, config: SchedulerConfig,
+                 scaleTileInfoA=None, scaleTileInfoB=None):
         self.tileInfoA = tileInfoA
         self.tileInfoB = tileInfoB
+        self.scaleTileInfoA = scaleTileInfoA
+        self.scaleTileInfoB = scaleTileInfoB
+        self.hasScale = scaleTileInfoA is not None and scaleTileInfoB is not None
         self.config = config
 
         self.MTA = tileInfoA.localSubtileGrid[0]
@@ -236,6 +267,11 @@ class SubtileBasedScheduler:
         self.hasDuplicatedReads: bool = False
         self.needsUnrolling: bool = False
 
+        # Scale VGPR tile IDs are deterministic: gid for A, numScaleGroupsA + gid for B.
+        self.numScaleGroupsA = math.ceil(self.MTA / 2) if self.hasScale else 0
+        self.numScaleGroupsB = math.ceil(self.MTB / 2) if self.hasScale else 0
+        self.totalScaleVGPRTiles = self.numScaleGroupsA + self.numScaleGroupsB
+
         self._runSchedule()
 
     # ── Outputs ──────────────────────────────────────────────
@@ -243,6 +279,13 @@ class SubtileBasedScheduler:
     @property
     def totalVGPRTiles(self) -> int:
         return self.allocator.totalVGPRTiles
+
+    def scaleVid(self, tc: str, subtileIdx: int) -> Tuple[int, int]:
+        """Deterministic scale VGPR tile ID for the group containing subtileIdx.
+        Returns (scaleGroupIdx, vgprTileId)."""
+        gid = subtileIdx // 2
+        vid = gid if tc == 'A' else self.numScaleGroupsA + gid
+        return gid, vid
 
     # ── Partition construction ─────────────────────────────────
 
@@ -339,8 +382,21 @@ class SubtileBasedScheduler:
                 lrLoadA[tA] = self.allocator.allocate('A', tA, sik)
             for tB in first.tileBIndices:
                 lrLoadB[tB] = self.allocator.allocate('B', tB, sik)
+
+            # Allocate scale VGPRs at subIterK==0 (scale is constant across subIterK)
+            lrScaleA = {}
+            lrScaleB = {}
+            if self.hasScale and sik == 0:
+                for tA in first.tileAIndices:
+                    gid, vid = self.scaleVid('A', tA)
+                    lrScaleA.setdefault(gid, vid)
+                for tB in first.tileBIndices:
+                    gid, vid = self.scaleVid('B', tB)
+                    lrScaleB.setdefault(gid, vid)
+
             lrOps.append(LROp(mtIteration="0", subIterK=sik,
-                              lrLoadA=lrLoadA, lrLoadB=lrLoadB))
+                              lrLoadA=lrLoadA, lrLoadB=lrLoadB,
+                              lrScaleA=lrScaleA, lrScaleB=lrScaleB))
 
         # Build preloop steps: GR(MT0) split by partition, WAIT, LR(MT0), SKIP guards, GR(MT1)
         preloopOps: List[ScheduleOp] = []
@@ -368,7 +424,10 @@ class SubtileBasedScheduler:
         preloopOps.append(SyncOp(comment="Barrier: wait for GR data before LR"))
         preloopOps.extend(lrOps)
         preloopOps.append(WaitLROp())
-        preloopOps.append(SkipOp(compare="LE", value=1, target="NLL"))
+        # With double-buffered scale VGPRs, counterL<=1 skips to a separate NLL
+        # that reads from scale set 0 (where the preloop LR wrote).
+        nllTarget = "NLLEarly" if self.hasScale else "NLL"
+        preloopOps.append(SkipOp(compare="LE", value=1, target=nllTarget))
         mt1Complete = (set(preloadMT1_A) == set(allA) and set(preloadMT1_B) == set(allB))
         preloopOps.append(GROp(mtIteration="1",
                                subtileA=preloadMT1_A, subtileB=preloadMT1_B,
@@ -409,6 +468,17 @@ class SubtileBasedScheduler:
                 for tB in partition.tileBIndices:
                     vgprTileMapB[tB] = self.allocator.getVGPRTileId('B', tB, sik)
 
+                # MFMA scale maps: look up already-allocated scale VGPR tile IDs
+                scaleMapA = {}
+                scaleMapB = {}
+                if self.hasScale:
+                    for tA in partition.tileAIndices:
+                        gid, vid = self.scaleVid('A', tA)
+                        scaleMapA.setdefault(gid, vid)
+                    for tB in partition.tileBIndices:
+                        gid, vid = self.scaleVid('B', tB)
+                        scaleMapB.setdefault(gid, vid)
+
                 # LOAD: determined by prefetch mode
                 loadATiles, loadBTiles, loadSubIterK = self._getLoadTargets(pi, sik, numPartitions)
                 isWrapAround = self._isWrapAroundLoad(pi, sik, numPartitions)
@@ -431,6 +501,22 @@ class SubtileBasedScheduler:
                         if vid is not None:
                             lrLoadB[tB] = vid
 
+                # Allocate scale VGPRs for loaded tiles (only when loading subIterK==0 data,
+                # since scale data is constant across subIterK within one MT iteration).
+                # Use loadSubIterK (not sik) because wrap-around loads target subIterK 0
+                # even though the current partition's sik may be > 0.
+                lrScaleA = {}
+                lrScaleB = {}
+                if self.hasScale and loadSubIterK == 0:
+                    if loadATiles is not None:
+                        for tA in loadATiles:
+                            gid, vid = self.scaleVid('A', tA)
+                            lrScaleA.setdefault(gid, vid)
+                    if loadBTiles is not None:
+                        for tB in loadBTiles:
+                            gid, vid = self.scaleVid('B', tB)
+                            lrScaleB.setdefault(gid, vid)
+
                 # Check MFMA and LOAD VGPRTile IDs don't overlap
                 mfmaIds = set(vgprTileMapA.values()) | set(vgprTileMapB.values())
                 loadIds = set(lrLoadA.values()) | set(lrLoadB.values())
@@ -446,9 +532,11 @@ class SubtileBasedScheduler:
                 mtLoad = "n+1" if isWrapAround else "n"
                 siks.ops.append(MFMAOp(mtIteration="n", subIterK=sik,
                                       subtiles=mfmas,
-                                      vgprTileMapA=vgprTileMapA, vgprTileMapB=vgprTileMapB))
+                                      vgprTileMapA=vgprTileMapA, vgprTileMapB=vgprTileMapB,
+                                      scaleMapA=scaleMapA, scaleMapB=scaleMapB))
                 siks.ops.append(LROp(mtIteration=mtLoad, subIterK=loadSubIterK,
-                                    lrLoadA=lrLoadA, lrLoadB=lrLoadB))
+                                    lrLoadA=lrLoadA, lrLoadB=lrLoadB,
+                                    lrScaleA=lrScaleA, lrScaleB=lrScaleB))
                 siks.conflict = conflict
                 pss.subIterKSteps.append(siks)
 
@@ -893,6 +981,8 @@ class SubtileBasedScheduler:
             print(f"{indent}MFMAs (MT {op.mtIteration}, subIterK {op.subIterK}):")
             print(f"{indent}  - {op.subtiles}")
             print(f"{indent}  - USING  A: {op.vgprTileMapA}  B: {op.vgprTileMapB}")
+            if op.scaleMapA or op.scaleMapB:
+                print(f"{indent}  - SCALE  A: {op.scaleMapA}  B: {op.scaleMapB}")
         elif isinstance(op, GROp):
             print(f"{indent}GR (MT {op.mtIteration}):  A: {op.subtileA}  B: {op.subtileB}")
         elif isinstance(op, WaitGROp):
@@ -904,7 +994,10 @@ class SubtileBasedScheduler:
             print(f"{indent}SYNC")
         elif isinstance(op, LROp):
             sikLabel = f", subIterK {op.subIterK}" if op.subIterK >= 0 else ""
-            print(f"{indent}LR (MT {op.mtIteration}{sikLabel}) A: {op.lrLoadA}  B: {op.lrLoadB}")
+            scaleStr = ""
+            if op.lrScaleA or op.lrScaleB:
+                scaleStr = f"  scaleA: {op.lrScaleA}  scaleB: {op.lrScaleB}"
+            print(f"{indent}LR (MT {op.mtIteration}{sikLabel}) A: {op.lrLoadA}  B: {op.lrLoadB}{scaleStr}")
         elif isinstance(op, SkipOp):
             print(f"{indent}SKIP_IF_{op.compare}({op.value}, {op.target})")
         elif isinstance(op, GR_INCOp):
@@ -921,6 +1014,8 @@ class SubtileBasedScheduler:
         print(f"hasDuplicatedReads: {self.hasDuplicatedReads}")
         print(f"needsUnrolling: {self.needsUnrolling}")
         print(f"totalVGPRTiles: {self.totalVGPRTiles} ({self.totalVGPRTiles * 4} VGPRs)")
+        print(f"totalScaleVGPRTiles: {self.totalScaleVGPRTiles}")
+        print(f"hasScale: {self.hasScale}")
         print()
 
         grid = [[None] * self.numPartitionsB for _ in range(self.numPartitionsA)]
@@ -973,7 +1068,7 @@ class SubtileBasedScheduler:
     # Allocate totalVGPRTiles vpgrTile
     def allocVgprTiles(self, writer):
         """Allocate a shared VGPR tile array for A and B, indexed by the scheduler's vgprTileId.
-        Also allocates scale VGPRs for MXSA/MXSB when MX block scaling is active."""
+        Also allocates scale VGPRs (1 VGPR each) when MX block scaling is active."""
         self.vgprTiles = []
         mmaTileRegCount = int(math.ceil(self.tileInfoA.mmaTileRegCount))
         for _ in range(self.totalVGPRTiles):
@@ -983,6 +1078,14 @@ class SubtileBasedScheduler:
                 for k in range(4):
                     tile.append(vstart + k)
             self.vgprTiles.append(tile)
+
+        # Allocate scale VGPRs: 1 VGPR per scale tile (each covers 2 M-adjacent subtiles)
+        # Double-buffer: two sets (ping/pong) so MFMA can read one set while ds_read writes the other
+        self.scaleVgprTiles = []     # set 0
+        self.scaleVgprTilesAlt = []  # set 1
+        for _ in range(self.totalScaleVGPRTiles):
+            self.scaleVgprTiles.append(writer.vgprPool.checkOut(1))
+            self.scaleVgprTilesAlt.append(writer.vgprPool.checkOut(1))
 
 
     def deallocVgprTiles(self, writer):
@@ -994,27 +1097,29 @@ class SubtileBasedScheduler:
                     pool.checkIn(val)
         self.vgprTiles = []
 
+        for v in self.scaleVgprTiles:
+            writer.vgprPool.checkIn(v)
+        self.scaleVgprTiles = []
+        for v in self.scaleVgprTilesAlt:
+            writer.vgprPool.checkIn(v)
+        self.scaleVgprTilesAlt = []
 
-    def emitMFMA(self, writer, kernel, op, dtileInfo):
+
+    def emitMFMA(self, writer, kernel, op, dtileInfo, scaleSet=0):
         """Emit MFMA instructions for a single MFMAOp."""
         module = Module()
-        mxsaTileInfo = writer.states.mxsa.tileInfo if kernel["ProblemType"].get("MXBlockA", 0) else None
-        mxsbTileInfo = writer.states.mxsb.tileInfo if kernel["ProblemType"].get("MXBlockB", 0) else None
-        hasScale = mxsaTileInfo is not None and mxsaTileInfo.mxBlock > 0
+        scaleTiles = self.scaleVgprTiles if scaleSet == 0 else self.scaleVgprTilesAlt
 
         for (a, b) in op.subtiles:
             aTile = self.vgprTiles[op.vgprTileMapA[a]]
             bTile = self.vgprTiles[op.vgprTileMapB[b]]
             dTile = dtileInfo.vgprTiles[a + b * dtileInfo.localMMATileGrid[0]]
 
-            if hasScale:
-                # Mirror the non-scheduler emitMfmaCode: look up scale VGPRs via vgprTiles.
-                mxsaId0, mxsaId1 = mxsaTileInfo.getLocalSubtileIdFromMMATile(a, op.subIterK)
-                mxsbId0, mxsbId1 = mxsbTileInfo.getLocalSubtileIdFromMMATile(b, op.subIterK)
-                mxsaLinearId = mxsaTileInfo.getLocalSubtileLinearId(mxsaId0, mxsaId1)
-                mxsbLinearId = mxsbTileInfo.getLocalSubtileLinearId(mxsbId0, mxsbId1)
-                scaleAVgpr = mxsaTileInfo.vgprTiles[4 * mxsaLinearId].regList.regValues[0]
-                scaleBVgpr = mxsbTileInfo.vgprTiles[4 * mxsbLinearId].regList.regValues[0]
+            if self.hasScale:
+                scaleGroupA = a // 2
+                scaleGroupB = b // 2
+                scaleAVgpr = scaleTiles[op.scaleMapA[scaleGroupA]]
+                scaleBVgpr = scaleTiles[op.scaleMapB[scaleGroupB]]
                 sAsel = (a % 2) + 2 * (op.subIterK % 2)
                 sBsel = (b % 2) + 2 * (op.subIterK % 2)
             else:
@@ -1029,12 +1134,10 @@ class SubtileBasedScheduler:
 
         return module
 
-    def emitLR(self, writer, kernel, op):
+    def emitLR(self, writer, kernel, op, scaleSet=0):
         """Emit LR (Local Read) ds_load instructions for a single LROp.
-        Scale LRs (DSLoadB32) are also emitted here and classified as OTHER_SLOT
-        by instructionSchedule — no MFMAs interleave with them, so the following
-        WaitLROp (s_waitcnt lgkmcnt=0) guarantees they complete before any MFMA
-        reads the scale VGPRs."""
+        Scale LRs (DSLoadB32) are also emitted here, using scheduler-managed VGPRs.
+        scaleSet selects which scale VGPR set the ds_reads write to."""
         module = Module()
         for tA, vgprTileId in op.lrLoadA.items():
             dstTile = self.vgprTiles[vgprTileId]
@@ -1044,12 +1147,27 @@ class SubtileBasedScheduler:
             dstTile = self.vgprTiles[vgprTileId]
             module.add(emitSingleDsRead(
                 self.tileInfoB, tB, op.subIterK, dstTile))
-        # Scale data is constant within a K-iteration: load it once on the first
-        # subIterK (subIterK==0) only, not once per subIterK.
-        if op.subIterK == 0 and kernel["ProblemType"].get("MXBlockA", 0) and kernel["ProblemType"].get("MXBlockB", 0):
-            module.add(localReadDoScaleSubtile('MXSA', writer, kernel))
-            module.add(localReadDoScaleSubtile('MXSB', writer, kernel))
+        if op.lrScaleA:
+            self._emitScaleDsReads(module, writer, 'MXSA', op.lrScaleA, scaleSet=scaleSet)
+        if op.lrScaleB:
+            self._emitScaleDsReads(module, writer, 'MXSB', op.lrScaleB, scaleSet=scaleSet)
         return module
+
+    def _emitScaleDsReads(self, module, writer, tc, lrScale, scaleSet=0):
+        """Emit DSLoadB32 for scale groups using scheduler-managed VGPRs."""
+        tileInfo = self.scaleTileInfoA if tc == 'MXSA' else self.scaleTileInfoB
+        scaleTiles = self.scaleVgprTiles if scaleSet == 0 else self.scaleVgprTilesAlt
+        # Each scale group covers 2 M-adjacent [1,2] subtiles = 4 bytes per lane.
+        # dsOffset stride per group = 2 * tileInfo.subtileSize (since [1,2] subtileSize
+        # covers 1 subtile, and a group is 2 subtiles).
+        groupStride = 2 * tileInfo.subtileSize
+        for scaleGroupIdx, scaleVgprTileId in lrScale.items():
+            dsOffset = groupStride * scaleGroupIdx
+            vdst = scaleTiles[scaleVgprTileId]
+            module.add(DSLoadB32(dst=vgpr(vdst),
+                                 src=vgpr(tileInfo.sharedVgprLROffset[0]),
+                                 ds=DSModifiers(offset=dsOffset),
+                                 comment="scale%s[group%u]: load 4B from LDS" % (tc, scaleGroupIdx)))
 
     def emitWaitGR(self, inflightLoadsA, inflightLoadsB, hasScale=False):
         """Emit SWaitCnt for GR (buffer_load) based on inflight GR counts.
@@ -1072,22 +1190,24 @@ class SubtileBasedScheduler:
                                     (" dscnt=0 (scale DTL)" if hasScale else "")))
         return module
 
-    def emitGR(self, writer, kernel, op, skipScale = False):
+    def emitGR(self, writer, kernel, op):
         """Emit GR (Global Read) buffer_load instructions for a single GROp."""
         module = Module()
-        # Scale DTL loads after A/B (buffer_load lds=True → lgkmcnt)
-        if kernel["ProblemType"].get("MXBlockA", 0) and kernel["ProblemType"].get("MXBlockB", 0) and not skipScale:
-            module.add(globalReadDoScaleSubtile('MXSA', writer, kernel))
-            module.add(globalReadDoScaleSubtile('MXSB', writer, kernel))
         # A and B data loads
         for subtileList, tileInfo in [(op.subtileA, self.tileInfoA),
                                       (op.subtileB, self.tileInfoB)]:
             for sId0 in subtileList:
                 module.add(emitSingleBufferLoad(tileInfo, sId0, 0))
+        # Scale DTL loads: only on the last GR of an MT (scale covers all subtiles)
+        if op.lastForMT and kernel["ProblemType"].get("MXBlockA", 0) and kernel["ProblemType"].get("MXBlockB", 0):
+            module.add(globalReadDoScaleSubtile('MXSA', writer, kernel))
+            module.add(globalReadDoScaleSubtile('MXSB', writer, kernel))
         return module
 
-    def _emitSubIterK(self, writer, kernel, pss, dus):
-        """Emit a single subIterK step into a Module."""
+    def _emitSubIterK(self, writer, kernel, pss, dus, scaleSet=0, scaleLRSet=0):
+        """Emit a single subIterK step into a Module.
+        scaleSet: which scale VGPR set MFMA reads from.
+        scaleLRSet: which scale VGPR set LR writes to."""
         dtileInfo = writer.states.d.tileInfo
         module = Module()
         module.addComment0(f"Partition {pss.partitionId}: subIterK={dus.subIterK}")
@@ -1095,7 +1215,7 @@ class SubtileBasedScheduler:
                     kernel["ProblemType"].get("MXBlockB", 0))
         for op in dus.ops:
             if isinstance(op, GROp):
-                module.add(self.emitGR(writer, kernel, op, dus.subIterK != 0))
+                module.add(self.emitGR(writer, kernel, op))
             elif isinstance(op, GR_INCOp):
                 module.add(globalReadPtrUpdates('A', writer, kernel))
                 module.add(globalReadPtrUpdates('B', writer, kernel))
@@ -1107,7 +1227,7 @@ class SubtileBasedScheduler:
                     module.add(globalReadScalePtrUpdates('MXSA', writer, kernel))
                     module.add(globalReadScalePtrUpdates('MXSB', writer, kernel))
             elif isinstance(op, MFMAOp):
-                module.add(self.emitMFMA(writer, kernel, op, dtileInfo))
+                module.add(self.emitMFMA(writer, kernel, op, dtileInfo, scaleSet=scaleSet))
             elif isinstance(op, WaitGROp):
                 module.add(self.emitWaitGR(op.inflightLoadsA, op.inflightLoadsB, hasScale))
             elif isinstance(op, WaitLROp):
@@ -1121,7 +1241,7 @@ class SubtileBasedScheduler:
                     module.add(localReadLDSBufferSwap('MXSA', writer, kernel))
                     module.add(localReadLDSBufferSwap('MXSB', writer, kernel))
             elif isinstance(op, LROp):
-                module.add(self.emitLR(writer, kernel, op))
+                module.add(self.emitLR(writer, kernel, op, scaleSet=scaleLRSet))
             elif isinstance(op, SkipOp):
                 skipLabel = Label(f"SkipTo{op.target}", "")
                 cmpMap = {"EQ": SCmpEQU32, "LE": SCmpLeU32}
@@ -1182,11 +1302,10 @@ class SubtileBasedScheduler:
 
         def classify(slot):
             first = slot[0]
-            # DSLoadB32 = scale LR (ds_read_b32): treat as OTHER_SLOT so no MFMAs
-            # interleave with it. Scale VGPRs must complete (via WaitLROp) before
-            # subsequent MFMAs read them; interleaving would create a race condition.
+            # DSLoadB32 = scale LR (ds_read_b32): with double-buffered scale VGPRs,
+            # MFMA reads from one set while ds_read writes to another, so interleaving is safe.
             if isinstance(first, DSLoadB32):
-                return OTHER_SLOT
+                return LR_SLOT
             if isinstance(first, LocalReadInstruction):
                 return LR_SLOT
             if isinstance(first, SWaitCnt):
@@ -1267,19 +1386,30 @@ class SubtileBasedScheduler:
 
         return result
 
-    def _emitLoop(self, writer, kernel, label, steps):
+    def _emitLoop(self, writer, kernel, label, steps, scaleSet=0, scaleLRSet=None):
         """Emit a loop module (mainloop, NGLL, or NLL).
 
         Emits each subIterK step as a separate module, applies instruction
         interleaving, then combines into the final loop module.
         All waits (WAIT_LR, WAIT_GR, SyncOp) are explicit schedule ops.
+
+        scaleSet: which scale VGPR set MFMA reads from (starting set for first partition).
+        scaleLRSet: which scale VGPR set LR writes to (defaults to 1-scaleSet if None).
+            Both rotate per partition so each partition's MFMA reads the scales
+            that the previous partition's LR loaded.
         """
+        if scaleLRSet is None:
+            scaleLRSet = 1 - scaleSet if self.hasScale else scaleSet
         module = Module(label)
+        module.addComment0(f"{label} start")
         for pss in steps:
             for dus in pss.subIterKSteps:
-                subModule = self._emitSubIterK(writer, kernel, pss, dus)
+                subModule = self._emitSubIterK(writer, kernel, pss, dus,
+                                               scaleSet=scaleSet, scaleLRSet=scaleLRSet)
                 subModule = self.instructionSchedule(subModule)
                 module.add(subModule)
+            if self.hasScale:
+                scaleSet, scaleLRSet = scaleLRSet, scaleSet
         return module
 
     def generateCode(self, writer, kernel):

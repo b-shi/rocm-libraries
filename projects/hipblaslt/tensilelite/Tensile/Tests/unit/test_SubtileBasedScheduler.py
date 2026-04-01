@@ -31,7 +31,7 @@ def create_kernel(MT0=256, MT1=256):
     return {
         "DepthU": 64,
         "_DepthUA": 64,
-        "_DepthUB": 64,                
+        "_DepthUB": 64,
         "MacroTileA": MT0,
         "MacroTileB": MT1,
         "MacroTile0": MT0,
@@ -104,6 +104,8 @@ Reuse: ACROSS_SUBGROUP
 hasDuplicatedReads: False
 needsUnrolling: False
 totalVGPRTiles: 8 (32 VGPRs)
+totalScaleVGPRTiles: 0
+hasScale: False
 
 Ordering grid (COLUMN_MAJOR):
    0
@@ -214,6 +216,8 @@ Reuse: ACROSS_SUBGROUP
 hasDuplicatedReads: False
 needsUnrolling: False
 totalVGPRTiles: 8 (32 VGPRs)
+totalScaleVGPRTiles: 0
+hasScale: False
 
 Ordering grid (COLUMN_MAJOR):
    0   2
