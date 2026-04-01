@@ -1780,13 +1780,14 @@ def mainLoop(writer, kernel):
     tiB = writer.states.b.tileInfo
     scaleTiA = writer.states.mxsa.tileInfo if kernel["ProblemType"].get("MXBlockA", 0) else None
     scaleTiB = writer.states.mxsb.tileInfo if kernel["ProblemType"].get("MXBlockB", 0) else None
+    # For 320x256, Use 5x1 parition grid.
+    # cfg = SchedulerConfig(tiA.localSubtileGrid[0]//5, tiB.localSubtileGrid[0],
     # Use a single partition for now. TODO
     cfg = SchedulerConfig(tiA.localSubtileGrid[0], tiB.localSubtileGrid[0],
-    #cfg = SchedulerConfig(tiA.localSubtileGrid[0]//2, tiB.localSubtileGrid[0]//2,
                           PrefetchMode.HALF_PREFETCH, VGPRTileReUseStrategy.ACROSS_SUBGROUP)
     scheduler = SubtileBasedScheduler(tiA, tiB, cfg,
                                       scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB)
-    # scheduler.printSchedule()
+    scheduler.printSchedule()
     scheduler.allocVgprTiles(writer)
 
     # Preloop (includes SKIP_IF_EQ(1,NLL) and SKIP_IF_LE(2,NGLL))

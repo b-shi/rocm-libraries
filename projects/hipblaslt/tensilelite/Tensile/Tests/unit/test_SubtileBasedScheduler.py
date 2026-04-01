@@ -103,8 +103,8 @@ Prefetch: HALF_PREFETCH
 Reuse: ACROSS_SUBGROUP
 hasDuplicatedReads: False
 needsUnrolling: False
-totalVGPRTiles: 8 (32 VGPRs)
-totalScaleVGPRTiles: 0
+totalVGPRTiles: 8 (A=4 B=4) x 4 regs = 32 VGPRs
+totalScaleVGPRTiles: 0 (A=0 B=0) x 2 sets = 0 VGPRs
 hasScale: False
 
 Ordering grid (COLUMN_MAJOR):
@@ -215,8 +215,8 @@ Prefetch: HALF_PREFETCH
 Reuse: ACROSS_SUBGROUP
 hasDuplicatedReads: False
 needsUnrolling: False
-totalVGPRTiles: 8 (32 VGPRs)
-totalScaleVGPRTiles: 0
+totalVGPRTiles: 8 (A=4 B=4) x 4 regs = 32 VGPRs
+totalScaleVGPRTiles: 0 (A=0 B=0) x 2 sets = 0 VGPRs
 hasScale: False
 
 Ordering grid (COLUMN_MAJOR):
@@ -448,7 +448,12 @@ if __name__ == "__main__":
     writer = create_writer_with_tiles(kernel, tiA, tiB)
 
     s.printSchedule()
-    s.generateCode(writer, kernel)
+
+    print("\n=== Allocator snapshots (recorded during scheduling) ===")
+    for snap in s.allocatorSnapshots:
+        print(snap)
+
+    # s.generateCode(writer, kernel)
     # kernel = create_kernel()
     # tiA = TileInfo('A', kernel)
     # tiB = TileInfo('B', kernel)
