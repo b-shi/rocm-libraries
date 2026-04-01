@@ -1202,6 +1202,10 @@ class SubtileBasedScheduler:
                                       (op.subtileB, self.tileInfoB)]:
             for sId0 in subtileList:
                 module.add(emitSingleBufferLoad(tileInfo, sId0, 0))
+        # Scale DTL loads: only on the last GR of an MT (scale covers all subtiles)
+        if op.lastForMT and kernel["ProblemType"].get("MXBlockA", 0) and kernel["ProblemType"].get("MXBlockB", 0):
+            module.add(globalReadDoScaleSubtile('MXSA', writer, kernel))
+            module.add(globalReadDoScaleSubtile('MXSB', writer, kernel))
         return module
 
     def _emitSubIterK(self, writer, kernel, pss, dus, scaleSet=0, scaleLRSet=0):
