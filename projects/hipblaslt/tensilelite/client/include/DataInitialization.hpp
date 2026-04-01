@@ -857,6 +857,8 @@ namespace TensileLite
                 if(targetJ >= maxJ)
                     targetJ = (maxJ > 0) ? maxJ - 1 : 0;
 
+                // Zero the entire allocated region including stride padding.
+                // Safe because the buffer is freshly allocated by generateMXInput().
                 std::memset(array, 0x00, totalElems * sizeof(MXScale));
 
                 size_t rStart = targetI * kMXScaleTileRows;

@@ -905,6 +905,12 @@ namespace TensileLite
             m_mxScaleBlockI = args["mx-scale-block-i"].as<int>();
             m_mxScaleBlockJ = args["mx-scale-block-j"].as<int>();
 
+            // Allow env-var override: MXSCALE_BLOCK_I / MXSCALE_BLOCK_J
+            if(auto* envI = std::getenv("MXSCALE_BLOCK_I"))
+                m_mxScaleBlockI = std::atoi(envI);
+            if(auto* envJ = std::getenv("MXSCALE_BLOCK_J"))
+                m_mxScaleBlockJ = std::atoi(envJ);
+
             m_rotatingBuffer
                 = args["rotating-buffer-size"].as<int32_t>() * 1024 * 1024; // Change to bytes
             m_rotatingMode   = args["rotating-buffer-mode"].as<int32_t>();
@@ -1792,17 +1798,16 @@ namespace TensileLite
         {
             switch(mode)
             {
-            case InitMode::SerialIdx:
-            case InitMode::SerialDim0:
-                return "Sequential";
-            case InitMode::SerialDim1:
-                return "ColIndex";
-            case InitMode::Identity:
-                return "Identity";
-            case InitMode::One:
-                return "Ones";
             case InitMode::Zero:
                 return "Zeros";
+            case InitMode::One:
+                return "Ones";
+            case InitMode::Identity:
+                return "Identity";
+            case InitMode::SerialIdx:
+            case InitMode::SerialDim0:
+            case InitMode::SerialDim1:
+                return "Sequential";
             default:
                 return "Bounded";
             }
