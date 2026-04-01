@@ -726,13 +726,22 @@ namespace TensileLite
                     initArray<T, InitMode::RandomNegPosLimited>(array, tensor);
                     break;
                 case InitMode::MXScaleBlockSerial:
-                    initArrayMXScaleBlockSerial<T>(array, tensor);
+                    if constexpr(std::is_same_v<T, MXScale>)
+                        initArrayMXScaleBlockSerial<T>(array, tensor);
+                    else
+                        throw std::runtime_error("MXScaleBlockSerial only valid for MXScale.");
                     break;
                 case InitMode::MXScaleSparseBlock:
-                    initArrayMXScaleSparseBlock<T>(array, tensor);
+                    if constexpr(std::is_same_v<T, MXScale>)
+                        initArrayMXScaleSparseBlock<T>(array, tensor);
+                    else
+                        throw std::runtime_error("MXScaleSparseBlock only valid for MXScale.");
                     break;
                 case InitMode::MXScaleSparseBlockRandom:
-                    initArrayMXScaleSparseBlockRandom<T>(array, tensor);
+                    if constexpr(std::is_same_v<T, MXScale>)
+                        initArrayMXScaleSparseBlockRandom<T>(array, tensor);
+                    else
+                        throw std::runtime_error("MXScaleSparseBlockRandom only valid for MXScale.");
                     break;
                 case InitMode::Free:
                 case InitMode::Count:
