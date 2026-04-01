@@ -1072,18 +1072,18 @@ class SubtileBasedScheduler:
                                     (" dscnt=0 (scale DTL)" if hasScale else "")))
         return module
 
-    def emitGR(self, writer, kernel, op):
+    def emitGR(self, writer, kernel, op, skipScale = False):
         """Emit GR (Global Read) buffer_load instructions for a single GROp."""
         module = Module()
+        # Scale DTL loads after A/B (buffer_load lds=True → lgkmcnt)
+        if kernel["ProblemType"].get("MXBlockA", 0) and kernel["ProblemType"].get("MXBlockB", 0) and not skipScale:
+            module.add(globalReadDoScaleSubtile('MXSA', writer, kernel))
+            module.add(globalReadDoScaleSubtile('MXSB', writer, kernel))
         # A and B data loads
         for subtileList, tileInfo in [(op.subtileA, self.tileInfoA),
                                       (op.subtileB, self.tileInfoB)]:
             for sId0 in subtileList:
                 module.add(emitSingleBufferLoad(tileInfo, sId0, 0))
-        # Scale DTL loads after A/B (buffer_load lds=True → lgkmcnt)
-        if kernel["ProblemType"].get("MXBlockA", 0) and kernel["ProblemType"].get("MXBlockB", 0):
-            module.add(globalReadDoScaleSubtile('MXSA', writer, kernel))
-            module.add(globalReadDoScaleSubtile('MXSB', writer, kernel))
         return module
 
     def _emitSubIterK(self, writer, kernel, pss, dus):
@@ -1095,7 +1095,7 @@ class SubtileBasedScheduler:
                     kernel["ProblemType"].get("MXBlockB", 0))
         for op in dus.ops:
             if isinstance(op, GROp):
-                module.add(self.emitGR(writer, kernel, op))
+                module.add(self.emitGR(writer, kernel, op, dus.subIterK != 0))
             elif isinstance(op, GR_INCOp):
                 module.add(globalReadPtrUpdates('A', writer, kernel))
                 module.add(globalReadPtrUpdates('B', writer, kernel))
@@ -1146,6 +1146,7 @@ class SubtileBasedScheduler:
           - No MFMAs between an m0 update and its buffer_load (they are a pair)
           - Remaining MFMAs are spread evenly between buffer_load pairs
         """
+        #return module
         items = module.flatitems()
         if not items:
             return module

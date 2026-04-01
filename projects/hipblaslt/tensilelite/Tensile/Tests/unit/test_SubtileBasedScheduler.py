@@ -21,7 +21,7 @@ def _mock_dtype(num_bytes=2):
     mock.numBytes.return_value = num_bytes
     return mock
 
-def create_kernel(MT0=64, MT1=64):
+def create_kernel(MT0=256, MT1=256):
     dtype = _mock_dtype(2)
     problemType = {
         "DataTypeA": dtype,
@@ -30,6 +30,8 @@ def create_kernel(MT0=64, MT1=64):
     }
     return {
         "DepthU": 64,
+        "_DepthUA": 64,
+        "_DepthUB": 64,                
         "MacroTileA": MT0,
         "MacroTileB": MT1,
         "MacroTile0": MT0,
@@ -421,7 +423,7 @@ NLL (No Load Loop):
 
 
 if __name__ == "__main__":
-    MT0=MT1=64
+    MT0=MT1=256
     kernel = create_kernel(MT0,MT1)
     tiA = TileInfo('A', kernel)
     tiB = TileInfo('B', kernel)
