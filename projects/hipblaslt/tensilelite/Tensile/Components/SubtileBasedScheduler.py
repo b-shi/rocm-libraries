@@ -11,7 +11,7 @@ from Tensile.Components.SubtileBasedKernel import globalReadPtrUpdates, globalRe
 from Tensile.Components.SubtileBasedKernel import globalReadDoScaleSubtile, globalReadScalePtrUpdates
 from rocisa.code import Module, Label
 from rocisa.instruction import SWaitCnt, SBarrier, SCmpEQU32, SCmpLeU32, SCBranchSCC1, MFMAInstruction, \
-    MXMFMAInstruction, GlobalReadInstruction, LocalReadInstruction, DSLoadB32
+    MXMFMAInstruction, LocalReadInstruction, DSLoadB32
 from rocisa.container import sgpr, vgpr, DSModifiers
 
 
@@ -1602,7 +1602,6 @@ class SubtileBasedScheduler:
 
         # Extract non-MFMA dependency paths from before-links only.
         mfmaIdx, pathOrders = SubtileBasedScheduler._extractPathsFromBeforeDeps(emittedModules)
-        print("mfmaIdx, pathOrders:", mfmaIdx, pathOrders)
         # Collect MFMA instructions from the single MFMA module.
         mfmas = [x for x in emittedModules[mfmaIdx].core if isMFMA(x)]
         assert len(mfmas) >= 2, "instructionSchedule expects at least two MFMA instructions"
@@ -1610,44 +1609,22 @@ class SubtileBasedScheduler:
         paths = []
         for order in pathOrders:
             hasWaitGR = any(emittedModules[i].opType == "wait_gr" for i in order)
-            hasGR = any(emittedModules[i].opType == "gr" for i in order)
             paths.append({
                 "order": order,
                 "hasWaitGR": hasWaitGR,
-                "hasGR": hasGR,
             })
 
         intervals = len(mfmas) - 1
 
-        def streamFromModule(mid: int) -> List[Tuple[int, list]]:
+        def getInstructionsFromModule(mid: int) -> List[Tuple[int, list]]:
             return [(mid, [inst]) for inst in emittedModules[mid].core]
 
-        def streamFromGRModule(mid: int) -> List[Tuple[int, list]]:
-            # For GR spacing, treat m0+buffer_load as one packet so spacing is
-            # measured between buffer_loads, not between m0 updates.
-            core = emittedModules[mid].core
-            out = []
-            i = 0
-            while i < len(core):
-                if i + 1 < len(core) and isinstance(core[i + 1], GlobalReadInstruction):
-                    out.append((mid, [core[i], core[i + 1]]))
-                    i += 2
-                else:
-                    out.append((mid, [core[i]]))
-                    i += 1
-            return out
-
-        def moduleStream(mid: int) -> List[Tuple[int, list]]:
-            return streamFromGRModule(mid) if emittedModules[mid].opType == "gr" else streamFromModule(mid)
-
         def pathPriority(p):
-            if p["hasGR"]:
-                return 0
             if p["hasWaitGR"]:
-                return 1
-            return 2
+                return 0
+            return 1
 
-        # Always schedule GR paths first, then WaitGR paths, then others.
+        # Schedule wait_gr paths first (placed from end), then others.
         paths.sort(key=lambda p: (pathPriority(p), p["order"][0] if p["order"] else 10**9))
 
         totalSlots = intervals * 2
@@ -1687,26 +1664,15 @@ class SubtileBasedScheduler:
                     hi = min(hi, firstPos[s] - 1)
             return lo, hi
 
-        def placeEarliestPacket(mid: int, packet: list, low: int, preferred: Optional[int]=None) -> Optional[int]:
+        def placeEarliestPacket(mid: int, packet: list, low: int) -> Optional[int]:
             lo, hi = bounds(mid)
             lo = max(lo, low)
             if hi < lo:
                 return None
 
-            scanRanges = []
-            if preferred is not None:
-                start = max(lo, preferred)
-                if start <= hi:
-                    scanRanges.append((start, hi))
-                if lo <= start - 1:
-                    scanRanges.append((lo, start - 1))
-            else:
-                scanRanges.append((lo, hi))
-
-            for a, b in scanRanges:
-                for p in range(a, b + 1):
-                    if canPlace(p, packet):
-                        return p
+            for p in range(lo, hi + 1):
+                if canPlace(p, packet):
+                    return p
             return None
 
         def placeLatestPacket(mid: int, packet: list, upper: int) -> Optional[int]:
@@ -1728,7 +1694,7 @@ class SubtileBasedScheduler:
             if path["hasWaitGR"]:
                 stream: List[Tuple[int, list]] = []
                 for mid in order:
-                    stream.extend(moduleStream(mid))
+                    stream.extend(getInstructionsFromModule(mid))
                 upper = totalSlots - 1
                 revStream = list(reversed(stream))
                 failedIdx = None
@@ -1748,51 +1714,20 @@ class SubtileBasedScheduler:
             low = 0
             pathFailed = False
             for oi, mid in enumerate(order):
-                stream = moduleStream(mid)
-
-                if emittedModules[mid].opType == "gr":
-                    # GR: populate from beginning and spread with remaining range.
-                    remaining = len(stream)
-                    preferred = low
-                    for si, item in enumerate(stream):
-                        mid2, packet = item
-                        pos = placeEarliestPacket(mid2, packet, low, preferred=preferred)
-                        if pos is None:
-                            leftovers.extend(stream[si:])
-                            for mid3 in order[oi + 1:]:
-                                leftovers.extend(moduleStream(mid3))
-                            pathFailed = True
-                            break
-                        recordPlacement(pos, item)
-                        low = pos + 1
-                        remaining -= 1
-                        if remaining > 0:
-                            lo, hi = bounds(mid2)
-                            lo = max(lo, low)
-                            if hi >= lo:
-                                currentMfmaIdx = pos // 2
-                                lastMfmaIdx = hi // 2
-                                distance = max((lastMfmaIdx - currentMfmaIdx) / remaining, 0.0)
-                                preferredMfmaIdx = currentMfmaIdx + int(round(distance))
-                                preferred = max(low, preferredMfmaIdx * 2)
-                            else:
-                                preferred = low
-                    if pathFailed:
+                stream = getInstructionsFromModule(mid)
+                for si, item in enumerate(stream):
+                    mid2, packet = item
+                    pos = placeEarliestPacket(mid2, packet, low)
+                    if pos is None:
+                        leftovers.extend(stream[si:])
+                        for mid3 in order[oi + 1:]:
+                            leftovers.extend(getInstructionsFromModule(mid3))
+                        pathFailed = True
                         break
-                else:
-                    for si, item in enumerate(stream):
-                        mid2, packet = item
-                        pos = placeEarliestPacket(mid2, packet, low)
-                        if pos is None:
-                            leftovers.extend(stream[si:])
-                            for mid3 in order[oi + 1:]:
-                                leftovers.extend(moduleStream(mid3))
-                            pathFailed = True
-                            break
-                        recordPlacement(pos, item)
-                        low = pos + 1
-                    if pathFailed:
-                        break
+                    recordPlacement(pos, item)
+                    low = pos + 1
+                if pathFailed:
+                    break
 
         # Assemble: MFMA, then 2 slots, then next MFMA.
         result = Module()
