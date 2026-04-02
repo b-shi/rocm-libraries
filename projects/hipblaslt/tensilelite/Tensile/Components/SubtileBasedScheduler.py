@@ -1657,8 +1657,6 @@ class SubtileBasedScheduler:
                              // sched["numBufLoads"])
                 limit = max(limit, sched["firstBufLoadPos"]
                             + sched["bufLoadIdx"] * stride)
-            print(f"    bufLoad[{sched['bufLoadIdx']}]: mid={mid} limit={limit} "
-                  f"bounds={bounds(mid)} firstBufLoadPos={sched['firstBufLoadPos']}")
             sched["bufLoadIdx"] += 1
             return limit
 
@@ -1689,7 +1687,6 @@ class SubtileBasedScheduler:
                 sched["earliestWaitCntPos"] = min(sched["earliestWaitCntPos"], pos)
             if isBufferLoad(inst) and sched["firstBufLoadPos"] is None:
                 sched["firstBufLoadPos"] = pos
-                print(f"      -> placed at slot {pos} (mfma interval {pos // 2})")
 
         def bounds(mid: int) -> Tuple[int, int]:
             lo = 0
@@ -1734,18 +1731,6 @@ class SubtileBasedScheduler:
                 sched["numBufLoads"] = sum(1 for _, inst in pathInsts if isBufferLoad(inst))
                 if sched["numBufLoads"] > 1:
                     _, sched["bufLoadMaxSlot"] = bounds(pathInsts[-1][0])
-                opTypes = [emittedModules[mid].opType for mid in order]
-                print(f"  GR path: order={order} opTypes={opTypes}")
-                for mid in order:
-                    lo, hi = bounds(mid)
-                    pred = prevInPath[mid]
-                    succ = nextInPath[mid]
-                    print(f"    mid={mid} opType={emittedModules[mid].opType} "
-                          f"bounds=[{lo}, {hi}] pred={pred} succ={succ} "
-                          f"firstPos={firstPos[mid]} lastPos={lastPos[mid]}")
-                print(f"    numBufLoads={sched['numBufLoads']} "
-                      f"bufLoadMaxSlot={sched['bufLoadMaxSlot']} totalSlots={totalSlots}")
-
             limit = (totalSlots - 1) if hasWaitGR else 0
             failedIdx = None
             for idx, item in enumerate(pathInsts):
