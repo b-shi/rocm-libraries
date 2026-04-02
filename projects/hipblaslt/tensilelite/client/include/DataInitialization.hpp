@@ -730,7 +730,6 @@ namespace TensileLite
                 case InitMode::MXScaleSparseBlockRandom:
                     throw std::runtime_error(
                         "MXScale init modes are handled by mxDataGenerator.");
-                    break;
                 case InitMode::Free:
                 case InitMode::Count:
                     throw std::runtime_error("Invalid InitMode.");

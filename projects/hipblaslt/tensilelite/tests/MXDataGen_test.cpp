@@ -610,6 +610,7 @@ INSTANTIATE_TEST_SUITE_P(
     MXScaleInitPreSwizzleTest,
     ::testing::Values(
         "MXScaleBlockSerial",
-        "MXScaleSparseBlock"
+        "MXScaleSparseBlock",
+        "MXScaleSparseBlockRandom"
     )
 );
