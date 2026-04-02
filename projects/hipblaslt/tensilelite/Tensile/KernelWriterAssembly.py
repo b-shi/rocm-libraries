@@ -1726,6 +1726,8 @@ class KernelWriterAssembly(KernelWriter):
         msg = "SIA2 better with occupancy 2"
       elif self.states.overflowedResources == 7:
         msg = "invalid LSU code due to assertion fail"
+      elif self.states.overflowedResources == 8:
+        msg = "not enough LDS space"
       else:
         msg = "unknown"
 

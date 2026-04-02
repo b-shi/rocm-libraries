@@ -657,6 +657,13 @@ class Solution(collections.abc.Mapping):
       # for buffer stores for now.
       state["BufferStore"] = 1
 
+      #
+      bytesLoaded = state["NumThreads"] * 16
+      numBytesMXSA = (state["DepthU"] // state["ProblemType"]["MXBlockA"]) * state["MacroTile0"]
+      numBytesMXSB = (state["DepthU"] // state["ProblemType"]["MXBlockB"]) * state["MacroTile1"]
+      if bytesLoaded < numBytesMXSA or bytesLoaded < numBytesMXSB:
+        reject(state, printRejectionReason, "Unable to load mx scales using one load per wave")
+
     # done
     state["AssignedProblemIndependentDerivedParameters"] = True
 

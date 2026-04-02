@@ -1141,12 +1141,14 @@ class SubtileBasedScheduler:
         module = Module()
         for tA, vgprTileId in op.lrLoadA.items():
             dstTile = self.vgprTiles[vgprTileId]
+            # Using 0 for subtile ID1 for now
             module.add(emitSingleDsRead(
-                self.tileInfoA, tA, op.subIterK, dstTile))
+                self.tileInfoA, tA, 0, op.subIterK, dstTile))
         for tB, vgprTileId in op.lrLoadB.items():
             dstTile = self.vgprTiles[vgprTileId]
+            # Using 0 for subtile ID1 for now
             module.add(emitSingleDsRead(
-                self.tileInfoB, tB, op.subIterK, dstTile))
+                self.tileInfoB, tB, 0, op.subIterK, dstTile))
         if op.lrScaleA:
             self._emitScaleDsReads(module, writer, 'MXSA', op.lrScaleA, scaleSet=scaleSet)
         if op.lrScaleB:
