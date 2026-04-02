@@ -11,7 +11,7 @@ from Tensile.Components.SubtileBasedKernel import globalReadPtrUpdates, globalRe
 from Tensile.Components.SubtileBasedKernel import globalReadDoScaleSubtile, globalReadScalePtrUpdates
 from rocisa.code import Module, Label
 from rocisa.instruction import SWaitCnt, SBarrier, SCmpEQU32, SCmpLeU32, SCBranchSCC1, MFMAInstruction, \
-    MXMFMAInstruction, LocalReadInstruction
+    MXMFMAInstruction, LocalReadInstruction, GlobalReadInstruction
 from rocisa.container import sgpr, vgpr, DSModifiers
 
 
@@ -1576,6 +1576,8 @@ class SubtileBasedScheduler:
 
         isMFMA = lambda x: isinstance(x, (MFMAInstruction, MXMFMAInstruction))
         isDsRead = lambda x: isinstance(x, LocalReadInstruction)
+        isBufferLoad = lambda x: isinstance(x, GlobalReadInstruction)
+        isWaitCnt = lambda x: isinstance(x, SWaitCnt)
 
         n = len(emittedModules)
 
@@ -1608,22 +1610,86 @@ class SubtileBasedScheduler:
         lastPos: List[Optional[int]] = [None] * n
         leftovers: List[Tuple[int, object]] = []
 
+        # ── Shared scheduling state (updated by recordPlacement) ──
+        sched = {
+            "lastDsReadPos": -1,       # cross-path: last placed ds_read slot
+            "earliestWaitCntPos": totalSlots,  # cross-path: earliest placed waitcnt slot
+            "firstBufLoadPos": None,    # per-path: first buffer load slot
+            "bufLoadIdx": 0,            # per-path: buffer load counter
+            "bufLoadMaxSlot": 0,        # per-path: upper bound for spreading
+            "numBufLoads": 0,           # per-path: total buffer loads in path
+        }
+
+        # ── Slot validators: (pos, inst) -> bool ──
+        # Return False to reject a slot.
+
+        def oneDsReadPerInterval(pos, inst):
+            """At most one ds_read (LocalReadInstruction) per interval."""
+            if not isDsRead(inst):
+                return True
+            peer = pos ^ 1
+            return not (0 <= peer < totalSlots and placed[peer] is not None
+                        and isDsRead(placed[peer][1]))
+
+        def minGapDsReadBeforeWait(pos, inst):
+            """Reject ds_read too close to an already-placed waitcnt ahead."""
+            if not isDsRead(inst):
+                return True
+            gap = MIN_MFMA_GAP_DS_READ_TO_WAIT * 2
+            return sched["earliestWaitCntPos"] - pos >= gap
+
+        validators = [oneDsReadPerInterval, minGapDsReadBeforeWait]
+
         def canPlace(pos: int, inst) -> bool:
             if pos < 0 or pos >= totalSlots or placed[pos] is not None:
                 return False
-            if isDsRead(inst):
-                peer = pos ^ 1  # other slot in the same interval
-                if 0 <= peer < totalSlots and placed[peer] is not None and isDsRead(placed[peer][1]):
-                    return False
-            return True
+            return all(v(pos, inst) for v in validators)
+
+        # ── Limit adjusters: (limit, mid, inst) -> limit ──
+        # Push the search starting point forward (or backward for reverse).
+
+        def spreadBufferLoads(limit, mid, inst):
+            """Spread buffer_load instructions evenly across available range."""
+            if not isBufferLoad(inst) or sched["bufLoadMaxSlot"] <= 0:
+                return limit
+            if sched["firstBufLoadPos"] is not None:
+                stride = max(1, (sched["bufLoadMaxSlot"] - sched["firstBufLoadPos"])
+                             // sched["numBufLoads"])
+                limit = max(limit, sched["firstBufLoadPos"]
+                            + sched["bufLoadIdx"] * stride)
+            print(f"    bufLoad[{sched['bufLoadIdx']}]: mid={mid} limit={limit} "
+                  f"bounds={bounds(mid)} firstBufLoadPos={sched['firstBufLoadPos']}")
+            sched["bufLoadIdx"] += 1
+            return limit
+
+        MIN_MFMA_GAP_DS_READ_TO_WAIT = 4
+
+        def minGapDsReadToWait(limit, mid, inst):
+            """Ensure minimum MFMA gap between last ds_read and waitcnt."""
+            if not isWaitCnt(inst) or sched["lastDsReadPos"] < 0:
+                return limit
+            minSlot = sched["lastDsReadPos"] + MIN_MFMA_GAP_DS_READ_TO_WAIT * 2
+            return max(limit, minSlot)
+
+        adjusters = [spreadBufferLoads, minGapDsReadToWait]
+
+        # ── Placement helpers ──
 
         def recordPlacement(pos: int, item: Tuple[int, object]):
-            mid = item[0]
+            mid, inst = item[0], item[1]
             placed[pos] = item
             if firstPos[mid] is None or pos < firstPos[mid]:
                 firstPos[mid] = pos
             if lastPos[mid] is None or pos > lastPos[mid]:
                 lastPos[mid] = pos
+            # Update scheduling state.
+            if isDsRead(inst):
+                sched["lastDsReadPos"] = max(sched["lastDsReadPos"], pos)
+            if isWaitCnt(inst):
+                sched["earliestWaitCntPos"] = min(sched["earliestWaitCntPos"], pos)
+            if isBufferLoad(inst) and sched["firstBufLoadPos"] is None:
+                sched["firstBufLoadPos"] = pos
+                print(f"      -> placed at slot {pos} (mfma interval {pos // 2})")
 
         def bounds(mid: int) -> Tuple[int, int]:
             lo = 0
@@ -1649,6 +1715,8 @@ class SubtileBasedScheduler:
                     return pos
             return None
 
+        # ── Main placement loop ──
+
         for order, hasWaitGR in paths:
             if not order:
                 continue
@@ -1657,10 +1725,34 @@ class SubtileBasedScheduler:
             if hasWaitGR:
                 pathInsts.reverse()
 
+            # Reset per-path state.
+            sched["firstBufLoadPos"] = None
+            sched["bufLoadIdx"] = 0
+            sched["bufLoadMaxSlot"] = 0
+            sched["numBufLoads"] = 0
+            if not hasWaitGR:
+                sched["numBufLoads"] = sum(1 for _, inst in pathInsts if isBufferLoad(inst))
+                if sched["numBufLoads"] > 1:
+                    _, sched["bufLoadMaxSlot"] = bounds(pathInsts[-1][0])
+                opTypes = [emittedModules[mid].opType for mid in order]
+                print(f"  GR path: order={order} opTypes={opTypes}")
+                for mid in order:
+                    lo, hi = bounds(mid)
+                    pred = prevInPath[mid]
+                    succ = nextInPath[mid]
+                    print(f"    mid={mid} opType={emittedModules[mid].opType} "
+                          f"bounds=[{lo}, {hi}] pred={pred} succ={succ} "
+                          f"firstPos={firstPos[mid]} lastPos={lastPos[mid]}")
+                print(f"    numBufLoads={sched['numBufLoads']} "
+                      f"bufLoadMaxSlot={sched['bufLoadMaxSlot']} totalSlots={totalSlots}")
+
             limit = (totalSlots - 1) if hasWaitGR else 0
             failedIdx = None
             for idx, item in enumerate(pathInsts):
                 mid, inst = item
+                if not hasWaitGR:
+                    for adj in adjusters:
+                        limit = adj(limit, mid, inst)
                 pos = findSlot(mid, inst, limit, reverse=hasWaitGR)
                 if pos is None:
                     failedIdx = idx
@@ -1674,7 +1766,7 @@ class SubtileBasedScheduler:
                     remaining = list(reversed(remaining))
                 leftovers.extend(remaining)
 
-        # Assemble: MFMA, then 2 slots, then next MFMA.
+        # ── Assemble: MFMA, then 2 slots, then next MFMA ──
         result = Module()
         result.add(mfmas[0])
         for i in range(intervals):
