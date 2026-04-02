@@ -1543,6 +1543,11 @@ class GlobalWriteBatchWriter:
       comment=f"16bit paired dwordx4 store tt0={tt0},{tt0+1}"
     ))
 
+    # WAR hazard: buffer_store_dwordx4 reads vPack[0:3] as source operands.
+    # The next paired store's v_cvt_pk_bf16_f32 will overwrite vPack.
+    # Insert nop to ensure the store has latched its source VGPRs.
+    module.add(SNop(waitState=0, comment="1 wait state: WAR hazard between store src and next pack dst"))
+
     return module
 
   def _emit16bitSubtileScalarStore(self, addrCalc, sumIdx0: int, prefixOffset: int, tt0: int = 0) -> Module:
