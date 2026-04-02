@@ -54,6 +54,7 @@ if(TARGET roc::mxDataGenerator)
         PRIVATE
             "${CMAKE_CURRENT_SOURCE_DIR}/../../clients/common/include"
     )
+    target_compile_definitions(tensilelite-tests PRIVATE HIPBLASLT_ENABLE_MXDATAGENERATOR)
     target_link_libraries(tensilelite-tests PRIVATE roc::mxDataGenerator)
     set_target_properties(tensilelite-tests
         PROPERTIES
