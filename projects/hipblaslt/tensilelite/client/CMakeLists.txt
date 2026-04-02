@@ -14,9 +14,7 @@ set(COMMON_CLIENT_LIBS
 )
 
 if(TARGET roc::mxDataGenerator)
-    target_compile_definitions(tensilelite-client PRIVATE HIPBLASLT_ENABLE_MXDATAGENERATOR)
     target_link_libraries(tensilelite-client PRIVATE roc::mxDataGenerator)
-    target_compile_definitions(cpu-gemm-driver PRIVATE HIPBLASLT_ENABLE_MXDATAGENERATOR)
     target_link_libraries(cpu-gemm-driver PRIVATE roc::mxDataGenerator)
 endif()
 
