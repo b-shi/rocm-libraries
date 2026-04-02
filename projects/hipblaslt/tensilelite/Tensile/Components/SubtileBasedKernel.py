@@ -172,9 +172,6 @@ class TileInfo:
     isMXSAB = tc in ['MXSA', 'MXSB']
 
     self.subtileShape = [1, 2]
-    if isMXSAB:
-      # TODO hardcoded this for now, current swizzled scale layout assumes M=32
-      self.subtileShape = [2, 2]
 
     self.tc = tc
     self.isSwizzled = isMXSAB
@@ -429,11 +426,12 @@ class TileInfo:
       st.regListId = slowId
       st.useSgpr = self.localSubtilesRegister[slowId].regPool == writer.sgprPool
 
-  def allocVgprTileRegisters(self, writer, kernel):
+  def allocVgprTileRegisters(self, writer, kernel, schedulerManaged=False):
     self.vgprTiles = []
 
     numMMATiles = self.localMMATileGrid[0] * self.localMMATileGrid[1]
     numMMATilesPerReg = max(1, int(1//self.mmaTileRegCount))
+
     for i in range(int(self.vgprTileFactor * numMMATiles)):
       # Determine which pool to allocate registers from
       if self.tc in ['A', 'B', 'MXSA', 'MXSB']:
@@ -962,9 +960,11 @@ def _graTileAssignmentScaleSwizzledCommon(tc, writer, kernel):
   loadWidthShift = loadWidth.bit_length() - 1
 
   # TODO: this logic assumes scales are in block TLU=0 format.
-  subtileSize = tileInfo.subtileSize # subtile size in bytes
+  # Scale groups span 2 M-adjacent subtiles (matching the physical 32-row scale blocks),
+  # so multiply subtileSize by 2 to get the actual bytes per group.
+  scaleGroupSize = 2 * tileInfo.subtileSize # bytes per scale group (2 subtiles in dim0)
   # number of consecutive threads needed to load all subtiles in contiguous dim
-  numThreadsPerGroup = (subtileSize * tileInfo.localSubtileGrid[1]) // loadWidth
+  numThreadsPerGroup = (scaleGroupSize * tileInfo.localSubtileGrid[1]) // loadWidth
 
   vtmp = writer.vgprPool.checkOut(1)
 
@@ -1030,7 +1030,7 @@ def _applyScaleWavePartitionLROffset(module, writer, kernel, tileInfo, waveId):
   # TODO: Calculate num of rows in subtile instead of hardcoding
   scaleSubtileBytes = tileInfo.subtileSize * tileInfo.bpe
   # Note MMATile format is always [NonK dim, K dim]
-  MT = (tileInfo.globalMMATileGrid[0] * tileInfo.mmaTileShape[0]) // 32 # 32 Hardcoded.. should fix
+  MT = tileInfo.globalMMATileGrid[0] // tileInfo.subtileShape[0]
   index = 0 if tc == 'MXSA' else 1
   totalScaleBytes = (MT // kernel["MIWaveGroup"][index]) * (tileInfo.localSubtileGrid[1]) * scaleSubtileBytes
 
@@ -1176,24 +1176,27 @@ def globalReadDoScaleSubtile(tc, writer, kernel):
 # Each 32-bit VGPR holds 4 E8M0 scale bytes; opsel/opsel_hi selects
 # the correct byte per MFMA invocation.
 #
-def emitSubtileScaleDsRead(tc, writer, kernel, subtileId):
+def emitSubtileScaleDsRead(tc, writer, kernel, scaleGroupIdx):
+  """Emit a single DSLoadB32 for a scale group (2 M-adjacent [1,2] subtiles).
+  Each ds_read_b32 loads 4 bytes = 4 E8M0 scale values into one VGPR."""
   module = Module()
   tileInfo = writer.states.mxsa.tileInfo if tc == 'MXSA' else writer.states.mxsb.tileInfo
 
   if tileInfo.mxBlock == 0:
     return module
 
-  sId0, sId1 = tileInfo.getLocalSubtileIdFromLinearId(subtileId)
-  dsOffset = tileInfo.subtileSize * (sId1 + sId0 * tileInfo.localSubtileGrid[1])
-  # TODO: REALLY REALLY HACKY.. fix
-  vdst = tileInfo.vgprTiles[4 * subtileId].regList.regValues[0]
+  # Each scale group covers 2 M-adjacent subtiles, stride = 2 * subtileSize
+  groupStride = 2 * tileInfo.subtileSize
+  dsOffset = groupStride * scaleGroupIdx
+  vdst = tileInfo.vgprTiles[4 * scaleGroupIdx].regList.regValues[0]
   module.add(DSLoadB32(dst=vgpr(vdst),
                        src=vgpr(tileInfo.sharedVgprLROffset[0]),
                        ds=DSModifiers(offset=dsOffset),
-                       comment="scale%s[%u]: load 4B from LDS" % (tc, subtileId)))
+                       comment="scale%s[group%u]: load 4B from LDS" % (tc, scaleGroupIdx)))
   return module
 
 def localReadDoScaleSubtile(tc, writer, kernel):
+  """Emit scale ds_reads for all scale groups (PGR=0 path)."""
   module = Module()
 
   if not kernel["ProblemType"].get("MXBlockA", 0) and not kernel["ProblemType"].get("MXBlockB", 0):
@@ -1201,10 +1204,10 @@ def localReadDoScaleSubtile(tc, writer, kernel):
 
   tileInfo = writer.states.mxsa.tileInfo if tc == 'MXSA' else writer.states.mxsb.tileInfo
 
-  for sid0 in range(tileInfo.localSubtileGrid[0]):
-    for sid1 in range(tileInfo.localSubtileGrid[1]):
-      linearSid = tileInfo.getLocalSubtileLinearId(sid0, sid1)
-      module.add(emitSubtileScaleDsRead(tc, writer, kernel, linearSid))
+  # Iterate over scale groups: one ds_read per 2 M-adjacent subtiles
+  numScaleGroups = math.ceil(tileInfo.localSubtileGrid[0] / 2) * tileInfo.localSubtileGrid[1]
+  for gid in range(numScaleGroups):
+    module.add(emitSubtileScaleDsRead(tc, writer, kernel, gid))
 
   return module
 
@@ -1218,7 +1221,7 @@ def globalReadScalePtrUpdates(tc, writer, kernel):
   if tileInfo.mxBlock == 0:
     return module
 
-  inc = tileInfo.subtileSize * tileInfo.localSubtileGrid[1]
+  inc = 2 * tileInfo.subtileSize * tileInfo.localSubtileGrid[1]
   module.addComment0("Scale SRD update: %s += %u" % (tc, inc))
   module.add(SAddU32(dst=sgpr("Srd%s" % tc), src0=sgpr("Srd%s" % tc), src1=inc))
   module.add(SAddCU32(dst=sgpr("Srd%s+1" % tc), src0=sgpr("Srd%s+1" % tc), src1=0))
@@ -1231,26 +1234,26 @@ def globalReadScalePtrUpdates(tc, writer, kernel):
 ##################################################
 # Subroutine to generate GR load code
 #
-def emitSubtileBufferLoad(tc, writer, kernel, subtileId):
+def emitSingleBufferLoad(tileInfo, kernel, sId0, sId1):
+  """Emit buffer_load instructions for a single subtile (sId0, sId1).
+
+  Args:
+      tileInfo: TileInfo for the tensor component
+      sId0:     Subtile row index
+      sId1:     Subtile column index (K-dimension)
+  """
   module = Module()
-  sId0 = subtileId[0]
-  sId1 = subtileId[1]
+  tc = tileInfo.tc
 
   isGlc = bool(kernel["NonTemporal%s"%tc] & 0x1)
   isSlc = bool(kernel["NonTemporal%s"%tc] & 0x2)
   isNT  = bool(kernel["NonTemporal%s"%tc] & 0x4)
 
-  tileInfo = writer.states.a.tileInfo if tc == 'A' else writer.states.b.tileInfo
-
-  loadWidth = tileInfo.loadWidthGR
-  numWaves = kernel["MIWaveGroup"][0] * kernel["MIWaveGroup"][1]
-
-  tileInfo = writer.states.a.tileInfo if tc == 'A' else writer.states.b.tileInfo
   subtileInfo = tileInfo.localSubtiles[tileInfo.getLocalSubtileLinearId(sId0, sId1)]
   regList = tileInfo.localSubtilesRegister[subtileInfo.regListId]
 
   offsetK = sId1 * int(tileInfo.mmaTileShape[1] * tileInfo.subtileShape[1] * tileInfo.bpe)
-  grBaseId = tileInfo.localSubtiles[tileInfo.getLocalSubtileLinearId(sId0, sId1)].globalReadMap[0]
+  grBaseId = subtileInfo.globalReadMap[0]
 
   subtileOffset = math.ceil(tileInfo.loadRatioGR*tileInfo.subtileSize)
   WriteBaseAddr = "LocalWriteBaseAddr%s"%tc
@@ -1269,6 +1272,11 @@ def emitSubtileBufferLoad(tc, writer, kernel, subtileId):
     module.add(BufferLoadB128(dst=None, vaddr=vgpr(voff), saddr=sgpr("Srd%s"%tc, 4), soffset=soffset, mubuf=mubuf, comment="grBaseId = %u, i= %u"%(grBaseId , i)))
 
   return module
+
+
+def emitSubtileBufferLoad(tc, writer, kernel, subtileId):
+  tileInfo = writer.states.a.tileInfo if tc == 'A' else writer.states.b.tileInfo
+  return emitSingleBufferLoad(tileInfo, kernel, subtileId[0], subtileId[1])
 
 ##################################################
 # Subroutine to generate GR load code
@@ -1293,6 +1301,40 @@ def globalReadDoSubtile(tc, writer, kernel):
 
   return module
 
+def emitSingleDsRead(tileInfo, sId0, subIterK, dstTile, interleaved = False):
+  """Emit a single DSLoadB128 for one MMA tile within a subtile.
+
+  Args:
+      tileInfo:  TileInfo (for subtileSize, loadRatioGR, sharedVgprLROffset, tc)
+      sId0:      Subtile row index (used for offset computation)
+      subIterK:  subIterK index within the subtile (maps to mfmaC; subtileShape[0]=1 so mfmaR=0)
+      dstTile:   RegisterTileInfo — destination vgpr tile for the load
+  """
+
+  # du maps to mfmaC, mfmaR is always 0 (subtileShape[0]=1)
+  mfmaId = tileInfo.getSubtileShapeLinearId(subIterK, 0)
+  addrVgpr = tileInfo.sharedVgprLROffset[mfmaId]
+
+  offsetStride = tileInfo.subtileSize
+  if interleaved:
+    if tileInfo.loadRatioGR == 2.0:
+      offset = sId0*offsetStride
+    elif tileInfo.loadRatioGR == 0.5:
+      offset = sId0*4*offsetStride
+    else:
+      offset = sId0*2*offsetStride
+  else:
+    offset = sId0*offsetStride
+
+  dstVgpr = dstTile.regList.regValues[0]
+  numRegs = len(dstTile.regList.regValues)
+  return DSLoadB128(
+      dst=vgpr(dstVgpr, numRegs),
+      src=vgpr(addrVgpr),
+      ds=DSModifiers(offset=offset),
+      comment="Subtile%s[%u] subIterK=%u" % (tileInfo.tc, sId0, subIterK))
+
+
 def emitSubtileDsRead(writer, kernel, tileInfo, subtileId):
 
   module = Module()
@@ -1301,31 +1343,11 @@ def emitSubtileDsRead(writer, kernel, tileInfo, subtileId):
 
   linearId = tileInfo.getLocalSubtileLinearId(sId0, sId1)
   subtileInfo = tileInfo.localSubtiles[linearId]
-  offsetStride = tileInfo.subtileSize
 
-  # Reads mma tiles in a subtile row-major
-  # TODO: Check if this ordering can be used for TLU=1
-  for mfmaC in range(tileInfo.subtileShape[1]):
-    for mfmaR in range(tileInfo.subtileShape[0]):
-      mfmaId = tileInfo.getSubtileShapeLinearId(mfmaC, mfmaR)
-      addrVgpr = tileInfo.sharedVgprLROffset[mfmaId]
-      dstTile = tileInfo.vgprTiles[subtileInfo.localReadMap[mfmaId]]
-      dstVgpr = dstTile.regList.regValues[0]
-      numRegs = len(dstTile.regList.regValues)
-
-      interleaved = False#True
-      if interleaved:
-        if tileInfo.loadRatioGR == 2.0:
-          offset = sId0*offsetStride
-        elif tileInfo.loadRatioGR == 0.5:
-          offset = sId0*4*offsetStride
-        else:
-          offset = sId0*2*offsetStride
-      else:
-        offset = sId0*offsetStride
-
-      module.add(DSLoadB128(dst=vgpr(dstVgpr, numRegs), src=vgpr(addrVgpr), ds=DSModifiers(offset=offset),
-                            comment="Subtile%s[%u,%u] mfmaId=[%u,%u]"%(tileInfo.tc, sId0, sId1, mfmaR, mfmaC)))
+  for du in range(tileInfo.subtileShape[1]):
+    mfmaId = tileInfo.getSubtileShapeLinearId(du, 0)
+    dstTile = tileInfo.vgprTiles[subtileInfo.localReadMap[mfmaId]]
+    module.add(emitSingleDsRead(tileInfo, sId0, du, dstTile))
 
   return module
 
@@ -1343,7 +1365,6 @@ def localReadDoSubtile(tc, writer, kernel):
         module.add(emitSubtileDsRead(writer, kernel, tileInfo, [i, j]))
 
   return module
-
 
 ##################################################
 # Subroutine to generate DTL M0 LDS buffer swap
@@ -1577,8 +1598,11 @@ def emitMfmaCode(writer, kernel):
   mxsatileInfo = writer.states.mxsa.tileInfo if kernel["ProblemType"].get("MXBlockA", 0) > 0 else None
   mxsbtileInfo = writer.states.mxsb.tileInfo if kernel["ProblemType"].get("MXBlockB", 0) > 0 else None
 
-  # Use loaded scale VGPRs when allocated otherwise use hardcoded 1s as scales
-  # Matches localReadDoScaleSubtile guard
+  # Use loaded scale VGPRs when MX block scaling is active.
+  # Note: scaleVgprTiles is only populated by the scheduler path;
+  # in the non-scheduler path we use vgprTiles (populated by localReadDoScaleSubtile).
+  hasScaleA = mxsatileInfo is not None and mxsatileInfo.mxBlock > 0
+  hasScaleB = mxsbtileInfo is not None and mxsbtileInfo.mxBlock > 0
 
   for mmak in range(atileInfo.localMMATileGrid[1]):
     for mma1 in range(btileInfo.localMMATileGrid[0]):
@@ -1588,25 +1612,22 @@ def emitMfmaCode(writer, kernel):
         dtiles = dtileInfo.vgprTiles[mma0 + mma1 * dtileInfo.localMMATileGrid[0]]
 
 
-        if mxsatileInfo != None and mxsbtileInfo != None:
-          mxsaId0, mxsaId1 = mxsatileInfo.getLocalSubtileIdFromMMATile(mma0, mmak)
-          mxsbId0, mxsbId1 = mxsbtileInfo.getLocalSubtileIdFromMMATile(mma1, mmak)
-          mxsaLinearId = mxsatileInfo.getLocalSubtileLinearId(mxsaId0, mxsaId1)
-          mxsbLinearId = mxsbtileInfo.getLocalSubtileLinearId(mxsbId0, mxsbId1)
+        if hasScaleA:
+          mxsatileInfo = writer.states.mxsa.tileInfo
+          mxsbtileInfo = writer.states.mxsb.tileInfo
+          # Scale group index: one VGPR per 2 M-adjacent subtiles (ds_read_b32 loads 4 bytes)
+          scaleGroupA = mma0 // 2
+          scaleGroupB = mma1 // 2
 
-          scaleAVgpr = mxsatileInfo.vgprTiles[4 * mxsaLinearId].regList.regValues[0] if mxsatileInfo.mxBlock else -1
-          scaleBVgpr = mxsbtileInfo.vgprTiles[4 * mxsbLinearId].regList.regValues[0] if mxsbtileInfo.mxBlock else -1
+          scaleAVgpr = mxsatileInfo.vgprTiles[4 * scaleGroupA].regList.regValues[0] if mxsatileInfo.mxBlock else -1
+          scaleBVgpr = mxsbtileInfo.vgprTiles[4 * scaleGroupB].regList.regValues[0] if mxsbtileInfo.mxBlock else -1
 
-          _mma0 = mma0 % 2
-          _mma1 = mma1 % 2
-          _mmak = mmak % 2
-
-          sAsel = _mma0 + 2 * _mmak
-          sBsel = _mma1 + 2 * _mmak
+          sAsel = (mma0 % 2) + 2 * (mmak % 2)
+          sBsel = (mma1 % 2) + 2 * (mmak % 2)
         else:
           scaleAVgpr = -1
           scaleBVgpr = -1
-          sAsel = sBsel = 0
+          sAsel = sBsel = -1
 
         module.add(emitMfmaInstruction(writer, kernel, atiles, btiles, dtiles, dtiles,
                                        scaleAVgpr=scaleAVgpr, scaleBVgpr=scaleBVgpr, scaleAsel=sAsel, scaleBsel=sBsel,
@@ -1624,7 +1645,7 @@ def emitMfmaCode(writer, kernel):
 #
 # Scheduling logic would be introduced here
 #
-def mainLoopImpl(writer, kernel, isNLL = False):
+def mainLoopImplPGR0(writer, kernel, isNLL = False):
   module = Module()
   module.addComment0("REMOVE WHEN IMPLEMNTED: Placeholder for subtile based main loop impl")
 
@@ -1725,13 +1746,124 @@ def preLoop(writer, kernel):
 #
 def mainLoop(writer, kernel):
   module = Module()
-  module.addComment0("MAINLOOP")
-  module.add(mainLoopImpl(writer, kernel))
-  module.addComment("")
+  pgr = kernel["PrefetchGlobalRead"]
+  assert pgr in (0, 2), "SubtileBasedKernel only supports PGR=0 and PGR=2, got PGR=%d" % pgr
 
-  #module.addComment0("MAINLOOP-NLL")
-  #isNLL = True
-  #module.add(mainLoopImpl(writer, kernel, isNLL))
-  #module.addComment("")
+  # new path for PGR=2 pipelining with SubtileBasedScheduler
+  if pgr == 2:
+    from Tensile.Components.SubtileBasedScheduler import SubtileBasedScheduler, SchedulerConfig, PrefetchMode, VGPRTileReUseStrategy
+    tiA = writer.states.a.tileInfo
+    tiB = writer.states.b.tileInfo
+    scaleTiA = writer.states.mxsa.tileInfo if kernel["ProblemType"].get("MXBlockA", 0) else None
+    scaleTiB = writer.states.mxsb.tileInfo if kernel["ProblemType"].get("MXBlockB", 0) else None
+    # Use a single partition for now. TODO
+    cfg = SchedulerConfig(tiA.localSubtileGrid[0], tiB.localSubtileGrid[0],
+    #cfg = SchedulerConfig(tiA.localSubtileGrid[0]//2, tiB.localSubtileGrid[0]//2,
+                          PrefetchMode.HALF_PREFETCH, VGPRTileReUseStrategy.ACROSS_SUBGROUP)
+    scheduler = SubtileBasedScheduler(tiA, tiB, cfg,
+                                      scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB)
+    # scheduler.printSchedule()
+    scheduler.allocVgprTiles(writer)
+
+    # Preloop (includes SKIP_IF_EQ(1,NLL) and SKIP_IF_LE(2,NGLL))
+    if scheduler.hasScale:
+      # Preloop LR writes directly to scale set 0 (no double-buffer flip).
+      # scaleSet=0 for MFMA (no MFMAs in preloop), scaleLRSet=0 for LR writes.
+      module.add(scheduler._emitLoop(writer, kernel, "PRELOOP", scheduler.preloopSteps,
+                                     scaleSet=0, scaleLRSet=0))
+    else:
+      module.add(scheduler._emitLoop(writer, kernel, "PRELOOP", scheduler.preloopSteps))
+
+    # Mainloop
+    skipMainloop = Label("SkipMainloop", "")
+    loopBegin = Label("LoopBeginL", "")
+    module.addComment0("MAINLOOP")
+    numPartitions = len(scheduler.partitions)
+
+    # With scale double buffering, the scale set rotates per partition inside _emitLoop.
+    # After one iteration (N partitions), the set flips if N is odd → need 2x unrolling.
+    # If N is even, the set returns to starting position → no unrolling needed.
+    needsScaleUnroll = scheduler.hasScale and (numPartitions % 2 == 1)
+
+    if needsScaleUnroll:
+      # 2x unrolled mainloop for odd partition count.
+      # Copy 1 starts at scaleSet=0, ends at scaleSet=1 (after odd number of flips).
+      # Copy 2 starts at scaleSet=1, ends at scaleSet=0.
+      ngllOddLabel = Label("NGLLOdd", "")
+      module.add(loopBegin)
+      module.add(scheduler._emitLoop(writer, kernel, "MAINLOOP_C1", scheduler.mainloopSteps,
+                                     scaleSet=0))
+      module.add(SSubU32(dst=sgpr("LoopCounterL"), src0=sgpr("LoopCounterL"), src1=1,
+                         comment="dec counterL (copy 1)"))
+      module.add(SCmpEQU32(src0=sgpr("LoopCounterL"), src1=2,
+                           comment="counterL == 2? (odd exit)"))
+      module.add(SCBranchSCC1(labelName=ngllOddLabel.getLabelName(),
+                              comment="odd counterL → NGLL with S1"))
+      module.add(scheduler._emitLoop(writer, kernel, "MAINLOOP_C2", scheduler.mainloopSteps,
+                                     scaleSet=1))
+      module.add(SSubU32(dst=sgpr("LoopCounterL"), src0=sgpr("LoopCounterL"), src1=1,
+                         comment="dec counterL (copy 2)"))
+      module.add(SCmpEQU32(src0=sgpr("LoopCounterL"), src1=2,
+                           comment="counterL == 2? (even exit)"))
+      module.add(SCBranchSCC0(labelName=loopBegin.getLabelName(),
+                              comment="restart mainloop"))
+    else:
+      # No unrolling needed: either no scales, or even partition count (sets return to start).
+      module.add(loopBegin)
+      module.add(scheduler._emitLoop(writer, kernel, "MAINLOOP", scheduler.mainloopSteps,
+                                     scaleSet=0))
+      module.add(SSubU32(dst=sgpr("LoopCounterL"), src0=sgpr("LoopCounterL"), src1=1,
+                         comment="dec counterL"))
+      module.add(SCmpEQU32(src0=sgpr("LoopCounterL"), src1=2,
+                           comment="counterL == 2?"))
+      module.add(SCBranchSCC0(labelName=loopBegin.getLabelName(),
+                              comment="restart mainloop"))
+
+    # NGLL + NLL
+    module.add(skipMainloop)
+    module.addComment0("NGLL")
+    module.add(Label("SkipToNGLL", ""))
+    if scheduler.hasScale:
+      endLabel = Label("SkipToEnd", "")
+      nllSet = 1 if numPartitions % 2 == 1 else 0
+
+      # Even path (or only path when no unrolling): mainloop ended at scaleSet=0.
+      module.add(scheduler._emitLoop(writer, kernel, "NGLL", scheduler.ngllSteps,
+                                     scaleSet=0))
+      module.addComment0("NLL")
+      module.add(scheduler._emitLoop(writer, kernel, "NLL", scheduler.nllSteps, scaleSet=nllSet))
+
+      if needsScaleUnroll:
+        module.add(SBranch(labelName=endLabel.getLabelName(), comment="skip odd NGLL path"))
+
+        # Odd path: after Copy 1 (ended at scaleSet=1).
+        module.addComment0("NGLL (odd)")
+        module.add(ngllOddLabel)
+        module.add(scheduler._emitLoop(writer, kernel, "NGLL_odd", scheduler.ngllSteps,
+                                       scaleSet=1))
+        module.addComment0("NLL (odd)")
+        nllSetOdd = 0 if numPartitions % 2 == 1 else 1
+        module.add(scheduler._emitLoop(writer, kernel, "NLL_odd", scheduler.nllSteps, scaleSet=nllSetOdd))
+
+      # NLLEarly: reached when counterL<=1 (preloop skip, no NGLL).
+      # Preloop LR wrote scale set 0, so MFMA reads set 0.
+      module.add(SBranch(labelName=endLabel.getLabelName(), comment="skip NLLEarly"))
+      module.addComment0("NLLEarly")
+      module.add(Label("SkipToNLLEarly", ""))
+      module.add(scheduler._emitLoop(writer, kernel, "NLLEarly", scheduler.nllSteps, scaleSet=0))
+      module.add(endLabel)
+    else:
+      module.add(scheduler._emitLoop(writer, kernel, "NGLL", scheduler.ngllSteps))
+      module.addComment0("NLL")
+      module.add(Label("SkipToNLL", ""))
+      module.add(scheduler._emitLoop(writer, kernel, "NLL", scheduler.nllSteps))
+
+    scheduler.deallocVgprTiles(writer)
+
+  else:
+    # PGR=0: non-pipelined
+    module.addComment0("MAINLOOP")
+    module.add(mainLoopImplPGR0(writer, kernel))
+    module.addComment("")
 
   return module

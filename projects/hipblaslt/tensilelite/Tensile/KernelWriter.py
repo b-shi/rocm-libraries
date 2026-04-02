@@ -3866,17 +3866,33 @@ class KernelWriter(metaclass=abc.ABCMeta):
     module.add(self.calculateLoopNumIter(kernel, tensorParametersA, tensorParametersB, self.states.unrollIdx))
 
     # Allocate registers for VGPR tiles
-    for tileInfo in [atileInfo, btileInfo, dtileInfo]:
-      tileInfo.allocVgprTileRegisters(self, kernel)
-
-    for tileInfo in [mxsatileInfo, mxsbtileInfo]:
-      if tileInfo:
+    pgr = kernel["PrefetchGlobalRead"]
+    if pgr != 2:
+      # PGR=2: A/B vgprTiles are allocated by SubtileBasedScheduler in mainLoop
+      # TMP HACK to still use legacy path for PGR=0
+      for tileInfo in [atileInfo, btileInfo]:
         tileInfo.allocVgprTileRegisters(self, kernel)
+      
+      for tileInfo in [mxsatileInfo, mxsbtileInfo]:
+        if tileInfo:
+          tileInfo.allocVgprTileRegisters(self, kernel)
+
+    for tileInfo in [dtileInfo]:
+        tileInfo.allocVgprTileRegisters(self, kernel)
+
+    
+
     module.add(initVgprTilesToZero(self, kernel, dtileInfo))
 
-    self.states.scheduleInfo = ScheduleInfo(atileInfo, btileInfo)
+    if pgr != 2:
+      self.states.scheduleInfo = ScheduleInfo(atileInfo, btileInfo)
+      for tileInfo in [atileInfo, btileInfo, mxsatileInfo, mxsbtileInfo]:
+        if tileInfo:
+          for vtiles in tileInfo.vgprTiles:
+            regStr = "Vgpr" if vtiles.regList.regPool == self.vgprPool else "Agpr" # shouldn't this only be vgpr pool?
+            module.addComment("%ss used for %s mma tile %u: %s"%(regStr, tileInfo.tc, tileInfo.vgprTiles.index(vtiles), str(vtiles)))
 
-    for tileInfo in [atileInfo, btileInfo, mxsatileInfo, mxsbtileInfo, dtileInfo]:
+    for tileInfo in [dtileInfo]:
       if tileInfo:
         for vtiles in tileInfo.vgprTiles:
           regStr = "Vgpr" if vtiles.regList.regPool == self.vgprPool else "Agpr" # shouldn't this only be vgpr pool?
@@ -3900,9 +3916,10 @@ class KernelWriter(metaclass=abc.ABCMeta):
         tileInfo.deallocOffsetRegisters(self, kernel)
 
     # Deallocate registers used for VGPR A/B/MXS tiles
-    for tileInfo in [atileInfo, btileInfo, mxsatileInfo, mxsbtileInfo]:
-      if tileInfo:
-        tileInfo.deallocVgprTileRegisters(self, kernel)
+    if pgr != 2:
+      for tileInfo in [atileInfo, btileInfo,mxsatileInfo, mxsbtileInfo]:
+        if tileInfo:
+          tileInfo.deallocVgprTileRegisters(self, kernel)
 
     # Start of post-loop code
     if 1:
