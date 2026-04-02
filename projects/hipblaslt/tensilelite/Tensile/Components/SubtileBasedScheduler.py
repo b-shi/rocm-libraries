@@ -1366,6 +1366,7 @@ class SubtileBasedScheduler:
         """Build EmittedModules with core instructions + before/after module links."""
         emitted: List[EmittedModule] = []
         modToEmittedId: Dict[int, int] = {}
+        suppressAfterWaitLRForMod: Set[int] = set()
 
         def addEmitted(op) -> Optional[int]:
             coreInsts = self._emitOp(writer, kernel, op, dtileInfo,
@@ -1381,6 +1382,16 @@ class SubtileBasedScheduler:
             emId = addEmitted(mod.op)
             if emId is not None:
                 modToEmittedId[id(mod)] = emId
+
+        # If another module has before=[module-ref-to-X, WaitLROp, ...],
+        # suppress standalone X.after WaitLROp emission to avoid duplicates.
+        for mod in modules:
+            hasWaitLRInBefore = any(isinstance(e.op, WaitLROp) for e in mod.before)
+            if not hasWaitLRInBefore:
+                continue
+            for e in mod.before:
+                if e.module is not None:
+                    suppressAfterWaitLRForMod.add(id(e.module))
 
         # Dependency-op links for emitted debug/scheduling.
         for mod in modules:
@@ -1428,6 +1439,8 @@ class SubtileBasedScheduler:
                         depIds.append(mId)
                     continue
                 if edge.op is None:
+                    continue
+                if isinstance(edge.op, WaitLROp) and id(mod) in suppressAfterWaitLRForMod:
                     continue
                 depId = addEmitted(edge.op)
                 if depId is None:

@@ -459,11 +459,10 @@ MAINLOOP EmittedModules:
   Partition 0:
     subIterK=0:
       id=0 mfma: core=4 insts before=[-] after=[-]
-      id=1 lr: core=4 insts before=[-] after=[3]
-      id=2 gr: core=4 insts before=[5] after=[-]
-      id=3 wait_lr: core=1 insts before=[-] after=[-]
-      id=4 wait_lr: core=1 insts before=[1] after=[-]
-      id=5 sync: core=1 insts before=[4] after=[-]
+      id=1 lr: core=4 insts before=[-] after=[-]
+      id=2 gr: core=4 insts before=[4] after=[-]
+      id=3 wait_lr: core=1 insts before=[1] after=[-]
+      id=4 sync: core=1 insts before=[3] after=[-]
     subIterK=1:
       id=0 mfma: core=4 insts before=[-] after=[-]
       id=1 lr: core=4 insts before=[5] after=[6]
