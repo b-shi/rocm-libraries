@@ -231,17 +231,12 @@ class AnnotatedModule:
 
 @dataclass
 class EmittedModule:
-    """Emitted instructions for one AnnotatedModule.
-
-    before: instructions from dependency edges that must execute before core
-    core:   instructions from the primary op (MFMAs, ds_reads, buffer_loads)
-    after:  instructions from dependency edges that execute after core
-    """
-    before: list = field(default_factory=list)
+    """One emitted module with core instructions and module-link deps."""
+    moduleId: int = -1
     core: list = field(default_factory=list)
-    after: list = field(default_factory=list)
-    opType: str = ""  # "mfma", "lr", "gr" — for the scheduler to know what it's working with
-    dependsOn: List[str] = field(default_factory=list)  # opTypes this module depends on (e.g. ["lr"])
+    before: List[int] = field(default_factory=list)  # moduleIds that must run before this module
+    after: List[int] = field(default_factory=list)   # moduleIds that must run after this module
+    opType: str = ""
 
 
 @dataclass
@@ -818,6 +813,7 @@ class SubtileBasedScheduler:
         pendingB = set()
         lastLRmt = None
         opIdx = 0
+        seenGRMods: List[AnnotatedModule] = []
 
         for pss in self.mainloopSteps:
             gr = self.partitionGRs[pss.partitionId]
@@ -835,6 +831,8 @@ class SubtileBasedScheduler:
                 lrMod = lrMods[0] if lrMods else None
                 lrOp = lrMod.op if lrMod else None
                 hasGRn2 = any(isinstance(m.op, GROp) and m.op.mtIteration == "n+2" for m in grMods)
+                waitA = set()
+                waitB = set()
 
                 # Determine if WAIT_GR is needed before this LR
                 waitGROp = None
@@ -860,8 +858,22 @@ class SubtileBasedScheduler:
                         if grMod.op.lastForMT:
                             grMod.after.append(DepEdge(op=GR_INCOp()))
                     if lrMod:
-                        if grMods:
-                            lrMod.before.append(DepEdge(module=grMods[0]))
+                        candidateGRs = list(reversed(seenGRMods + grMods))
+                        grMatch = None
+                        # LR(MT x) must depend on GR(MT x)
+                        targetGRmt = lrOp.mtIteration
+                        for g in candidateGRs:
+                            if g.op.mtIteration != targetGRmt:
+                                continue
+                            gA = set(g.op.subtileA)
+                            gB = set(g.op.subtileB)
+                            if (not waitA or waitA.issubset(gA)) and (not waitB or waitB.issubset(gB)):
+                                grMatch = g
+                                break
+                        if grMatch is None:
+                            grMatch = next((g for g in candidateGRs if g.op.mtIteration == targetGRmt), None)
+                        if grMatch is not None:
+                            lrMod.before.append(DepEdge(module=grMatch))
                         lrMod.before.append(DepEdge(op=waitGROp))
                         lrMod.before.append(DepEdge(op=SyncOp(comment="Barrier: wait for GR data")))
                         if lastLRmt is not None and lrOp.mtIteration != lastLRmt:
@@ -873,6 +885,8 @@ class SubtileBasedScheduler:
                     # Order: MFMAs → LR_INC? → LR → ... MFMAs ... → WAIT_LR → SYNC → GR → GR_INC?
                     if lastLRmt is not None and lrOp.mtIteration != lastLRmt:
                         lrMod.before.append(DepEdge(op=LR_INCOp()))
+                    # LR completion marker for end-of-subIterK consistency.
+                    lrMod.after.append(DepEdge(op=WaitLROp()))
                     for grMod in grMods:
                         grMod.before.append(DepEdge(module=lrMod))
                         grMod.before.append(DepEdge(op=WaitLROp()))
@@ -892,6 +906,7 @@ class SubtileBasedScheduler:
 
                 if lrOp:
                     lastLRmt = lrOp.mtIteration
+                seenGRMods.extend(grMods)
                 opIdx += numModules
 
 
@@ -1125,8 +1140,7 @@ class SubtileBasedScheduler:
     def printEmittedModules(self, writer, kernel, label, steps):
         """Print EmittedModules for a loop section (before instructionSchedule).
 
-        Emits each AnnotatedModule into an EmittedModule and prints its
-        opType, dependsOn, and instruction counts for before/core/after.
+        Emits each subIterK into EmittedModules and prints per-module links.
         """
         dtileInfo = writer.states.d.tileInfo
         print(f"\n{label} EmittedModules:")
@@ -1134,12 +1148,12 @@ class SubtileBasedScheduler:
             print(f"  Partition {pss.partitionId}:")
             for dus in pss.subIterKSteps:
                 print(f"    subIterK={dus.subIterK}:")
-                for mod in dus.modules:
-                    em = self._emitAnnotatedModule(writer, kernel, mod, dtileInfo)
-                    dep_str = ", ".join(em.dependsOn) if em.dependsOn else "none"
-                    print(f"      {em.opType}: dependsOn=[{dep_str}]  "
-                          f"before={len(em.before)} insts, core={len(em.core)} insts, "
-                          f"after={len(em.after)} insts")
+                emitted = self._buildEmittedModules(writer, kernel, dus.modules, dtileInfo)
+                for em in emitted:
+                    beforeStr = ",".join(str(i) for i in em.before) if em.before else "-"
+                    afterStr = ",".join(str(i) for i in em.after) if em.after else "-"
+                    print(f"      id={em.moduleId} {em.opType}: core={len(em.core)} insts "
+                          f"before=[{beforeStr}] after=[{afterStr}]")
 
     # Allocate totalVGPRTiles vpgrTile
     def allocVgprTiles(self, writer):
@@ -1326,39 +1340,104 @@ class SubtileBasedScheduler:
                 comment=f"skip to {op.target}"))
         return module.flatitems()
 
-    def _emitAnnotatedModule(self, writer, kernel, mod, dtileInfo, scaleSet=0, scaleLRSet=0):
-        """Emit an AnnotatedModule into an EmittedModule with before/core/after instruction lists."""
-        before_insts = []
-        dependsOn = []
-        for edge in mod.before:
-            if edge.module:
-                # Module reference: record ordering constraint, don't emit instructions
-                if isinstance(edge.module.op, LROp):
-                    dependsOn.append("lr")
-                elif isinstance(edge.module.op, GROp):
-                    dependsOn.append("gr")
-            elif edge.op:
-                before_insts.extend(self._emitOp(writer, kernel, edge.op, dtileInfo,
-                                                 scaleSet=scaleSet, scaleLRSet=scaleLRSet))
-        core_insts = self._emitOp(writer, kernel, mod.op, dtileInfo,
-                                  scaleSet=scaleSet, scaleLRSet=scaleLRSet)
-        after_insts = []
-        for edge in mod.after:
-            if edge.op:
-                after_insts.extend(self._emitOp(writer, kernel, edge.op, dtileInfo,
-                                                scaleSet=scaleSet, scaleLRSet=scaleLRSet))
+    @staticmethod
+    def _opType(op):
+        if isinstance(op, MFMAOp):
+            return "mfma"
+        if isinstance(op, LROp):
+            return "lr"
+        if isinstance(op, GROp):
+            return "gr"
+        if isinstance(op, WaitGROp):
+            return "wait_gr"
+        if isinstance(op, WaitLROp):
+            return "wait_lr"
+        if isinstance(op, SyncOp):
+            return "sync"
+        if isinstance(op, GR_INCOp):
+            return "gr_inc"
+        if isinstance(op, LR_INCOp):
+            return "lr_inc"
+        if isinstance(op, SkipOp):
+            return "skip"
+        return "other"
 
-        if isinstance(mod.op, MFMAOp):
-            opType = "mfma"
-        elif isinstance(mod.op, LROp):
-            opType = "lr"
-        elif isinstance(mod.op, GROp):
-            opType = "gr"
-        else:
-            opType = "other"
+    def _buildEmittedModules(self, writer, kernel, modules, dtileInfo, scaleSet=0, scaleLRSet=0):
+        """Build EmittedModules with core instructions + before/after module links."""
+        emitted: List[EmittedModule] = []
+        modToEmittedId: Dict[int, int] = {}
 
-        return EmittedModule(before=before_insts, core=core_insts,
-                             after=after_insts, opType=opType, dependsOn=dependsOn)
+        def addEmitted(op) -> Optional[int]:
+            coreInsts = self._emitOp(writer, kernel, op, dtileInfo,
+                                     scaleSet=scaleSet, scaleLRSet=scaleLRSet)
+            if not coreInsts:
+                return None
+            emId = len(emitted)
+            emitted.append(EmittedModule(moduleId=emId, core=coreInsts, opType=self._opType(op)))
+            return emId
+
+        # Primary modules first (MFMA/LR/GR)
+        for mod in modules:
+            emId = addEmitted(mod.op)
+            if emId is not None:
+                modToEmittedId[id(mod)] = emId
+
+        # Dependency-op links for emitted debug/scheduling.
+        for mod in modules:
+            curId = modToEmittedId.get(id(mod))
+            if curId is None:
+                continue
+
+            # before ops: chain from module refs / deps, then core.before points to
+            # the last non-standalone dep.
+            prevId: Optional[int] = None
+            lastDepId: Optional[int] = None
+            for edge in mod.before:
+                if edge.module:
+                    prevId = modToEmittedId.get(id(edge.module), prevId)
+                    continue
+                if edge.op is None:
+                    continue
+                depId = addEmitted(edge.op)
+                if depId is None:
+                    continue
+                if isinstance(edge.op, WaitGROp):
+                    # Keep WAIT_GR standalone (no links), but allow later deps to
+                    # chain from it.
+                    prevId = depId
+                    continue
+                if prevId is not None and prevId not in emitted[depId].before:
+                    emitted[depId].before.append(prevId)
+                prevId = depId
+                lastDepId = depId
+            if lastDepId is not None:
+                if lastDepId not in emitted[curId].before:
+                    emitted[curId].before.append(lastDepId)
+            elif prevId is not None:
+                # before had only module refs and/or standalone deps
+                if prevId not in emitted[curId].before and prevId != curId:
+                    emitted[curId].before.append(prevId)
+
+            # after ops: append deps as standalone modules; core.after references
+            # them, but deps do not link back.
+            depIds: List[int] = []
+            for edge in mod.after:
+                if edge.module:
+                    mId = modToEmittedId.get(id(edge.module))
+                    if mId is not None:
+                        depIds.append(mId)
+                    continue
+                if edge.op is None:
+                    continue
+                depId = addEmitted(edge.op)
+                if depId is None:
+                    continue
+                depIds.append(depId)
+            for depId in depIds:
+                if depId not in emitted[curId].after and depId != curId:
+                    emitted[curId].after.append(depId)
+
+        return emitted
 
     def _emitSubIterK(self, writer, kernel, pss, dus, scaleSet=0, scaleLRSet=0):
         """Emit a single subIterK step into a Module.
@@ -1376,12 +1455,8 @@ class SubtileBasedScheduler:
         module.addComment0(f"Partition {pss.partitionId}: subIterK={dus.subIterK}")
 
         if dus.modules:
-            # Emit each AnnotatedModule into an EmittedModule
-            emitted = []
-            for mod in dus.modules:
-                em = self._emitAnnotatedModule(writer, kernel, mod, dtileInfo,
-                                               scaleSet=scaleSet, scaleLRSet=scaleLRSet)
-                emitted.append(em)
+            emitted = self._buildEmittedModules(writer, kernel, dus.modules, dtileInfo,
+                                                scaleSet=scaleSet, scaleLRSet=scaleLRSet)
             # instructionSchedule merges them with fine-grained interleaving
             merged = self.instructionSchedule(emitted)
             module.add(merged)
@@ -1397,16 +1472,13 @@ class SubtileBasedScheduler:
     def instructionSchedule(emittedModules: List['EmittedModule']):
         """Merge EmittedModules with fine-grained MFMA interleaving.
 
-        Receives a list of EmittedModules (one per AnnotatedModule: mfma, lr, gr)
-        each containing before/core/after instruction lists.
+        Receives EmittedModules with module-link dependencies in before/after.
 
         The scheduler:
-          1. Determines ordering between LR and GR groups based on dependency
-             structure (which has before/after deps)
-          2. Extracts all MFMA instructions from the mfma module's core
-          3. Builds a non-MFMA instruction stream from LR and GR groups
-             (respecting before → core → after ordering within each group)
-          4. Interleaves MFMAs into the non-MFMA stream using slot-based rules:
+          1. Topologically orders emitted modules using before/after links
+          2. Extracts all MFMA instructions from emitted mfma groups
+          3. Builds the non-MFMA stream from ordered non-mfma groups
+          3. Interleaves MFMAs into the non-MFMA stream using slot-based rules:
              - 1 MFMA between each LR (ds_read) instruction
              - 3 MFMAs between the last LR and the WAIT_LR (SWaitCnt dscnt)
              - 1 MFMA between WAIT_LR and SYNC (SBarrier)
@@ -1416,60 +1488,44 @@ class SubtileBasedScheduler:
         if not emittedModules:
             return Module()
 
-        # Separate modules by type
-        mfmaEm = None
-        lrEm = None
-        grEm = None
-        for em in emittedModules:
-            if em.opType == "mfma":
-                mfmaEm = em
-            elif em.opType == "lr":
-                lrEm = em
-            elif em.opType == "gr":
-                grEm = em
+        # Topological order by module links (stable by moduleId/index).
+        n = len(emittedModules)
+        indeg = [0] * n
+        succ = [[] for _ in range(n)]
+        for i, em in enumerate(emittedModules):
+            deps = set([d for d in em.before if 0 <= d < n])
+            indeg[i] = len(deps)
+            for d in deps:
+                succ[d].append(i)
+
+        ready = [i for i in range(n) if indeg[i] == 0]
+        ready.sort()
+        orderedIdx = []
+        while ready:
+            i = ready.pop(0)
+            orderedIdx.append(i)
+            for j in succ[i]:
+                indeg[j] -= 1
+                if indeg[j] == 0:
+                    ready.append(j)
+            ready.sort()
+        if len(orderedIdx) != n:
+            orderedIdx = list(range(n))
 
         # Extract MFMA instructions
         isMFMA = lambda x: isinstance(x, (MFMAInstruction, MXMFMAInstruction))
         mfmas = []
-        if mfmaEm:
-            mfmas = [x for x in mfmaEm.core if isMFMA(x)]
+        for i in orderedIdx:
+            em = emittedModules[i]
+            if em.opType == "mfma":
+                mfmas.extend([x for x in em.core if isMFMA(x)])
 
-        # Determine ordering between LR and GR groups based on dependsOn.
-        # If LR dependsOn GR → GR goes first (waitGROp pattern)
-        # If GR dependsOn LR → LR goes first (collision pattern)
-        # Otherwise → LR first, GR after, deferred WAIT_LR at end (default)
-        lr_depends_on_gr = lrEm and "gr" in lrEm.dependsOn
-        gr_depends_on_lr = grEm and "lr" in grEm.dependsOn
-
-        # Build non-MFMA instruction stream in dependency-correct order
+        # Build non-MFMA instruction stream in dependency order
         others = []
-        if lr_depends_on_gr and grEm:
-            # LR depends on GR: GR+after → LR.before → LR.core → LR.after
-            others.extend(grEm.core)
-            others.extend(grEm.after)
-            if lrEm:
-                others.extend(lrEm.before)
-                others.extend(lrEm.core)
-                others.extend(lrEm.after)
-        elif gr_depends_on_lr and lrEm:
-            # GR depends on LR: LR.before → LR.core → LR.after → GR.before → GR.core → GR.after
-            others.extend(lrEm.before)
-            others.extend(lrEm.core)
-            others.extend(lrEm.after)
-            if grEm:
-                others.extend(grEm.before)
-                others.extend(grEm.core)
-                others.extend(grEm.after)
-        else:
-            # No inter-module dependency: LR.before → LR.core → GR.core → GR.after → LR.after
-            if lrEm:
-                others.extend(lrEm.before)
-                others.extend(lrEm.core)
-            if grEm:
-                others.extend(grEm.core)
-                others.extend(grEm.after)
-            if lrEm:
-                others.extend(lrEm.after)
+        for i in orderedIdx:
+            em = emittedModules[i]
+            if em.opType != "mfma":
+                others.extend(em.core)
 
         if not mfmas:
             # No MFMAs to interleave, just return the ordered stream

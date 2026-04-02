@@ -431,6 +431,52 @@ NLL (No Load Loop):
     assert actual == expected
 
 
+def test_PGR2_64_64_1x1_emitted_modules_links():
+    MT0 = MT1 = 64
+    kernel = create_kernel(MT0, MT1)
+    tiA = TileInfo('A', kernel)
+    tiB = TileInfo('B', kernel)
+    lsgA = tiA.localSubtileGrid[0]
+    lsgB = tiB.localSubtileGrid[0]
+
+    cfg = SchedulerConfig(lsgA, lsgB, PrefetchMode.HALF_PREFETCH,
+                          VGPRTileReUseStrategy.ACROSS_SUBGROUP,
+                          SubgroupOrdering.COLUMN_MAJOR)
+    s = SubtileBasedScheduler(tiA, tiB, cfg)
+    writer = create_writer_with_tiles(kernel, tiA, tiB)
+
+    s.allocVgprTiles(writer)
+    try:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            s.printEmittedModules(writer, kernel, "MAINLOOP", s.mainloopSteps)
+        actual = buf.getvalue()
+    finally:
+        s.deallocVgprTiles(writer)
+
+    expected = """\
+MAINLOOP EmittedModules:
+  Partition 0:
+    subIterK=0:
+      id=0 mfma: core=4 insts before=[-] after=[-]
+      id=1 lr: core=4 insts before=[-] after=[3]
+      id=2 gr: core=4 insts before=[5] after=[-]
+      id=3 wait_lr: core=1 insts before=[-] after=[-]
+      id=4 wait_lr: core=1 insts before=[1] after=[-]
+      id=5 sync: core=1 insts before=[4] after=[-]
+    subIterK=1:
+      id=0 mfma: core=4 insts before=[-] after=[-]
+      id=1 lr: core=4 insts before=[5] after=[6]
+      id=2 gr: core=4 insts before=[-] after=[7]
+      id=3 wait_gr: core=1 insts before=[-] after=[-]
+      id=4 sync: core=1 insts before=[3] after=[-]
+      id=5 lr_inc: core=6 insts before=[4] after=[-]
+      id=6 wait_lr: core=1 insts before=[-] after=[-]
+      id=7 gr_inc: core=10 insts before=[-] after=[-]
+"""
+    assert expected in actual
+
+
 if __name__ == "__main__":
     MT0=MT1=64
     kernel = create_kernel(MT0,MT1)
@@ -459,11 +505,11 @@ if __name__ == "__main__":
 
     s.allocVgprTiles(writer)
     s.printEmittedModules(writer, kernel, "MAINLOOP", s.mainloopSteps)
-    s.printEmittedModules(writer, kernel, "NGLL", s.ngllSteps)
-    s.printEmittedModules(writer, kernel, "NLL", s.nllSteps)
+    # s.printEmittedModules(writer, kernel, "NGLL", s.ngllSteps)
+    # s.printEmittedModules(writer, kernel, "NLL", s.nllSteps)
     s.deallocVgprTiles(writer)
 
-    # s.generateCode(writer, kernel)
+    s.generateCode(writer, kernel)
     # kernel = create_kernel()
     # tiA = TileInfo('A', kernel)
     # tiB = TileInfo('B', kernel)
