@@ -11,7 +11,7 @@ from Tensile.Components.SubtileBasedKernel import globalReadPtrUpdates, globalRe
 from Tensile.Components.SubtileBasedKernel import globalReadDoScaleSubtile, globalReadScalePtrUpdates
 from rocisa.code import Module, Label
 from rocisa.instruction import SWaitCnt, SBarrier, SCmpEQU32, SCmpLeU32, SCBranchSCC1, MFMAInstruction, \
-    MXMFMAInstruction, LocalReadInstruction, GlobalReadInstruction
+    MXMFMAInstruction, LocalReadInstruction, GlobalReadInstruction, DSLoadB32
 from rocisa.container import sgpr, vgpr, DSModifiers
 
 

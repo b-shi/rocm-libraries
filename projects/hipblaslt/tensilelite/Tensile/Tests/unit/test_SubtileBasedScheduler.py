@@ -21,30 +21,41 @@ def _mock_dtype(num_bytes=2):
     mock.numBytes.return_value = num_bytes
     return mock
 
-def create_kernel(MT0=256, MT1=256):
-    dtype = _mock_dtype(2)
+def create_kernel(MT0=256, MT1=256, fp4=False):
+    mxblock = 32 if fp4 else 0
+    bpe = 1 if fp4 else 2
+    matrixInstK = 128 if fp4 else 32
+    depthU = 256 if fp4 else 64
+    dtype = _mock_dtype(bpe)
     problemType = {
         "DataTypeA": dtype,
         "DataTypeB": dtype,
         "ComputeDataType": _mock_dtype(4),
     }
-    return {
-        "DepthU": 64,
-        "_DepthUA": 64,
-        "_DepthUB": 64,
+    if fp4:
+        problemType["MXBlockA"] = mxblock
+        problemType["MXBlockB"] = mxblock
+    kernel = {
+        "DepthU": depthU,
+        "_DepthUA": depthU,
+        "_DepthUB": depthU,
         "MacroTileA": MT0,
         "MacroTileB": MT1,
         "MacroTile0": MT0,
         "MacroTile1": MT1,
         "MatrixInstM": 16,
         "MatrixInstN": 16,
-        "MatrixInstK": 32,
+        "MatrixInstK": matrixInstK,
         "MIWaveGroup": [2, 2],
         "WavefrontSize": 64,
         "SourceSwap": False,
         "MIArchVgpr": False,
         "ProblemType": problemType,
     }
+    if fp4:
+        kernel["_DepthUMXSA"] = depthU // mxblock
+        kernel["_DepthUMXSB"] = depthU // mxblock
+    return kernel
 
 def create_mock_writer(kernel):
     writer = SimpleNamespace()
@@ -60,12 +71,18 @@ def create_mock_writer(kernel):
     writer.states.d = SimpleNamespace(tileInfo=dTileInfo)
     return writer
 
-def create_writer_with_tiles(kernel, tiA, tiB):
+def create_writer_with_tiles(kernel, tiA, tiB, scaleTiA=None, scaleTiB=None):
     writer = create_mock_writer(kernel)
     writer.states.a = SimpleNamespace(tileInfo=tiA)
     writer.states.b = SimpleNamespace(tileInfo=tiB)
+    writer.states.mxsa = SimpleNamespace(tileInfo=scaleTiA) if scaleTiA else SimpleNamespace()
+    writer.states.mxsb = SimpleNamespace(tileInfo=scaleTiB) if scaleTiB else SimpleNamespace()
     tiA.allocOffsetRegisters(writer, kernel)
     tiB.allocOffsetRegisters(writer, kernel)
+    if scaleTiA:
+        scaleTiA.allocOffsetRegisters(writer, kernel)
+    if scaleTiB:
+        scaleTiB.allocOffsetRegisters(writer, kernel)
     return writer
 
 
@@ -533,25 +550,35 @@ def test_PGR2_256_256_1x1_extract_paths_from_before_deps():
 
 
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--fp4", action="store_true", help="Enable FP4 path with MX scales")
+    args = parser.parse_args()
+
     MT0=MT1=256
-    kernel = create_kernel(MT0,MT1)
+    kernel = create_kernel(MT0, MT1, fp4=args.fp4)
     tiA = TileInfo('A', kernel)
     tiB = TileInfo('B', kernel)
-    # 2x2 partition grid
+
+    scaleTiA = TileInfo('MXSA', kernel) if args.fp4 else None
+    scaleTiB = TileInfo('MXSB', kernel) if args.fp4 else None
+
     lsgA = tiA.localSubtileGrid[0]
     lsgB = tiB.localSubtileGrid[0]
 
     cfg = SchedulerConfig(lsgA, lsgB, PrefetchMode.HALF_PREFETCH,
                           VGPRTileReUseStrategy.ACROSS_SUBGROUP,
                           SubgroupOrdering.COLUMN_MAJOR)
-    s = SubtileBasedScheduler(tiA, tiB, cfg)
+    s = SubtileBasedScheduler(tiA, tiB, cfg,
+                              scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB)
 
     assert len(s.preloopSteps)  > 0
     assert len(s.mainloopSteps) > 0
     assert len(s.ngllSteps)     > 0
     assert len(s.nllSteps)      > 0
 
-    writer = create_writer_with_tiles(kernel, tiA, tiB)
+    writer = create_writer_with_tiles(kernel, tiA, tiB,
+                                      scaleTiA=scaleTiA, scaleTiB=scaleTiB)
 
     print("=== INITIAL ===")
     s.printSchedule(mode="initial")
@@ -560,8 +587,6 @@ if __name__ == "__main__":
 
     s.allocVgprTiles(writer)
     s.printEmittedModules(writer, kernel, "MAINLOOP", s.mainloopSteps)
-    # s.printEmittedModules(writer, kernel, "NGLL", s.ngllSteps)
-    # s.printEmittedModules(writer, kernel, "NLL", s.nllSteps)
     s.deallocVgprTiles(writer)
 
     s.generateCode(writer, kernel)
