@@ -146,6 +146,36 @@ namespace DGen
                                       TrigonometricFromFloat,
                                       NormalFromFloat>;
 
+    //
+    // Defining Scale Initialization Modes
+    //
+    struct ScaleBlockSerial
+    {
+        std::string toString() const
+        {
+            return "ScaleBlockSerial";
+        }
+    };
+
+    struct ScaleSparseBlock
+    {
+        std::string toString() const
+        {
+            return "ScaleSparseBlock";
+        }
+    };
+
+    struct ScaleSparseBlockRandom
+    {
+        std::string toString() const
+        {
+            return "ScaleSparseBlockRandom";
+        }
+    };
+
+    using ScaleInitMode
+        = std::variant<std::monostate, ScaleBlockSerial, ScaleSparseBlock, ScaleSparseBlockRandom>;
+
     inline std::string toString(DataInitMode const& initMode)
     {
         return "DataInitMode("
@@ -178,6 +208,10 @@ namespace DGen
 
         DataScaling scaling      = DataScaling::Mean;
         index_t     blockScaling = 1;
+
+        ScaleInitMode scaleInitMode = std::monostate{};
+        int           scaleBlockI   = 0;
+        int           scaleBlockJ   = 0;
     };
 
     template <typename DTYPE>
@@ -262,6 +296,14 @@ namespace DGen
                                       index_t                      block_size);
 
         void post_sprinkle(const std::vector<index_t>& size, int32_t unbiased_min_exp);
+
+        static constexpr index_t kScaleTileRows = 32;
+        static constexpr index_t kScaleTileCols = 8;
+
+        void apply_scale_init(const std::vector<index_t>& size);
+        void generate_scale_block_serial(const std::vector<index_t>& size);
+        void generate_scale_sparse_block(const std::vector<index_t>& size);
+        void generate_scale_sparse_block_random(const std::vector<index_t>& size);
 
         void setGenerator(int numThreads);
     };
@@ -386,6 +428,9 @@ namespace DGen
         setGenerator(m_num_threads);
 
         dispatch_generate_data(sorted_size, sorted_stride);
+
+        if(!std::holds_alternative<std::monostate>(m_options.scaleInitMode))
+            apply_scale_init(sorted_size);
 
         return *this;
     }
@@ -1787,5 +1832,103 @@ namespace DGen
                 }
             }
         }
+    }
+
+    template <typename DTYPE>
+    void DataGenerator<DTYPE>::apply_scale_init(const std::vector<index_t>& size)
+    {
+        std::visit(
+            overload{[](const std::monostate&) {},
+                     [&](const ScaleBlockSerial&) { generate_scale_block_serial(size); },
+                     [&](const ScaleSparseBlock&) { generate_scale_sparse_block(size); },
+                     [&](const ScaleSparseBlockRandom&) { generate_scale_sparse_block_random(size); }},
+            m_options.scaleInitMode);
+    }
+
+    template <typename DTYPE>
+    void DataGenerator<DTYPE>::generate_scale_block_serial(const std::vector<index_t>& size)
+    {
+        if(!isScaled<DTYPE>() || m_scaleDesc.array_size == 0)
+            return;
+
+        index_t scaleRows = size[0] / m_options.blockScaling;
+        index_t scaleCols = size[1];
+
+        index_t numTileRows = (scaleRows + kScaleTileRows - 1) / kScaleTileRows;
+        index_t numTileCols = (scaleCols + kScaleTileCols - 1) / kScaleTileCols;
+
+        uint8_t tileValue = 0;
+        for(index_t tr = 0; tr < numTileRows; tr++)
+        {
+            for(index_t tc = 0; tc < numTileCols; tc++)
+            {
+                index_t rEnd = std::min((tr + 1) * kScaleTileRows, scaleRows);
+                index_t cEnd = std::min((tc + 1) * kScaleTileCols, scaleCols);
+                for(index_t r = tr * kScaleTileRows; r < rEnd; r++)
+                    for(index_t c = tc * kScaleTileCols; c < cEnd; c++)
+                        m_scaleBytes[r + c * scaleRows] = tileValue;
+                tileValue = (tileValue >= 0xFE) ? 0 : tileValue + 1;
+            }
+        }
+    }
+
+    template <typename DTYPE>
+    void DataGenerator<DTYPE>::generate_scale_sparse_block(const std::vector<index_t>& size)
+    {
+        if(!isScaled<DTYPE>() || m_scaleDesc.array_size == 0)
+            return;
+
+        index_t scaleRows = size[0] / m_options.blockScaling;
+        index_t scaleCols = size[1];
+
+        index_t maxI    = scaleRows / kScaleTileRows;
+        index_t maxJ    = scaleCols / kScaleTileCols;
+        index_t targetI = (m_options.scaleBlockI >= 0) ? static_cast<index_t>(m_options.scaleBlockI) : 0;
+        index_t targetJ = (m_options.scaleBlockJ >= 0) ? static_cast<index_t>(m_options.scaleBlockJ) : 0;
+        if(targetI >= maxI)
+            targetI = (maxI > 0) ? maxI - 1 : 0;
+        if(targetJ >= maxJ)
+            targetJ = (maxJ > 0) ? maxJ - 1 : 0;
+
+        std::memset(m_scaleBytes.data(), 0x00, m_scaleBytes.size());
+
+        index_t rStart = targetI * kScaleTileRows;
+        index_t cStart = targetJ * kScaleTileCols;
+        index_t rEnd   = std::min(rStart + kScaleTileRows, scaleRows);
+        index_t cEnd   = std::min(cStart + kScaleTileCols, scaleCols);
+        for(index_t r = rStart; r < rEnd; r++)
+            for(index_t c = cStart; c < cEnd; c++)
+                m_scaleBytes[r + c * scaleRows] = 0x7F;
+    }
+
+    template <typename DTYPE>
+    void DataGenerator<DTYPE>::generate_scale_sparse_block_random(const std::vector<index_t>& size)
+    {
+        if(!isScaled<DTYPE>() || m_scaleDesc.array_size == 0)
+            return;
+
+        index_t scaleRows = size[0] / m_options.blockScaling;
+        index_t scaleCols = size[1];
+
+        index_t maxI    = scaleRows / kScaleTileRows;
+        index_t maxJ    = scaleCols / kScaleTileCols;
+        index_t targetI = (m_options.scaleBlockI >= 0) ? static_cast<index_t>(m_options.scaleBlockI) : 0;
+        index_t targetJ = (m_options.scaleBlockJ >= 0) ? static_cast<index_t>(m_options.scaleBlockJ) : 0;
+        if(targetI >= maxI)
+            targetI = (maxI > 0) ? maxI - 1 : 0;
+        if(targetJ >= maxJ)
+            targetJ = (maxJ > 0) ? maxJ - 1 : 0;
+
+        std::memset(m_scaleBytes.data(), 0x00, m_scaleBytes.size());
+
+        std::bernoulli_distribution coin(0.5);
+
+        index_t rStart = targetI * kScaleTileRows;
+        index_t cStart = targetJ * kScaleTileCols;
+        index_t rEnd   = std::min(rStart + kScaleTileRows, scaleRows);
+        index_t cEnd   = std::min(cStart + kScaleTileCols, scaleCols);
+        for(index_t r = rStart; r < rEnd; r++)
+            for(index_t c = cStart; c < cEnd; c++)
+                m_scaleBytes[r + c * scaleRows] = coin(m_gen[0]) ? 0x7F : 0x00;
     }
 }

@@ -311,7 +311,10 @@ std::vector<float> generateMXInput(hipDataType                dataType,
                                    bool                       isMatrixA,
                                    std::string_view const     initMethod,
                                    float                      min_val,
-                                   float                      max_val)
+                                   float                      max_val,
+                                   std::string_view const     scaleInitMethod,
+                                   int                        scaleBlockI,
+                                   int                        scaleBlockJ)
 {
     using namespace DGen;
 
@@ -343,6 +346,17 @@ std::vector<float> generateMXInput(hipDataType                dataType,
     else
         // TODO initMethod == "hpl" should also be Bounded, but fails some tests
         opt.initMode = DataInitMode(TrigonometricFromFloat{});
+
+    // Map scaleInitMethod string to ScaleInitMode
+    if(scaleInitMethod == "MXScaleBlockSerial")
+        opt.scaleInitMode = DGen::ScaleBlockSerial{};
+    else if(scaleInitMethod == "MXScaleSparseBlock")
+        opt.scaleInitMode = DGen::ScaleSparseBlock{};
+    else if(scaleInitMethod == "MXScaleSparseBlockRandom")
+        opt.scaleInitMode = DGen::ScaleSparseBlockRandom{};
+
+    opt.scaleBlockI = scaleBlockI;
+    opt.scaleBlockJ = scaleBlockJ;
 
     const uint32_t seed = 1713573849;
 
