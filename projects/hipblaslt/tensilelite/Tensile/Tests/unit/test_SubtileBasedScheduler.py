@@ -129,7 +129,7 @@ MAINLOOP:
         - USING  A: {0: 0, 1: 1}  B: {0: 2, 1: 3}
         before: [none]  after: [none]
       LR (MT n, subIterK 1) A: {0: 4, 1: 5}  B: {0: 6, 1: 7}
-        before: [none]  after: [none]
+        before: [none]  after: [WaitLROp]
       GR (MT n+2):  A: [0]  B: [0]
         before: [LR(MT n, sik 1), WaitLROp, SyncOp]  after: [none]
     subIterK=1:
@@ -138,7 +138,7 @@ MAINLOOP:
         - USING  A: {0: 4, 1: 5}  B: {0: 6, 1: 7}
         before: [none]  after: [none]
       LR (MT n+1, subIterK 0) A: {0: 0, 1: 1}  B: {0: 2, 1: 3}
-        before: [GR(MT n+2), WaitGROp, SyncOp, LR_INCOp]  after: [WaitLROp]
+        before: [WaitGROp, SyncOp, LR_INCOp]  after: [WaitLROp]
       GR (MT n+2):  A: [1]  B: [1]
         before: [none]  after: [GR_INCOp]
 
@@ -150,7 +150,7 @@ NGLL (No Global Load Loop):
         - USING  A: {0: 0, 1: 1}  B: {0: 2, 1: 3}
         before: [none]  after: [none]
       LR (MT n, subIterK 1) A: {0: 4, 1: 5}  B: {0: 6, 1: 7}
-        before: [none]  after: [WaitLROp, SyncOp]
+        before: [none]  after: [WaitLROp, WaitLROp, SyncOp]
     subIterK=1:
       MFMAs (MT n, subIterK 1):
         - [(0, 0), (0, 1), (1, 0), (1, 1)]
@@ -167,7 +167,7 @@ NLL (No Load Loop):
         - USING  A: {0: 0, 1: 1}  B: {0: 2, 1: 3}
         before: [none]  after: [none]
       LR (MT n, subIterK 1) A: {0: 4, 1: 5}  B: {0: 6, 1: 7}
-        before: [none]  after: [WaitLROp]
+        before: [none]  after: [WaitLROp, WaitLROp]
     subIterK=1:
       MFMAs (MT n, subIterK 1):
         - [(0, 0), (0, 1), (1, 0), (1, 1)]
@@ -290,7 +290,7 @@ MAINLOOP:
         - USING  A: {1: 4}  B: {1: 6}
         before: [none]  after: [none]
       LR (MT n, subIterK 1) A: {}  B: {}
-        before: [none]  after: [none]
+        before: [none]  after: [WaitLROp]
       GR (MT n+2):  A: [0]  B: [0]
         before: [LR(MT n, sik 1), WaitLROp, SyncOp]  after: [none]
     subIterK=1:
@@ -299,7 +299,7 @@ MAINLOOP:
         - USING  A: {1: 5}  B: {1: 7}
         before: [none]  after: [none]
       LR (MT n+1, subIterK 0) A: {0: 0}  B: {0: 1}
-        before: [WaitGROp, SyncOp, LR_INCOp]  after: [WaitLROp]
+        before: [GR(MT n+1), WaitGROp, SyncOp, LR_INCOp]  after: [WaitLROp]
 
 NGLL (No Global Load Loop):
   Partition 0:
@@ -358,14 +358,14 @@ NGLL (No Global Load Loop):
         - USING  A: {1: 4}  B: {1: 6}
         before: [none]  after: [none]
       LR (MT n, subIterK 1) A: {}  B: {}
-        before: [none]  after: [WaitLROp, SyncOp]
+        before: [none]  after: [WaitLROp, WaitLROp, SyncOp]
     subIterK=1:
       MFMAs (MT n, subIterK 1):
         - [(1, 1)]
         - USING  A: {1: 5}  B: {1: 7}
         before: [none]  after: [none]
       LR (MT n+1, subIterK 0) A: {0: 0}  B: {0: 1}
-        before: [WaitGROp, SyncOp, LR_INCOp]  after: [WaitLROp]
+        before: [GR(MT n+1), WaitGROp, SyncOp, LR_INCOp]  after: [WaitLROp]
 
 NLL (No Load Loop):
   Partition 0:
@@ -420,7 +420,7 @@ NLL (No Load Loop):
         - USING  A: {1: 4}  B: {1: 6}
         before: [none]  after: [none]
       LR (MT n, subIterK 1) A: {}  B: {}
-        before: [none]  after: [WaitLROp]
+        before: [none]  after: [WaitLROp, WaitLROp]
     subIterK=1:
       MFMAs (MT n, subIterK 1):
         - [(1, 1)]
@@ -470,14 +470,70 @@ MAINLOOP EmittedModules:
       id=3 wait_gr: core=1 insts before=[-] after=[-]
       id=4 sync: core=1 insts before=[3] after=[-]
       id=5 lr_inc: core=6 insts before=[4] after=[-]
-      id=6 wait_lr: core=1 insts before=[-] after=[-]
-      id=7 gr_inc: core=10 insts before=[-] after=[-]
+      id=6 wait_lr: core=1 insts before=[1] after=[-]
+      id=7 gr_inc: core=10 insts before=[2] after=[-]
 """
     assert expected in actual
 
 
+def test_PGR2_256_256_1x1_extract_paths_from_before_deps():
+    MT0 = MT1 = 256
+    kernel = create_kernel(MT0, MT1)
+    tiA = TileInfo('A', kernel)
+    tiB = TileInfo('B', kernel)
+    lsgA = tiA.localSubtileGrid[0]
+    lsgB = tiB.localSubtileGrid[0]
+
+    cfg = SchedulerConfig(lsgA, lsgB, PrefetchMode.HALF_PREFETCH,
+                          VGPRTileReUseStrategy.ACROSS_SUBGROUP,
+                          SubgroupOrdering.COLUMN_MAJOR)
+    s = SubtileBasedScheduler(tiA, tiB, cfg)
+    writer = create_writer_with_tiles(kernel, tiA, tiB)
+
+    s.allocVgprTiles(writer)
+    try:
+        dtileInfo = writer.states.d.tileInfo
+        pss = s.mainloopSteps[0]
+        dus0 = pss.subIterKSteps[0]
+        dus1 = pss.subIterKSteps[1]
+
+        emitted0 = s._buildEmittedModules(writer, kernel, dus0.modules, dtileInfo)
+        emitted1 = s._buildEmittedModules(writer, kernel, dus1.modules, dtileInfo)
+    finally:
+        s.deallocVgprTiles(writer)
+
+    sig0 = [(em.moduleId, em.opType, len(em.core), em.before, em.after) for em in emitted0]
+    sig1 = [(em.moduleId, em.opType, len(em.core), em.before, em.after) for em in emitted1]
+
+    assert sig0 == [
+        (0, "mfma", 64, None, []),
+        (1, "lr", 16, None, []),
+        (2, "gr", 16, 4, []),
+        (3, "wait_lr", 1, 1, []),
+        (4, "sync", 1, 3, []),
+    ]
+    assert sig1 == [
+        (0, "mfma", 64, None, []),
+        (1, "lr", 16, 5, [6]),
+        (2, "gr", 16, None, [7]),
+        (3, "wait_gr", 1, None, []),
+        (4, "sync", 1, 3, []),
+        (5, "lr_inc", 6, 4, []),
+        (6, "wait_lr", 1, 1, []),
+        (7, "gr_inc", 10, 2, []),
+    ]
+
+    mfmaIdx0, pathOrders0 = SubtileBasedScheduler._extractPathsFromBeforeDeps(emitted0)
+    mfmaIdx1, pathOrders1 = SubtileBasedScheduler._extractPathsFromBeforeDeps(emitted1)
+
+    assert mfmaIdx0 == 0
+    assert pathOrders0 == [[1, 3, 4, 2]]
+    assert mfmaIdx1 == 0
+    assert pathOrders1 == [[3, 4, 5, 1, 6], [2, 7]]
+
+
 if __name__ == "__main__":
-    MT0=MT1=64
+    MT0=MT1=256
     kernel = create_kernel(MT0,MT1)
     tiA = TileInfo('A', kernel)
     tiB = TileInfo('B', kernel)

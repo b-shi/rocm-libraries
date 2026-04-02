@@ -234,7 +234,7 @@ class EmittedModule:
     """One emitted module with core instructions and module-link deps."""
     moduleId: int = -1
     core: list = field(default_factory=list)
-    before: List[int] = field(default_factory=list)  # moduleIds that must run before this module
+    before: Optional[int] = None                     # moduleId that must run before this module
     after: List[int] = field(default_factory=list)   # moduleIds that must run after this module
     opType: str = ""
 
@@ -1150,7 +1150,7 @@ class SubtileBasedScheduler:
                 print(f"    subIterK={dus.subIterK}:")
                 emitted = self._buildEmittedModules(writer, kernel, dus.modules, dtileInfo)
                 for em in emitted:
-                    beforeStr = ",".join(str(i) for i in em.before) if em.before else "-"
+                    beforeStr = str(em.before) if em.before is not None else "-"
                     afterStr = ",".join(str(i) for i in em.after) if em.after else "-"
                     print(f"      id={em.moduleId} {em.opType}: core={len(em.core)} insts "
                           f"before=[{beforeStr}] after=[{afterStr}]")
@@ -1377,6 +1377,16 @@ class SubtileBasedScheduler:
             emitted.append(EmittedModule(moduleId=emId, core=coreInsts, opType=self._opType(op)))
             return emId
 
+        def setBefore(moduleId: int, beforeId: Optional[int]) -> None:
+            if beforeId is None or beforeId == moduleId:
+                return
+            curBefore = emitted[moduleId].before
+            if curBefore is None:
+                emitted[moduleId].before = beforeId
+                return
+            assert curBefore == beforeId, \
+                f"EmittedModule {moduleId} has multiple before deps: {curBefore} and {beforeId}"
+
         # Primary modules first (MFMA/LR/GR)
         for mod in modules:
             emId = addEmitted(mod.op)
@@ -1417,20 +1427,17 @@ class SubtileBasedScheduler:
                     # chain from it.
                     prevId = depId
                     continue
-                if prevId is not None and prevId not in emitted[depId].before:
-                    emitted[depId].before.append(prevId)
+                setBefore(depId, prevId)
                 prevId = depId
                 lastDepId = depId
             if lastDepId is not None:
-                if lastDepId not in emitted[curId].before:
-                    emitted[curId].before.append(lastDepId)
+                setBefore(curId, lastDepId)
             elif prevId is not None:
                 # before had only module refs and/or standalone deps
-                if prevId not in emitted[curId].before and prevId != curId:
-                    emitted[curId].before.append(prevId)
+                setBefore(curId, prevId)
 
-            # after ops: append deps as standalone modules; core.after references
-            # them, but deps do not link back.
+            # after ops: append deps as standalone modules and chain them via
+            # before links so before-only path extraction can follow them.
             depIds: List[int] = []
             for edge in mod.after:
                 if edge.module:
@@ -1446,9 +1453,12 @@ class SubtileBasedScheduler:
                 if depId is None:
                     continue
                 depIds.append(depId)
+            prevAfterId = curId
             for depId in depIds:
                 if depId not in emitted[curId].after and depId != curId:
                     emitted[curId].after.append(depId)
+                setBefore(depId, prevAfterId)
+                prevAfterId = depId
 
         return emitted
 
@@ -1482,169 +1492,326 @@ class SubtileBasedScheduler:
         return module
 
     @staticmethod
+    def _extractPathsFromBeforeDeps(emittedModules: List['EmittedModule']) -> Tuple[int, List[List[int]]]:
+        """Extract non-MFMA dependency paths using only EmittedModule.before links.
+
+        Returns:
+          (mfmaIdx, paths)
+          - mfmaIdx: index of the MFMA emitted module in emittedModules
+          - paths: list of non-MFMA module-index paths
+        """
+        idToIdx = {em.moduleId: i for i, em in enumerate(emittedModules)}
+        n = len(emittedModules)
+
+        mfmaModuleIds = [i for i, em in enumerate(emittedModules) if em.opType == "mfma"]
+        assert len(mfmaModuleIds) == 1, "_extractPathsFromBeforeDeps expects exactly one MFMA emitted module"
+        mfmaIdx = mfmaModuleIds[0]
+        nonMfmaIds = [i for i in range(n) if i != mfmaIdx]
+        nonMfmaSet = set(nonMfmaIds)
+
+        # Each non-MFMA module has at most one predecessor, and each predecessor
+        # has at most one child, so paths are simple chains.
+        pred: List[int] = [-1 for _ in range(n)]
+        child: List[int] = [-1 for _ in range(n)]
+        for i in nonMfmaIds:
+            parent = -1
+            b = emittedModules[i].before
+            if b is not None:
+                bi = idToIdx.get(b)
+                if bi is not None and bi != i and bi in nonMfmaSet:
+                    parent = bi
+            pred[i] = parent
+            if parent != -1:
+                assert child[parent] == -1, \
+                    f"_extractPathsFromBeforeDeps expects unique child per predecessor, got {child[parent]} and {i} for {parent}"
+                child[parent] = i
+
+        def _findHead(mid: int) -> int:
+            cur = mid
+            seen = [False for _ in range(n)]
+            while pred[cur] != -1 and not seen[cur]:
+                seen[cur] = True
+                cur = pred[cur]
+            return cur
+
+        def _walkFromHead(head: int, used: List[bool]) -> List[int]:
+            order: List[int] = []
+            localSeen = [False for _ in range(n)]
+            cur = head
+            while cur != -1 and not used[cur] and not localSeen[cur]:
+                order.append(cur)
+                localSeen[cur] = True
+                cur = child[cur]
+            return order
+
+        used = [False for _ in range(n)]
+        paths: List[List[int]] = []
+        for mid in nonMfmaIds:
+            if used[mid]:
+                continue
+            head = _findHead(mid)
+            order = _walkFromHead(head, used)
+            assert order, f"_extractPathsFromBeforeDeps produced empty path for module {mid}"
+            for i in order:
+                used[i] = True
+            paths.append(order)
+
+        return mfmaIdx, paths
+
+    @staticmethod
     def instructionSchedule(emittedModules: List['EmittedModule']):
-        """Merge EmittedModules with fine-grained MFMA interleaving.
+        """Interleave non-MFMA instructions between MFMAs using 2 slots/interval.
 
-        Receives EmittedModules with module-link dependencies in before/after.
-
-        The scheduler:
-          1. Topologically orders emitted modules using before/after links
-          2. Extracts all MFMA instructions from emitted mfma groups
-          3. Builds the non-MFMA stream from ordered non-mfma groups
-          3. Interleaves MFMAs into the non-MFMA stream using slot-based rules:
-             - 1 MFMA between each LR (ds_read) instruction
-             - 3 MFMAs between the last LR and the WAIT_LR (SWaitCnt dscnt)
-             - 1 MFMA between WAIT_LR and SYNC (SBarrier)
-             - No MFMAs between an m0 update and its buffer_load (they are a pair)
-             - Remaining MFMAs spread evenly between buffer_load pairs
+        Rules:
+          - MFMA order is preserved.
+          - Between two adjacent MFMAs there are 2 placement slots.
+          - At most one ds_read (LocalReadInstruction/DSLoadB32) per interval.
+          - before/after dependencies are respected at module order level.
+          - Module-internal instruction order is preserved.
+          - LR path is packed from the end backwards.
+          - GR path is spread as much as possible across remaining valid slots.
         """
         if not emittedModules:
             return Module()
 
-        # Topological order by module links (stable by moduleId/index).
-        n = len(emittedModules)
-        indeg = [0] * n
-        succ = [[] for _ in range(n)]
-        for i, em in enumerate(emittedModules):
-            deps = set([d for d in em.before if 0 <= d < n])
-            indeg[i] = len(deps)
-            for d in deps:
-                succ[d].append(i)
-
-        ready = [i for i in range(n) if indeg[i] == 0]
-        ready.sort()
-        orderedIdx = []
-        while ready:
-            i = ready.pop(0)
-            orderedIdx.append(i)
-            for j in succ[i]:
-                indeg[j] -= 1
-                if indeg[j] == 0:
-                    ready.append(j)
-            ready.sort()
-        if len(orderedIdx) != n:
-            orderedIdx = list(range(n))
-
-        # Extract MFMA instructions
         isMFMA = lambda x: isinstance(x, (MFMAInstruction, MXMFMAInstruction))
-        mfmas = []
-        for i in orderedIdx:
-            em = emittedModules[i]
-            if em.opType == "mfma":
-                mfmas.extend([x for x in em.core if isMFMA(x)])
+        isDsRead = lambda x: isinstance(x, (LocalReadInstruction, DSLoadB32))
 
-        # Build non-MFMA instruction stream in dependency order
-        others = []
-        for i in orderedIdx:
-            em = emittedModules[i]
-            if em.opType != "mfma":
-                others.extend(em.core)
+        # Resolve moduleId -> index in emittedModules.
+        idToIdx = {em.moduleId: i for i, em in enumerate(emittedModules)}
+        n = len(emittedModules)
 
-        if not mfmas:
-            # No MFMAs to interleave, just return the ordered stream
-            result = Module()
-            for inst in others:
-                result.add(inst)
-            return result
+        def _resolve(mid: int) -> Optional[int]:
+            return idToIdx.get(mid, None)
 
-        if not others:
-            result = Module()
-            for inst in mfmas:
-                result.add(inst)
-            return result
+        # Build dependency graph from before/after.
+        preds: List[Set[int]] = [set() for _ in range(n)]
+        succs: List[Set[int]] = [set() for _ in range(n)]
+        for i, em in enumerate(emittedModules):
+            if em.before is not None:
+                bi = _resolve(em.before)
+                if bi is not None and bi != i:
+                    preds[i].add(bi)
+                    succs[bi].add(i)
+            for a in em.after:
+                ai = _resolve(a)
+                if ai is None or ai == i:
+                    continue
+                preds[ai].add(i)
+                succs[i].add(ai)
 
-        # Group non-MFMA instructions into slots (m0 + buffer_load pairs stay together)
-        slots = []
-        i = 0
-        while i < len(others):
-            inst = others[i]
-            if i + 1 < len(others) and isinstance(others[i + 1], GlobalReadInstruction):
-                slots.append(others[i:i+2])
-                i += 2
+        # Extract non-MFMA dependency paths from before-links only.
+        mfmaIdx, pathOrders = SubtileBasedScheduler._extractPathsFromBeforeDeps(emittedModules)
+        print("mfmaIdx, pathOrders:", mfmaIdx, pathOrders)
+        # Collect MFMA instructions from the single MFMA module.
+        mfmas = [x for x in emittedModules[mfmaIdx].core if isMFMA(x)]
+        assert len(mfmas) >= 2, "instructionSchedule expects at least two MFMA instructions"
+
+        paths = []
+        for order in pathOrders:
+            hasWaitGR = any(emittedModules[i].opType == "wait_gr" for i in order)
+            hasGR = any(emittedModules[i].opType == "gr" for i in order)
+            paths.append({
+                "order": order,
+                "hasWaitGR": hasWaitGR,
+                "hasGR": hasGR,
+            })
+
+        intervals = len(mfmas) - 1
+
+        def streamFromModule(mid: int) -> List[Tuple[int, list]]:
+            return [(mid, [inst]) for inst in emittedModules[mid].core]
+
+        def streamFromGRModule(mid: int) -> List[Tuple[int, list]]:
+            # For GR spacing, treat m0+buffer_load as one packet so spacing is
+            # measured between buffer_loads, not between m0 updates.
+            core = emittedModules[mid].core
+            out = []
+            i = 0
+            while i < len(core):
+                if i + 1 < len(core) and isinstance(core[i + 1], GlobalReadInstruction):
+                    out.append((mid, [core[i], core[i + 1]]))
+                    i += 2
+                else:
+                    out.append((mid, [core[i]]))
+                    i += 1
+            return out
+
+        def moduleStream(mid: int) -> List[Tuple[int, list]]:
+            return streamFromGRModule(mid) if emittedModules[mid].opType == "gr" else streamFromModule(mid)
+
+        def pathPriority(p):
+            if p["hasGR"]:
+                return 0
+            if p["hasWaitGR"]:
+                return 1
+            return 2
+
+        # Always schedule GR paths first, then WaitGR paths, then others.
+        paths.sort(key=lambda p: (pathPriority(p), p["order"][0] if p["order"] else 10**9))
+
+        totalSlots = intervals * 2
+        placed: List[Optional[Tuple[int, list]]] = [None] * totalSlots
+        firstPos: List[Optional[int]] = [None] * n
+        lastPos: List[Optional[int]] = [None] * n
+        leftovers: List[Tuple[int, list]] = []
+
+        def packetHasDsRead(packet: list) -> bool:
+            return any(isDsRead(inst) for inst in packet)
+
+        def canPlace(pos: int, packet: list) -> bool:
+            if pos < 0 or pos >= totalSlots or placed[pos] is not None:
+                return False
+            if packetHasDsRead(packet):
+                peer = pos + 1 if pos % 2 == 0 else pos - 1
+                if 0 <= peer < totalSlots and placed[peer] is not None and packetHasDsRead(placed[peer][1]):
+                    return False
+            return True
+
+        def recordPlacement(pos: int, item: Tuple[int, list]):
+            mid, _ = item
+            placed[pos] = item
+            if firstPos[mid] is None or pos < firstPos[mid]:
+                firstPos[mid] = pos
+            if lastPos[mid] is None or pos > lastPos[mid]:
+                lastPos[mid] = pos
+
+        def bounds(mid: int) -> Tuple[int, int]:
+            lo = 0
+            for p in preds[mid]:
+                if 0 <= p < n and lastPos[p] is not None:
+                    lo = max(lo, lastPos[p] + 1)
+            hi = totalSlots - 1
+            for s in succs[mid]:
+                if 0 <= s < n and firstPos[s] is not None:
+                    hi = min(hi, firstPos[s] - 1)
+            return lo, hi
+
+        def placeEarliestPacket(mid: int, packet: list, low: int, preferred: Optional[int]=None) -> Optional[int]:
+            lo, hi = bounds(mid)
+            lo = max(lo, low)
+            if hi < lo:
+                return None
+
+            scanRanges = []
+            if preferred is not None:
+                start = max(lo, preferred)
+                if start <= hi:
+                    scanRanges.append((start, hi))
+                if lo <= start - 1:
+                    scanRanges.append((lo, start - 1))
             else:
-                slots.append([inst])
-                i += 1
+                scanRanges.append((lo, hi))
 
-        # Classify each slot
-        LR_SLOT = 0
-        WAITLR_SLOT = 1
-        SYNC_SLOT = 2
-        GR_SLOT = 3
-        OTHER_SLOT = 4
+            for a, b in scanRanges:
+                for p in range(a, b + 1):
+                    if canPlace(p, packet):
+                        return p
+            return None
 
-        def classify(slot):
-            first = slot[0]
-            if isinstance(first, DSLoadB32):
-                return LR_SLOT
-            if isinstance(first, LocalReadInstruction):
-                return LR_SLOT
-            if isinstance(first, SWaitCnt):
-                return WAITLR_SLOT
-            if isinstance(first, SBarrier):
-                return SYNC_SLOT
-            if isinstance(first, GlobalReadInstruction) or \
-               (len(slot) > 1 and isinstance(slot[-1], GlobalReadInstruction)):
-                return GR_SLOT
-            return OTHER_SLOT
+        def placeLatestPacket(mid: int, packet: list, upper: int) -> Optional[int]:
+            lo, hi = bounds(mid)
+            hi = min(hi, upper)
+            if hi < lo:
+                return None
+            for p in range(hi, lo - 1, -1):
+                if canPlace(p, packet):
+                    return p
+            return None
 
-        slotTypes = [classify(s) for s in slots]
+        for path in paths:
+            order = path["order"]
+            if not order:
+                continue
 
-        # Build MFMA budget per slot
-        numSlots = len(slots)
-        mfmasAfter = [0] * numSlots
-        mi = 0
+            # WaitGR path: populate from the end and go upwards.
+            if path["hasWaitGR"]:
+                stream: List[Tuple[int, list]] = []
+                for mid in order:
+                    stream.extend(moduleStream(mid))
+                upper = totalSlots - 1
+                revStream = list(reversed(stream))
+                failedIdx = None
+                for ri, item in enumerate(revStream):
+                    mid, packet = item
+                    pos = placeLatestPacket(mid, packet, upper)
+                    if pos is None:
+                        failedIdx = ri
+                        break
+                    recordPlacement(pos, item)
+                    upper = pos - 1
+                if failedIdx is not None:
+                    leftovers.extend(reversed(revStream[failedIdx:]))
+                continue
 
-        # Pass 1: assign fixed MFMAs per rules
-        for si in range(numSlots):
-            if mi >= len(mfmas):
-                break
-            st = slotTypes[si]
-            nextSt = slotTypes[si + 1] if si + 1 < numSlots else None
+            # Forward path (GR-first): place modules in path order.
+            low = 0
+            pathFailed = False
+            for oi, mid in enumerate(order):
+                stream = moduleStream(mid)
 
-            if st == LR_SLOT and nextSt == LR_SLOT:
-                mfmasAfter[si] = min(1, len(mfmas) - mi)
-                mi += mfmasAfter[si]
-            elif st == LR_SLOT and nextSt == WAITLR_SLOT:
-                mfmasAfter[si] = min(3, len(mfmas) - mi)
-                mi += mfmasAfter[si]
-            elif st == LR_SLOT and nextSt != LR_SLOT and nextSt != WAITLR_SLOT:
-                mfmasAfter[si] = min(1, len(mfmas) - mi)
-                mi += mfmasAfter[si]
-            elif st == WAITLR_SLOT and nextSt == SYNC_SLOT:
-                mfmasAfter[si] = min(1, len(mfmas) - mi)
-                mi += mfmasAfter[si]
+                if emittedModules[mid].opType == "gr":
+                    # GR: populate from beginning and spread with remaining range.
+                    remaining = len(stream)
+                    preferred = low
+                    for si, item in enumerate(stream):
+                        mid2, packet = item
+                        pos = placeEarliestPacket(mid2, packet, low, preferred=preferred)
+                        if pos is None:
+                            leftovers.extend(stream[si:])
+                            for mid3 in order[oi + 1:]:
+                                leftovers.extend(moduleStream(mid3))
+                            pathFailed = True
+                            break
+                        recordPlacement(pos, item)
+                        low = pos + 1
+                        remaining -= 1
+                        if remaining > 0:
+                            lo, hi = bounds(mid2)
+                            lo = max(lo, low)
+                            if hi >= lo:
+                                currentMfmaIdx = pos // 2
+                                lastMfmaIdx = hi // 2
+                                distance = max((lastMfmaIdx - currentMfmaIdx) / remaining, 0.0)
+                                preferredMfmaIdx = currentMfmaIdx + int(round(distance))
+                                preferred = max(low, preferredMfmaIdx * 2)
+                            else:
+                                preferred = low
+                    if pathFailed:
+                        break
+                else:
+                    for si, item in enumerate(stream):
+                        mid2, packet = item
+                        pos = placeEarliestPacket(mid2, packet, low)
+                        if pos is None:
+                            leftovers.extend(stream[si:])
+                            for mid3 in order[oi + 1:]:
+                                leftovers.extend(moduleStream(mid3))
+                            pathFailed = True
+                            break
+                        recordPlacement(pos, item)
+                        low = pos + 1
+                    if pathFailed:
+                        break
 
-        # Pass 2: spread remaining MFMAs evenly between GR slots
-        grIndices = [si for si in range(numSlots) if slotTypes[si] == GR_SLOT]
-        remaining = len(mfmas) - mi
-        if remaining > 0 and grIndices:
-            base = remaining // len(grIndices)
-            extra = remaining % len(grIndices)
-            for gi, si in enumerate(grIndices):
-                count = base + (1 if gi < extra else 0)
-                mfmasAfter[si] += count
-                mi += count
-
-        # Assemble final output
+        # Assemble: MFMA, then 2 slots, then next MFMA.
         result = Module()
-        mfmaIdx = 0
+        result.add(mfmas[0])
+        for i in range(intervals):
+            p0 = 2 * i
+            p1 = p0 + 1
+            if placed[p0] is not None:
+                for inst in placed[p0][1]:
+                    result.add(inst)
+            if placed[p1] is not None:
+                for inst in placed[p1][1]:
+                    result.add(inst)
+            result.add(mfmas[i + 1])
 
-        leadingMfmas = len(mfmas) - mi
-        for _ in range(leadingMfmas):
-            result.add(mfmas[mfmaIdx])
-            mfmaIdx += 1
-
-        for si in range(numSlots):
-            for inst in slots[si]:
+        # Fallback: anything unscheduled (capacity/constraint spill) goes last.
+        for _, packet in leftovers:
+            for inst in packet:
                 result.add(inst)
-            for _ in range(mfmasAfter[si]):
-                if mfmaIdx < len(mfmas):
-                    result.add(mfmas[mfmaIdx])
-                    mfmaIdx += 1
-
-        while mfmaIdx < len(mfmas):
-            result.add(mfmas[mfmaIdx])
-            mfmaIdx += 1
 
         return result
 
@@ -1664,6 +1831,7 @@ class SubtileBasedScheduler:
             scaleLRSet = 1 - scaleSet if self.hasScale else scaleSet
         module = Module(label)
         module.addComment0(f"{label} start")
+        print("Emmitting loop :", label)
         for pss in steps:
             for dus in pss.subIterKSteps:
                 subModule = self._emitSubIterK(writer, kernel, pss, dus,
