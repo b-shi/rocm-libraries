@@ -642,12 +642,16 @@ class Solution(collections.abc.Mapping):
       state["Use64bShadowLimit"] = False
       state["Use64bShadowLimitMX"] = False
 
-      #
       bytesLoaded = state["NumThreads"] * 16
-      numBytesMXSA = (state["DepthU"] // state["ProblemType"]["MXBlockA"]) * state["MacroTile0"]
-      numBytesMXSB = (state["DepthU"] // state["ProblemType"]["MXBlockB"]) * state["MacroTile1"]
-      if bytesLoaded < numBytesMXSA or bytesLoaded < numBytesMXSB:
-        reject(state, printRejectionReason, "Unable to load mx scales using one load per wave")
+      if state["ProblemType"]["MXBlockA"]:
+        numBytesMXSA = (state["DepthU"] // state["ProblemType"]["MXBlockA"]) * state["MacroTile0"]
+        if bytesLoaded < numBytesMXSA:
+          reject(state, printRejectionReason, "Unable to load MXSA scales using one load per wave")
+      if state["ProblemType"]["MXBlockB"]:
+        numBytesMXSB = (state["DepthU"] // state["ProblemType"]["MXBlockB"]) * state["MacroTile1"]
+        if bytesLoaded < numBytesMXSB:
+          reject(state, printRejectionReason, "Unable to load MXSB scales using one load per wave")
+
 
     # done
     state["AssignedProblemIndependentDerivedParameters"] = True
