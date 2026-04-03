@@ -120,7 +120,6 @@ Partition grid: 1 x 1
 Partition size: 2 x 2
 Prefetch: HALF_PREFETCH
 Reuse: ACROSS_PARTITIONS
-needsUnrolling: False
 totalVGPRTiles: 8 (32 VGPRs)
 totalScaleVGPRTiles: 0
 hasScale: False
@@ -249,7 +248,6 @@ Partition grid: 2 x 2
 Partition size: 1 x 1
 Prefetch: HALF_PREFETCH
 Reuse: ACROSS_PARTITIONS
-needsUnrolling: False
 totalVGPRTiles: 8 (32 VGPRs)
 totalScaleVGPRTiles: 0
 hasScale: False

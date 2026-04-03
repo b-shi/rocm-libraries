@@ -249,7 +249,6 @@ class SubIterKSchedule:
     """Ops for one subIterK iteration within a partition."""
     subIterK: int
     modules: List[AnnotatedModule] = field(default_factory=list)
-    conflict: Set[int] = field(default_factory=set)
 
 
 @dataclass
@@ -522,7 +521,6 @@ class SubtileBasedScheduler:
 
         self.partitions: List[Partition] = self._buildPartitions()
         self.allocator = VGPRTileAllocator()
-        self.needsUnrolling: bool = False
 
         # Scale VGPR tile IDs are deterministic: gid for A, numScaleGroupsA + gid for B.
         self.numScaleGroupsA = math.ceil(self.MTA / 2) if self.hasScale else 0
@@ -738,17 +736,20 @@ class SubtileBasedScheduler:
                 gid, vid = self.scaleVid('B', tB)
                 lrScaleB.setdefault(gid, vid)
 
-        # Conflict detection
+        # Conflict detection: MFMA reads and LR writes must not share VGPR tiles
         mfmaIds = set(vgprTileMapA.values()) | set(vgprTileMapB.values())
         loadIds = set(lrLoadA.values()) | set(lrLoadB.values())
-        conflict = mfmaIds & loadIds
-        if conflict:
-            self.needsUnrolling = True
+        overlap = mfmaIds & loadIds
+        if overlap:
+            # Fail for now. We could support this by duplicating the loop and use different VGPR tiles.
+            raise RuntimeError(
+                f"VGPR tile conflict in partition {partition.partitionId} subIterK={sik}: "
+                f"MFMA and LR share tile IDs {overlap}")
 
         # Build modules
         mfmas = [(a, b) for a in sorted(vgprTileMapA) for b in sorted(vgprTileMapB)]
         mtLoad = "n+1" if isWrapAround else "n"
-        siks = SubIterKSchedule(subIterK=sik, conflict=conflict)
+        siks = SubIterKSchedule(subIterK=sik)
         siks.modules.append(AnnotatedModule(op=MFMAOp(
             mtIteration="n", subIterK=sik, subtiles=mfmas,
             vgprTileMapA=vgprTileMapA, vgprTileMapB=vgprTileMapB,
@@ -804,6 +805,11 @@ class SubtileBasedScheduler:
                 mtIteration=gr.mtIteration,
                 subtileA=gr1_A, subtileB=gr1_B, lastForMT=isLast)))
 
+    # Generate the schedule
+    # 1- build subIterK steps
+    # 2- insert GR ops 
+    # 3- annotate dependencies (WAIT and INC Ops)
+    # 4- build NGLL & NLL using mainloop schedule
     def _runSchedule(self):
         if self.config.prefetchMode == PrefetchMode.NO:
             raise NotImplementedError("PrefetchMode.NO is not yet supported")
@@ -828,7 +834,7 @@ class SubtileBasedScheduler:
             if self.config.reuseStrategy == VGPRTileReUseStrategy.ACROSS_PARTITIONS:
                 self._releaseUnusedAfterPartition(pi)
 
-        self._computeDependencies(numPartitions)
+        self._annotateDependencies(numPartitions)
         self.ngllSteps = self._buildNGLL()
         self.nllSteps = self._buildNLL()
 
@@ -919,7 +925,7 @@ class SubtileBasedScheduler:
                     opIdx += 1
         return grEvents
 
-    def _computeDependencies(self, numPartitions: int):
+    def _annotateDependencies(self, numPartitions: int):
         """Pass 2: Compute dependency edges for each module.
 
         Annotates each AnnotatedModule with before/after dependency edges.
@@ -1085,7 +1091,7 @@ class SubtileBasedScheduler:
         for pss in self.mainloopSteps:
             newPss = PartitionSchedule(partitionId=pss.partitionId)
             for dus in pss.subIterKSteps:
-                newDus = SubIterKSchedule(subIterK=dus.subIterK, conflict=dus.conflict)
+                newDus = SubIterKSchedule(subIterK=dus.subIterK)
                 orphaned_deps = []
                 for mod in dus.modules:
                     if isinstance(mod.op, GROp) and mod.op.mtIteration == "n+2":
@@ -1121,7 +1127,7 @@ class SubtileBasedScheduler:
         for pss in self.mainloopSteps:
             newPss = PartitionSchedule(partitionId=pss.partitionId)
             for dus in pss.subIterKSteps:
-                newDus = SubIterKSchedule(subIterK=dus.subIterK, conflict=dus.conflict)
+                newDus = SubIterKSchedule(subIterK=dus.subIterK)
                 # Track which modules are being removed (for filtering module refs)
                 removedMods = set()
                 orphaned_waitlr = []
@@ -1248,8 +1254,6 @@ class SubtileBasedScheduler:
                 self._printModules(dus.modules, indent=f"{indent}    ",
                                    showVgpr=showVgpr, showDeps=showDeps,
                                    showSubtiles=showSubtiles)
-                if dus.conflict:
-                    print(f"{indent}    *** CONFLICT: USE/LOAD share VGPRTile IDs {dus.conflict} — needs unrolling ***")
 
     def printSchedule(self, showVgpr: bool = False, showDeps: bool = False,
                       showSubtiles: bool = False):
@@ -1265,7 +1269,6 @@ class SubtileBasedScheduler:
         print(f"Partition size: {self.config.partitionSizeA} x {self.config.partitionSizeB}")
         print(f"Prefetch: {self.config.prefetchMode.name}")
         print(f"Reuse: {self.config.reuseStrategy.name}")
-        print(f"needsUnrolling: {self.needsUnrolling}")
         print(f"totalVGPRTiles: {self.totalVGPRTiles} ({self.totalVGPRTiles * 4} VGPRs)")
         print(f"totalScaleVGPRTiles: {self.totalScaleVGPRTiles}")
         print(f"hasScale: {self.hasScale}")
