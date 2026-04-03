@@ -656,6 +656,9 @@ class Solution(collections.abc.Mapping):
       # Force BufferStore=1: UseSubtileImpl optimized storeD path is only implemented
       # for buffer stores for now.
       state["BufferStore"] = 1
+      # Not currently implemented in subtile implementation
+      state["Use64bShadowLimit"] = False
+      state["Use64bShadowLimitMX"] = False
 
       #
       bytesLoaded = state["NumThreads"] * 16

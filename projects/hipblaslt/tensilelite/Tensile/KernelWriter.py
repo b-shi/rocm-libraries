@@ -5090,7 +5090,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
       self.ldsTotalSize = sizeA + sizeB + sizeMXSA + sizeMXSB
 
       kernel["LdsNumBytes"] = max(1, int(self.ldsTotalSize * kernel["NumLdsBlk"]))
-      if kernel["LdsNumBytes"] > 160 * 1024:
+      if kernel["LdsNumBytes"] > self.states.archCaps["DeviceLDS"]:
         self.states.overflowedResources = 8
 
 
@@ -5483,7 +5483,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
 
     # use 64-bit buffer limit shadow register
     # but not implemented or tested
-    self.states.use64bShadowLimit = kernel["Use64bShadowLimit"] and kernel["BufferLoad"] and not kernel["UseSubtileImpl"]
+    self.states.use64bShadowLimit = kernel["Use64bShadowLimit"] and kernel["BufferLoad"]
     self.states.use64bShadowLimitMX = kernel["Use64bShadowLimitMX"] and kernel["BufferLoad"]
 
     # Check if the address setup code for LWA and GRO causes register growth.
