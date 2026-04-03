@@ -1110,30 +1110,21 @@ class SubtileBasedScheduler:
         return [e for e in edges if not isinstance(e.op, remove_types)]
 
     def _buildNGLL(self) -> List[PartitionSchedule]:
-        """NGLL (Non Global Load Loop): mainloop without GR(n+2) and GR_INC.
-
-        When removing a GR(n+2) module, its SyncOp before-dep is preserved
-        by moving it to the last remaining module's after list. Module refs
-        and GR_INC are discarded.
-        """
+        """NGLL (No Global Load Loop): mainloop without GR(n+2) and GR_INC."""
         ngll = []
         for pss in self.mainloopSteps:
             newPss = PartitionSchedule(partitionId=pss.partitionId)
             for dus in pss.subIterKSteps:
                 newDus = SubIterKSchedule(subIterK=dus.subIterK)
-                orphaned_deps = []
                 for mod in dus.modules:
                     if isinstance(mod.op, GROp) and mod.op.mtIteration == "n+2":
-                        for e in mod.before:
-                            if e.op and isinstance(e.op, (WaitLROp, SyncOp)):
-                                orphaned_deps.append(e)
                         continue
-                    # Clone module: filter out module refs to removed GR(n+2), zero inflight on WaitGR
                     newBefore = []
                     for e in mod.before:
                         if e.module and isinstance(e.module.op, GROp) and e.module.op.mtIteration == "n+2":
                             continue
                         if e.op and isinstance(e.op, WaitGROp):
+                            # TODO. Check counts here. 
                             newBefore.append(DepEdge(op=WaitGROp(
                                 mtIteration=e.op.mtIteration,
                                 subtileA=e.op.subtileA, subtileB=e.op.subtileB,
@@ -1143,8 +1134,6 @@ class SubtileBasedScheduler:
                     newAfter = self._filterDepEdges(mod.after, (GR_INCOp,))
                     newDus.modules.append(AnnotatedModule(
                         op=mod.op, before=newBefore, after=newAfter))
-                if orphaned_deps and newDus.modules:
-                    newDus.modules[-1].after.extend(orphaned_deps)
                 newPss.subIterKSteps.append(newDus)
             ngll.append(newPss)
         return ngll
@@ -1159,14 +1148,9 @@ class SubtileBasedScheduler:
                 newDus = SubIterKSchedule(subIterK=dus.subIterK)
                 # Track which modules are being removed (for filtering module refs)
                 removedMods = set()
-                orphaned_waitlr = []
                 for mod in dus.modules:
                     if isinstance(mod.op, GROp):
                         removedMods.add(id(mod))
-                        # Collect WaitLROp from removed GR's before deps
-                        for e in mod.before:
-                            if e.op and isinstance(e.op, WaitLROp):
-                                orphaned_waitlr.append(e)
                     elif isinstance(mod.op, LROp) and mod.op.mtIteration == "n+1":
                         removedMods.add(id(mod))
 
@@ -1199,12 +1183,9 @@ class SubtileBasedScheduler:
                     newAfter = self._filterDepEdges(mod.after, (GR_INCOp,))
                     newDus.modules.append(AnnotatedModule(
                         op=mod.op, before=newBefore, after=newAfter))
-                # Attach orphaned WaitLROp to last LR module's after list
+                # Remove WaitLROp from after when no LR exists in this subIterK
+                # (the WaitLROp was for the removed LR(n+1))
                 hasLR = any(isinstance(m.op, LROp) for m in newDus.modules)
-                if orphaned_waitlr and hasLR:
-                    lrMods = [m for m in newDus.modules if isinstance(m.op, LROp)]
-                    lrMods[-1].after.extend(orphaned_waitlr)
-                # Remove orphaned WAIT_LR only when no LROp exists in this subIterK
                 if not hasLR:
                     for m in newDus.modules:
                         m.after = self._filterDepEdges(m.after, (WaitLROp,))

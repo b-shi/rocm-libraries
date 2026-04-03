@@ -397,7 +397,7 @@ def _create_1x1_scheduler():
 
 
 def test_PGR2_64_64_1x1_ngll():
-    """NGLL removes GR(n+2) and GR_INC; orphaned SyncOp moves to last module's after."""
+    """NGLL removes GR(n+2) and GR_INC; orphaned deps from GR(n+2) are dropped."""
     s = _create_1x1_scheduler()
     mainloop_sig = _step_sig(s.mainloopSteps)
     ngll_sig = _step_sig(s.ngllSteps)
@@ -413,12 +413,10 @@ def test_PGR2_64_64_1x1_ngll():
         for name, before, after in mods:
             assert "GR_INCOp" not in after, \
                 f"NGLL partition {pid} sik {sik} {name} should not have GR_INCOp in after"
-
-    # subIterK=0: LR should pick up orphaned WaitLROp + SyncOp from removed GR(n+2)
-    _, _, mods_sik0 = ngll_sig[0]
-    lr_mod = next((name, before, after) for name, before, after in mods_sik0 if name.startswith("LR"))
-    assert "WaitLROp" in lr_mod[2] and "SyncOp" in lr_mod[2], \
-        f"NGLL sik=0 LR should have orphaned WaitLROp+SyncOp in after, got {lr_mod[2]}"
+        # No SyncOp orphaned from removed GR(n+2)
+        for name, before, after in mods:
+            assert "SyncOp" not in after, \
+                f"NGLL partition {pid} sik {sik} {name} should not have orphaned SyncOp in after"
 
 
 def test_PGR2_64_64_1x1_nll():
@@ -678,9 +676,9 @@ if __name__ == "__main__":
 
     print("=== DEFAULT ===")
     s.printSchedule()
-    # print("\n=== VGPR + DEPS ===")
-    # s.printSchedule(showVgpr=True, showDeps=True, showSubtiles=True)
-    # s.printSchedule()
+    print("\n=== VGPR + DEPS ===")
+    s.printSchedule(showVgpr=False, showDeps=True, showSubtiles=False)
+    s.printSchedule()
 
     s.allocVgprTiles(writer)
 
