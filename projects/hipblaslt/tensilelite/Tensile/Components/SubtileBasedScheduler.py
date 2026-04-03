@@ -1,3 +1,35 @@
+"""Subtile-based mainloop scheduler.
+
+The scheduler builds an instruction schedule for the preloop, mainloop, NGLL & NLL. The GEMM is split
+into Partitions, again split into subIterK steps.
+
+Naming conventions:
+  - Partition:  A rectangle of subtiles (partitionSizeA x partitionSizeB)
+                processed together in one mainloop step. 
+  - subIterK:   K-dimension sub-iteration within a partition. Each subtile's
+                data is split along K into numSubIterK chunks (hardcoded to 2).
+  - MT iteration (macrotile iteration): Which macrotile's data is being
+                referenced. "n" = current iteration, "n+1" = next iteration, "n+2" = two ahead.
+
+Scheduling pipeline:
+  1. _buildPreloop     — Emit initial GR + LR to init the pipeline (preloop).
+  2. _buildSubIterK    — For each partition and subIterK, build MFMA and LR
+                         modules with VGPR tile assignments.
+  3. _insertGROps      — Split GR loads across subIterK=0/1 within each partition.
+  4. _annotateDependencies — Wire up before/after dependency edges between modules
+                         (WAIT_GR, SYNC, LR_INC, GR_INC, WAIT_LR).
+  5. _buildNGLL        — Derive the No-Global-Load-Loop from mainloop
+                         (remove GR(n+2) and GR_INC).
+  6. _buildNLL         — Derive the No-Load-Loop from mainloop
+                         (remove all GR, LR(n+1), and associated sync ops).
+
+Emission pipeline (called by the kernel writer):
+  7. _buildEmittedModules — Convert AnnotatedModules into EmittedModules with
+                            actual GPU instructions and before-link chains.
+  8. instructionSchedule  — Interleave non-MFMA instructions between MFMAs
+                            using a slot-based placer with pluggable rules.
+"""
+
 from enum import Enum, auto
 from dataclasses import dataclass, field
 import math
@@ -925,154 +957,151 @@ class SubtileBasedScheduler:
                     opIdx += 1
         return grEvents
 
+    @staticmethod
+    def _parseMTOffset(mt: str) -> Optional[int]:
+        if mt == "n":
+            return 0
+        if mt.startswith("n+"):
+            return int(mt[2:])
+        return None
+
+    def _countInflightSubtileLoads(self, grEvents, waitOpIndex, waitMT, waitSubtileA, waitSubtileB):
+        """Count GR subtile loads still in flight at the point where WAIT_GR will be inserted."""
+        waitOffset = self._parseMTOffset(waitMT)
+        if waitOffset is None:
+            return 0, 0
+
+        targetA, targetB = set(waitSubtileA), set(waitSubtileB)
+        before = [(mt, a, b) for (idx, mt, a, b) in grEvents if idx < waitOpIndex]
+        after  = [(mt, a, b) for (idx, mt, a, b) in grEvents if idx >= waitOpIndex]
+        totalA, totalB = 0, 0
+
+        for (grMT, grA, grB) in reversed(before):
+            grOffset = self._parseMTOffset(grMT)
+            if grOffset is None:
+                continue
+            if grOffset == waitOffset and grA == targetA and grB == targetB:
+                return totalA, totalB
+            totalA += len(grA)
+            totalB += len(grB)
+
+        for (grMT, grA, grB) in reversed(after):
+            grOffset = self._parseMTOffset(grMT)
+            if grOffset is None:
+                continue
+            if grOffset - 1 == waitOffset and grA == targetA and grB == targetB:
+                return totalA, totalB
+            totalA += len(grA)
+            totalB += len(grB)
+
+        return totalA, totalB
+
+    def _buildWaitGROp(self, lrOp, pendingA, pendingB, opIdx, numModules, grEvents):
+        """Determine if a WAIT_GR is needed before this LR. Returns (waitGROp, waitA, waitB)."""
+        if not lrOp or lrOp.subIterK != 0:
+            return None, set(), set()
+
+        waitA = set(lrOp.lrLoadA.keys()) & pendingA
+        waitB = set(lrOp.lrLoadB.keys()) & pendingB
+        if not waitA and not waitB:
+            return None, set(), set()
+
+        #TODO. fix _countInflightSubtileLoads . Scale load not taken into account and likely not working well in 1x4,4x1 or multi-parition configs
+        inflightA, inflightB = self._countInflightSubtileLoads(
+            grEvents, opIdx + numModules, lrOp.mtIteration, sorted(waitA), sorted(waitB))
+        waitGROp = WaitGROp(
+            mtIteration=lrOp.mtIteration,
+            subtileA=sorted(waitA), subtileB=sorted(waitB),
+            inflightLoadsA=inflightA, inflightLoadsB=inflightB)
+        pendingA -= waitA
+        pendingB -= waitB
+        return waitGROp, waitA, waitB
+
+    @staticmethod
+    def _findMatchingGR(lrOp, priorGRMods, grMods, waitA, waitB):
+        """Find the GR module that the LR should depend on (matching MT iteration)."""
+        targetMT = lrOp.mtIteration
+        for g in reversed(priorGRMods + grMods):
+            if g.op.mtIteration != targetMT:
+                continue
+            gA, gB = set(g.op.subtileA), set(g.op.subtileB)
+            if (not waitA or waitA.issubset(gA)) and (not waitB or waitB.issubset(gB)):
+                return g
+        # Fallback: any GR with matching MT
+        return next((g for g in reversed(priorGRMods + grMods)
+                     if g.op.mtIteration == targetMT), None)
+
+    @staticmethod
+    def _annotateGRInc(grMods):
+        """Append GR_INC to the last GR module for this MT iteration."""
+        for grMod in grMods:
+            if grMod.op.lastForMT:
+                grMod.after.append(DepEdge(op=GR_INCOp()))
+
+    @staticmethod
+    def _annotateLRInc(lrMod, lrOp, lastLRmt):
+        """Prepend LR_INC if the LR's MT iteration changed."""
+        if lastLRmt is not None and lrOp.mtIteration != lastLRmt:
+            lrMod.before.append(DepEdge(op=LR_INCOp()))
+
+    def _annotateLRDependsOnGR(self, lrMod, lrOp, grMods, priorGRMods, waitGROp, waitA, waitB):
+        """LR depends on GR — GR must complete before LR can read from LDS."""
+        grMatch = self._findMatchingGR(lrOp, priorGRMods, grMods, waitA, waitB)
+        if grMatch is not None:
+            lrMod.before.append(DepEdge(module=grMatch))
+        lrMod.before.append(DepEdge(op=waitGROp))
+        lrMod.before.append(DepEdge(op=SyncOp(comment="Barrier: wait for GR data")))
+
+    @staticmethod
+    def _annotateGRDependsOnLR(lrMod, grMods):
+        """GR(n+2) depends on LR — LR must complete before GR writes to LDS. Limited due to LDS double-buffering."""
+        for grMod in grMods:
+            grMod.before.append(DepEdge(module=lrMod))
+            grMod.before.append(DepEdge(op=WaitLROp()))
+            grMod.before.append(DepEdge(op=SyncOp(comment="Barrier: all waves done with LR before GR(n+2) writes")))
+
     def _annotateDependencies(self, numPartitions: int):
-        """Pass 2: Compute dependency edges for each module.
-
-        Annotates each AnnotatedModule with before/after dependency edges.
-        """
+        """Annotate each AnnotatedModule with before/after dependency edges."""
         grEvents = self._buildGREvents()
-
-        def _parseMTOffset(mt: str) -> Optional[int]:
-            if mt == "n":
-                return 0
-            if mt.startswith("n+"):
-                return int(mt[2:])
-            return None
-
-        def _countInflightSubtileLoads(waitOpIndex, waitMT, waitSubtileA, waitSubtileB):
-            waitOffset = _parseMTOffset(waitMT)
-            if waitOffset is None:
-                return 0, 0
-
-            targetA = set(waitSubtileA)
-            targetB = set(waitSubtileB)
-
-            before = [(mt, a, b) for (idx, mt, a, b) in grEvents if idx < waitOpIndex]
-            after  = [(mt, a, b) for (idx, mt, a, b) in grEvents if idx >= waitOpIndex]
-
-            totalA = 0
-            totalB = 0
-
-            for (grMT, grA, grB) in reversed(before):
-                grOffset = _parseMTOffset(grMT)
-                if grOffset is None:
-                    continue
-                if grOffset == waitOffset and grA == targetA and grB == targetB:
-                    return totalA, totalB
-                totalA += len(grA)
-                totalB += len(grB)
-
-            for (grMT, grA, grB) in reversed(after):
-                grOffset = _parseMTOffset(grMT)
-                if grOffset is None:
-                    continue
-                shiftedOffset = grOffset - 1
-                if shiftedOffset == waitOffset and grA == targetA and grB == targetB:
-                    return totalA, totalB
-                totalA += len(grA)
-                totalB += len(grB)
-
-            return totalA, totalB
-
         pendingA = set()
         pendingB = set()
         lastLRmt = None
         opIdx = 0
-        seenGRMods: List[AnnotatedModule] = []
+        priorGRMods: List[AnnotatedModule] = []
 
         for pss in self.mainloopSteps:
             gr = self.partitionGRs[pss.partitionId]
+            # PendingA/B are subtiles issues not been waited on yet.
             pendingA |= gr.subtileA
             pendingB |= gr.subtileB
 
             for dus in pss.subIterKSteps:
-                numModules = len(dus.modules)
-
-                # Find modules by type
-                mfmaMods = [m for m in dus.modules if isinstance(m.op, MFMAOp)]
                 lrMods = [m for m in dus.modules if isinstance(m.op, LROp)]
                 grMods = [m for m in dus.modules if isinstance(m.op, GROp)]
-
                 lrMod = lrMods[0] if lrMods else None
                 lrOp = lrMod.op if lrMod else None
-                hasGRn2 = any(isinstance(m.op, GROp) and m.op.mtIteration == "n+2" for m in grMods)
-                waitA = set()
-                waitB = set()
+                hasGRn2 = any(m.op.mtIteration == "n+2" for m in grMods)
 
-                # Determine if WAIT_GR is needed before this LR
-                waitGROp = None
-                if lrOp and lrOp.subIterK == 0:
-                    waitA = set(lrOp.lrLoadA.keys()) & pendingA
-                    waitB = set(lrOp.lrLoadB.keys()) & pendingB
-                    if waitA or waitB:
-                        waitOpIdx = opIdx + numModules
-                        inflightCountA, inflightCountB = _countInflightSubtileLoads(
-                            waitOpIdx, lrOp.mtIteration, sorted(waitA), sorted(waitB))
-                        waitGROp = WaitGROp(
-                            mtIteration=lrOp.mtIteration,
-                            subtileA=sorted(waitA), subtileB=sorted(waitB),
-                            inflightLoadsA=inflightCountA, inflightLoadsB=inflightCountB)
-                        pendingA -= waitA
-                        pendingB -= waitB
+                # build WAIT_GR is the LROp needs subtile that are still pending.
+                waitGROp, waitA, waitB = self._buildWaitGROp(
+                    lrOp, pendingA, pendingB, opIdx, len(dus.modules), grEvents)
 
-                # Annotate dependencies
-                if waitGROp:
-                    # LR depends on GR: GR must complete before LR can read from LDS
-                    # Order: MFMAs → GR → GR_INC? → WAIT_GR → SYNC → LR_INC? → LR → WAIT_LR
-                    for grMod in grMods:
-                        if grMod.op.lastForMT:
-                            grMod.after.append(DepEdge(op=GR_INCOp()))
-                    if lrMod:
-                        candidateGRs = list(reversed(seenGRMods + grMods))
-                        grMatch = None
-                        # LR(MT x) must depend on GR(MT x)
-                        targetGRmt = lrOp.mtIteration
-                        for g in candidateGRs:
-                            if g.op.mtIteration != targetGRmt:
-                                continue
-                            gA = set(g.op.subtileA)
-                            gB = set(g.op.subtileB)
-                            if (not waitA or waitA.issubset(gA)) and (not waitB or waitB.issubset(gB)):
-                                grMatch = g
-                                break
-                        if grMatch is None:
-                            grMatch = next((g for g in candidateGRs if g.op.mtIteration == targetGRmt), None)
-                        if grMatch is not None:
-                            lrMod.before.append(DepEdge(module=grMatch))
-                        lrMod.before.append(DepEdge(op=waitGROp))
-                        lrMod.before.append(DepEdge(op=SyncOp(comment="Barrier: wait for GR data")))
-                        if lastLRmt is not None and lrOp.mtIteration != lastLRmt:
-                            lrMod.before.append(DepEdge(op=LR_INCOp()))
-                        lrMod.after.append(DepEdge(op=WaitLROp()))
+                self._annotateGRInc(grMods)
+
+                if waitGROp and lrMod:
+                    self._annotateLRDependsOnGR(
+                        lrMod, lrOp, grMods, priorGRMods, waitGROp, waitA, waitB)
                 elif hasGRn2 and lrMod:
-                    # GR depends on LR: LR must complete, then WAIT_LR + SYNC before GR(n+2)
-                    # WaitLROp on GR.before so instructionSchedule can interleave MFMAs freely
-                    # Order: MFMAs → LR_INC? → LR → ... MFMAs ... → WAIT_LR → SYNC → GR → GR_INC?
-                    if lastLRmt is not None and lrOp.mtIteration != lastLRmt:
-                        lrMod.before.append(DepEdge(op=LR_INCOp()))
-                    # LR completion marker for end-of-subIterK consistency.
+                    self._annotateGRDependsOnLR(lrMod, grMods)
+
+                if lrMod:
+                    self._annotateLRInc(lrMod, lrOp, lastLRmt)
                     lrMod.after.append(DepEdge(op=WaitLROp()))
-                    for grMod in grMods:
-                        grMod.before.append(DepEdge(module=lrMod))
-                        grMod.before.append(DepEdge(op=WaitLROp()))
-                        grMod.before.append(DepEdge(op=SyncOp(comment="Barrier: all waves done with LR before GR(n+2) writes")))
-                        if grMod.op.lastForMT:
-                            grMod.after.append(DepEdge(op=GR_INCOp()))
-                else:
-                    # No inter-module dependency
-                    # Order: MFMAs → LR_INC? → LR → GR → GR_INC? → WAIT_LR
-                    if lrMod:
-                        if lastLRmt is not None and lrOp.mtIteration != lastLRmt:
-                            lrMod.before.append(DepEdge(op=LR_INCOp()))
-                        lrMod.after.append(DepEdge(op=WaitLROp()))
-                    for grMod in grMods:
-                        if grMod.op.lastForMT:
-                            grMod.after.append(DepEdge(op=GR_INCOp()))
 
                 if lrOp:
                     lastLRmt = lrOp.mtIteration
-                seenGRMods.extend(grMods)
-                opIdx += numModules
+                priorGRMods.extend(grMods)
+                opIdx += len(dus.modules)
 
 
     @staticmethod
