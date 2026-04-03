@@ -378,6 +378,7 @@ class _SlotPlacer:
 
 # ── Scheduling rules ──
 
+# Hardcoded gap to hide ds_read latency. TODO: compute this more accurately.
 _MIN_MFMA_GAP_DS_READ_TO_WAIT = 4
 
 _isDsRead = lambda x: isinstance(x, LocalReadInstruction)
@@ -408,7 +409,7 @@ class _SchedulingRules:
     # ── Validators: (placer, pos, inst) -> bool ──
 
     def oneDsReadPerInterval(self, placer, pos, inst):
-        """At most one ds_read per interval (pair of slots)."""
+        """At most one ds_read per interval (pair of slots) to avoid same SIMD pair stalls as we have a single codepath"""
         if not _isDsRead(inst):
             return True
         peer = pos ^ 1
@@ -472,6 +473,7 @@ class _SchedulingRules:
             lastGrIdx = max(order.index(m) for m in grModuleIds if m in order)
             tailModuleIds = set(order[lastGrIdx + 1:])
             numTailInsts = sum(1 for mid, _ in pathInsts if mid in tailModuleIds)
+            # this is an approximation as we don't know exactly how many slots will be use by modules after the GR yet (in this codepath)
             self.bufLoadMaxSlot = max(0, rawMax - numTailInsts)
 
 
@@ -1792,10 +1794,13 @@ class SubtileBasedScheduler:
           - MFMA order is preserved.
           - Between two adjacent MFMAs there are 2 placement slots.
           - At most one ds_read (LocalReadInstruction) per interval.
-          - before dependencies are respected at module order level.
+          - Before dependencies are respected at module order level.
+          - Minimm distance between ds_read and it waitcnt (hardcoded for now)
           - Module-internal instruction order is preserved.
-          - LR path is packed from the end backwards.
-          - GR path is spread as much as possible across remaining valid slots.
+          - LR path containing a WAIT_GR is packed from the end backwards. We want WAIT_GR to be done as late as possible.
+          - GR path is spread as much as possible across remaining valid slots. No backwards here as we want GRs to be done as early as possible.
+
+          TODO : To be tested on multi-partition setup.
         """
         if not emittedModules:
             return Module()
