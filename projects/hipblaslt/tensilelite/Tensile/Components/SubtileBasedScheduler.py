@@ -235,7 +235,6 @@ class EmittedModule:
     moduleId: int = -1
     core: list = field(default_factory=list)
     before: Optional[int] = None                     # moduleId that must run before this module
-    after: List[int] = field(default_factory=list)   # moduleIds that must run after this module
     opType: str = ""
 
 
@@ -1151,9 +1150,8 @@ class SubtileBasedScheduler:
                 emitted = self._buildEmittedModules(writer, kernel, dus.modules, dtileInfo)
                 for em in emitted:
                     beforeStr = str(em.before) if em.before is not None else "-"
-                    afterStr = ",".join(str(i) for i in em.after) if em.after else "-"
                     print(f"      id={em.moduleId} {em.opType}: core={len(em.core)} insts "
-                          f"before=[{beforeStr}] after=[{afterStr}]")
+                          f"before=[{beforeStr}]")
 
     # Allocate totalVGPRTiles vpgrTile
     def allocVgprTiles(self, writer):
@@ -1363,7 +1361,7 @@ class SubtileBasedScheduler:
         return "other"
 
     def _buildEmittedModules(self, writer, kernel, modules, dtileInfo, scaleSet=0, scaleLRSet=0):
-        """Build EmittedModules with core instructions + before/after module links."""
+        """Build EmittedModules with core instructions + before module links."""
         emitted: List[EmittedModule] = []
         modToEmittedId: Dict[int, int] = {}
         suppressAfterWaitLRForMod: Set[int] = set()
@@ -1455,8 +1453,6 @@ class SubtileBasedScheduler:
                 depIds.append(depId)
             prevAfterId = curId
             for depId in depIds:
-                if depId not in emitted[curId].after and depId != curId:
-                    emitted[curId].after.append(depId)
                 setBefore(depId, prevAfterId)
                 prevAfterId = depId
 
@@ -1566,7 +1562,7 @@ class SubtileBasedScheduler:
           - MFMA order is preserved.
           - Between two adjacent MFMAs there are 2 placement slots.
           - At most one ds_read (LocalReadInstruction) per interval.
-          - before/after dependencies are respected at module order level.
+          - before dependencies are respected at module order level.
           - Module-internal instruction order is preserved.
           - LR path is packed from the end backwards.
           - GR path is spread as much as possible across remaining valid slots.
