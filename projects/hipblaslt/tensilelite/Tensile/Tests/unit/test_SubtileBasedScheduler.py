@@ -475,20 +475,20 @@ def test_PGR2_64_64_1x1_emitted_modules_links():
 MAINLOOP EmittedModules:
   Partition 0:
     subIterK=0:
-      id=0 mfma: core=4 insts before=[-]
-      id=1 lr: core=4 insts before=[-]
-      id=2 gr: core=4 insts before=[4]
-      id=3 wait_lr: core=1 insts before=[1]
-      id=4 sync: core=1 insts before=[3]
+      id=0 mfma: 4 insts before=[-]
+      id=1 lr: 4 insts before=[-]
+      id=2 gr: 4 insts before=[4]
+      id=3 wait_lr: 1 insts before=[1]
+      id=4 sync: 1 insts before=[3]
     subIterK=1:
-      id=0 mfma: core=4 insts before=[-]
-      id=1 lr: core=4 insts before=[5]
-      id=2 gr: core=4 insts before=[-]
-      id=3 wait_gr: core=1 insts before=[-]
-      id=4 sync: core=1 insts before=[3]
-      id=5 lr_inc: core=6 insts before=[4]
-      id=6 wait_lr: core=1 insts before=[1]
-      id=7 gr_inc: core=10 insts before=[2]
+      id=0 mfma: 4 insts before=[-]
+      id=1 lr: 4 insts before=[5]
+      id=2 gr: 4 insts before=[-]
+      id=3 wait_gr: 1 insts before=[-]
+      id=4 sync: 1 insts before=[3]
+      id=5 lr_inc: 6 insts before=[4]
+      id=6 wait_lr: 1 insts before=[1]
+      id=7 gr_inc: 10 insts before=[2]
 """
     assert expected in actual
 
@@ -519,8 +519,8 @@ def test_PGR2_256_256_1x1_extract_paths_from_before_deps():
     finally:
         s.deallocVgprTiles(writer)
 
-    sig0 = [(em.moduleId, em.opType, len(em.core), em.before) for em in emitted0]
-    sig1 = [(em.moduleId, em.opType, len(em.core), em.before) for em in emitted1]
+    sig0 = [(em.moduleId, em.opType, len(em.instructions), em.before) for em in emitted0]
+    sig1 = [(em.moduleId, em.opType, len(em.instructions), em.before) for em in emitted1]
 
     assert sig0 == [
         (0, "mfma", 64, None),

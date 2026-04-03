@@ -223,17 +223,17 @@ class DepEdge:
 
 @dataclass
 class AnnotatedModule:
-    """A primary module (MFMA, LR, or GR) with dependency edges."""
-    op: Union[MFMAOp, LROp, GROp]
+    """A module with dependency edges."""
+    op: ScheduleOp
     before: List[DepEdge] = field(default_factory=list)
     after: List[DepEdge] = field(default_factory=list)
 
 
 @dataclass
 class EmittedModule:
-    """One emitted module with core instructions and module-link deps."""
+    """One emitted module with instructions and module-link deps."""
     moduleId: int = -1
-    core: list = field(default_factory=list)
+    instructions: list = field(default_factory=list)
     before: Optional[int] = None                     # moduleId that must run before this module
     opType: str = ""
 
@@ -252,7 +252,6 @@ class SubIterKSchedule:
     """Ops for one subIterK iteration within a partition."""
     subIterK: int
     modules: List[AnnotatedModule] = field(default_factory=list)
-    ops: List[ScheduleOp] = field(default_factory=list)
     conflict: Set[int] = field(default_factory=set)
 
 
@@ -489,7 +488,7 @@ def _classifyPaths(pathOrders, emittedModules):
 
 def _flattenPath(order, emittedModules, reverse=False):
     """Flatten a path of module indices into (moduleId, instruction) pairs."""
-    pathInsts = [(mid, inst) for mid in order for inst in emittedModules[mid].core]
+    pathInsts = [(mid, inst) for mid in order for inst in emittedModules[mid].instructions]
     if reverse:
         pathInsts.reverse()
     return pathInsts
@@ -697,7 +696,7 @@ class SubtileBasedScheduler:
             preloopOps.append(GR_INCOp())
         preloopOps.append(SkipOp(compare="LE", value=2, target="NGLL"))
         preloopSik = SubIterKSchedule(subIterK=0)
-        preloopSik.ops = preloopOps
+        preloopSik.modules = [AnnotatedModule(op=op) for op in preloopOps]
         self.preloopSteps: List[PartitionSchedule] = [
             PartitionSchedule(partitionId=0, subIterKSteps=[preloopSik])]
 
@@ -1353,8 +1352,8 @@ class SubtileBasedScheduler:
         print("PRELOOP:")
         for pss in self.preloopSteps:
             for dus in pss.subIterKSteps:
-                for op in dus.ops:
-                    self._printOp(op, indent="  ")
+                for mod in dus.modules:
+                    self._printOp(mod.op, indent="  ")
         print()
 
         print("MAINLOOP:")
@@ -1382,7 +1381,7 @@ class SubtileBasedScheduler:
                 emitted = self._buildEmittedModules(writer, kernel, dus.modules, dtileInfo)
                 for em in emitted:
                     beforeStr = str(em.before) if em.before is not None else "-"
-                    print(f"      id={em.moduleId} {em.opType}: core={len(em.core)} insts "
+                    print(f"      id={em.moduleId} {em.opType}: {len(em.instructions)} insts "
                           f"before=[{beforeStr}]")
 
     # Allocate totalVGPRTiles vpgrTile
@@ -1593,18 +1592,18 @@ class SubtileBasedScheduler:
         return "other"
 
     def _buildEmittedModules(self, writer, kernel, modules, dtileInfo, scaleSet=0, scaleLRSet=0):
-        """Build EmittedModules with core instructions + before module links."""
+        """Build EmittedModules with instructions + before module links."""
         emitted: List[EmittedModule] = []
         modToEmittedId: Dict[int, int] = {}
         suppressAfterWaitLRForMod: Set[int] = set()
 
         def addEmitted(op) -> Optional[int]:
-            coreInsts = self._emitOp(writer, kernel, op, dtileInfo,
-                                     scaleSet=scaleSet, scaleLRSet=scaleLRSet)
-            if not coreInsts:
+            insts = self._emitOp(writer, kernel, op, dtileInfo,
+                                scaleSet=scaleSet, scaleLRSet=scaleLRSet)
+            if not insts:
                 return None
             emId = len(emitted)
-            emitted.append(EmittedModule(moduleId=emId, core=coreInsts, opType=self._opType(op)))
+            emitted.append(EmittedModule(moduleId=emId, instructions=insts, opType=self._opType(op)))
             return emId
 
         def setBefore(moduleId: int, beforeId: Optional[int]) -> None:
@@ -1639,7 +1638,7 @@ class SubtileBasedScheduler:
             if curId is None:
                 continue
 
-            # before ops: chain from module refs / deps, then core.before points to
+            # before ops: chain from module refs / deps, then before points to
             # the last non-standalone dep.
             prevId: Optional[int] = None
             lastDepId: Optional[int] = None
@@ -1695,26 +1694,22 @@ class SubtileBasedScheduler:
         scaleSet: which scale VGPR set MFMA reads from.
         scaleLRSet: which scale VGPR set LR writes to.
 
-        For subIterK steps with modules (mainloop/NGLL/NLL), emits each
-        AnnotatedModule into an EmittedModule and passes them to
-        instructionSchedule for dependency-aware merging.
-
-        For subIterK steps with only ops (preloop), emits ops sequentially.
+        If modules contain MFMAs, emits via instructionSchedule for
+        dependency-aware interleaving. Otherwise emits sequentially.
         """
         dtileInfo = writer.states.d.tileInfo
         module = Module()
         module.addComment0(f"Partition {pss.partitionId}: subIterK={dus.subIterK}")
 
-        if dus.modules:
+        hasMFMA = any(isinstance(m.op, MFMAOp) for m in dus.modules)
+        if hasMFMA:
             emitted = self._buildEmittedModules(writer, kernel, dus.modules, dtileInfo,
                                                 scaleSet=scaleSet, scaleLRSet=scaleLRSet)
-            # instructionSchedule merges them with fine-grained interleaving
             merged = self.instructionSchedule(emitted)
             module.add(merged)
         else:
-            # Preloop: no modules, emit ops sequentially
-            for op in dus.ops:
-                for inst in self._emitOp(writer, kernel, op, dtileInfo,
+            for m in dus.modules:
+                for inst in self._emitOp(writer, kernel, m.op, dtileInfo,
                                          scaleSet=scaleSet, scaleLRSet=scaleLRSet):
                     module.add(inst)
         return module
@@ -1809,7 +1804,7 @@ class SubtileBasedScheduler:
         n = len(emittedModules)
 
         mfmaIdx, pathOrders = SubtileBasedScheduler._extractPathsFromBeforeDeps(emittedModules)
-        mfmas = [x for x in emittedModules[mfmaIdx].core if isMFMA(x)]
+        mfmas = [x for x in emittedModules[mfmaIdx].instructions if isMFMA(x)]
         assert len(mfmas) >= 2, "instructionSchedule expects at least two MFMA instructions"
 
         paths = _classifyPaths(pathOrders, emittedModules)

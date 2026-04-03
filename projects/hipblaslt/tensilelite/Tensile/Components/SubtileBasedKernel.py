@@ -1787,7 +1787,7 @@ def mainLoop(writer, kernel):
                           PrefetchMode.HALF_PREFETCH, VGPRTileReUseStrategy.ACROSS_SUBGROUP)
     scheduler = SubtileBasedScheduler(tiA, tiB, cfg,
                                       scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB)
-    scheduler.printSchedule()
+    # scheduler.printSchedule()
     scheduler.allocVgprTiles(writer)
 
     # Preloop (includes SKIP_IF_EQ(1,NLL) and SKIP_IF_LE(2,NGLL))
