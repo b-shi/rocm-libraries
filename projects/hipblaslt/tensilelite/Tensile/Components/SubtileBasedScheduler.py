@@ -1252,13 +1252,16 @@ class SubtileBasedScheduler:
     # ── Debug ────────────────────────────────────────────────
 
     @staticmethod
-    def _printOp(op: ScheduleOp, indent: str = ""):
+    def _printOp(op: ScheduleOp, indent: str = "",
+                 showVgpr: bool = False, showSubtiles: bool = False):
         if isinstance(op, MFMAOp):
             print(f"{indent}MFMAs (MT {op.mtIteration}, subIterK {op.subIterK}):")
-            print(f"{indent}  - {op.subtiles}")
-            print(f"{indent}  - USING  A: {op.vgprTileMapA}  B: {op.vgprTileMapB}")
-            if op.scaleMapA or op.scaleMapB:
-                print(f"{indent}  - SCALE  A: {op.scaleMapA}  B: {op.scaleMapB}")
+            if showSubtiles:
+                print(f"{indent}  - {op.subtiles}")
+            if showVgpr:
+                print(f"{indent}  - USING  A: {op.vgprTileMapA}  B: {op.vgprTileMapB}")
+                if op.scaleMapA or op.scaleMapB:
+                    print(f"{indent}  - SCALE  A: {op.scaleMapA}  B: {op.scaleMapB}")
         elif isinstance(op, GROp):
             print(f"{indent}GR (MT {op.mtIteration}):  A: {op.subtileA}  B: {op.subtileB}")
         elif isinstance(op, WaitGROp):
@@ -1270,21 +1273,19 @@ class SubtileBasedScheduler:
             print(f"{indent}SYNC")
         elif isinstance(op, LROp):
             sikLabel = f", subIterK {op.subIterK}" if op.subIterK >= 0 else ""
-            scaleStr = ""
-            if op.lrScaleA or op.lrScaleB:
-                scaleStr = f"  scaleA: {op.lrScaleA}  scaleB: {op.lrScaleB}"
-            print(f"{indent}LR (MT {op.mtIteration}{sikLabel}) A: {op.lrLoadA}  B: {op.lrLoadB}{scaleStr}")
+            aKeys = sorted(op.lrLoadA.keys())
+            bKeys = sorted(op.lrLoadB.keys())
+            print(f"{indent}LR (MT {op.mtIteration}{sikLabel}) A: {aKeys}  B: {bKeys}")
+            if showVgpr:
+                print(f"{indent}  - LOAD  A: {op.lrLoadA}  B: {op.lrLoadB}")
+                if op.lrScaleA or op.lrScaleB:
+                    print(f"{indent}  - SCALE  A: {op.lrScaleA}  B: {op.lrScaleB}")
         elif isinstance(op, SkipOp):
             print(f"{indent}SKIP_IF_{op.compare}({op.value}, {op.target})")
         elif isinstance(op, GR_INCOp):
             print(f"{indent}GR_INC")
         elif isinstance(op, LR_INCOp):
             print(f"{indent}LR_INC")
-
-    def _printModulesInitial(self, modules: List[AnnotatedModule], indent: str):
-        """Print modules without dependency edges (initial schedule)."""
-        for mod in modules:
-            self._printOp(mod.op, indent=indent)
 
     @staticmethod
     def _depEdgeLabel(e: DepEdge) -> str:
@@ -1297,35 +1298,39 @@ class SubtileBasedScheduler:
             return type(op).__name__
         return type(e.op).__name__
 
-    def _printModulesAnnotated(self, modules: List[AnnotatedModule], indent: str):
-        """Print modules with before/after dependency edges."""
+    def _printModules(self, modules: List[AnnotatedModule], indent: str,
+                      showVgpr: bool = False, showDeps: bool = False,
+                      showSubtiles: bool = False):
         for mod in modules:
-            before_str = ", ".join(self._depEdgeLabel(e) for e in mod.before) if mod.before else "none"
-            after_str = ", ".join(self._depEdgeLabel(e) for e in mod.after) if mod.after else "none"
-            self._printOp(mod.op, indent=indent)
-            print(f"{indent}  before: [{before_str}]  after: [{after_str}]")
+            self._printOp(mod.op, indent=indent, showVgpr=showVgpr,
+                          showSubtiles=showSubtiles)
+            if showDeps:
+                before_str = ", ".join(self._depEdgeLabel(e) for e in mod.before) if mod.before else "none"
+                after_str = ", ".join(self._depEdgeLabel(e) for e in mod.after) if mod.after else "none"
+                print(f"{indent}  before: [{before_str}]  after: [{after_str}]")
 
-    def _printLoopSteps(self, loopSteps: List[PartitionSchedule], indent: str, mode: str):
-        """Print partition/subIterK structure for a loop section."""
-        printFn = {
-            "initial": self._printModulesInitial,
-            "annotated": self._printModulesAnnotated,
-        }[mode]
+    def _printLoopSteps(self, loopSteps: List[PartitionSchedule], indent: str,
+                        showVgpr: bool = False, showDeps: bool = False,
+                        showSubtiles: bool = False):
         for partition in loopSteps:
             print(f"{indent}Partition {partition.partitionId}:")
             for dus in partition.subIterKSteps:
                 print(f"{indent}  subIterK={dus.subIterK}:")
-                printFn(dus.modules, indent=f"{indent}    ")
+                self._printModules(dus.modules, indent=f"{indent}    ",
+                                   showVgpr=showVgpr, showDeps=showDeps,
+                                   showSubtiles=showSubtiles)
                 if dus.conflict:
                     print(f"{indent}    *** CONFLICT: USE/LOAD share VGPRTile IDs {dus.conflict} — needs unrolling ***")
 
-    def printSchedule(self, mode: str = "annotated"):
-        """Print schedule in one of two modes:
-          - 'initial': modules only (MFMA, LR, GR) without dependency edges
-          - 'annotated': modules with before/after dependency edges (including module refs)
-        """
-        assert mode in ("initial", "annotated"), f"Unknown mode: {mode}"
+    def printSchedule(self, showVgpr: bool = False, showDeps: bool = False,
+                      showSubtiles: bool = False):
+        """Print the schedule.
 
+        Args:
+            showVgpr: show VGPR tile assignments and scale maps.
+            showDeps: show before/after dependency edges on each module.
+            showSubtiles: show MFMA subtile coordinate lists.
+        """
         print(f"SubtileGridA={self.MTA}, SubtileGridB={self.MTB}")
         print(f"Partition grid: {self.numPartitionsA} x {self.numPartitionsB}")
         print(f"Partition size: {self.config.partitionSizeA} x {self.config.partitionSizeB}")
@@ -1349,23 +1354,25 @@ class SubtileBasedScheduler:
             print("  " + "  ".join(f"{v:2d}" if v is not None else "  " for v in row))
         print()
 
+        opts = dict(showVgpr=showVgpr, showDeps=showDeps, showSubtiles=showSubtiles)
+
         print("PRELOOP:")
         for pss in self.preloopSteps:
             for dus in pss.subIterKSteps:
-                for mod in dus.modules:
-                    self._printOp(mod.op, indent="  ")
+                self._printModules(dus.modules, indent="  ",
+                                   showVgpr=showVgpr, showSubtiles=showSubtiles)
         print()
 
         print("MAINLOOP:")
-        self._printLoopSteps(self.mainloopSteps, indent="  ", mode=mode)
+        self._printLoopSteps(self.mainloopSteps, indent="  ", **opts)
 
         print()
         print("NGLL (No Global Load Loop):")
-        self._printLoopSteps(self.ngllSteps, indent="  ", mode=mode)
+        self._printLoopSteps(self.ngllSteps, indent="  ", **opts)
 
         print()
         print("NLL (No Load Loop):")
-        self._printLoopSteps(self.nllSteps, indent="  ", mode=mode)
+        self._printLoopSteps(self.nllSteps, indent="  ", **opts)
 
     def printEmittedModules(self, writer, kernel, label, steps):
         """Print EmittedModules for a loop section (before instructionSchedule).

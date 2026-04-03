@@ -109,7 +109,7 @@ def test_PGR2_64_64_1x1():
 
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
-        s.printSchedule()
+        s.printSchedule(showVgpr=True, showDeps=True, showSubtiles=True)
     actual = buf.getvalue()
 
     expected = """\
@@ -131,7 +131,8 @@ PRELOOP:
   GR_INC
   WAIT_GR (MT 0) A: [0, 1]  B: [0, 1] — inflight SubtileLoads A=0 B=0
   SYNC
-  LR (MT 0, subIterK 0) A: {0: 0, 1: 1}  B: {0: 2, 1: 3}
+  LR (MT 0, subIterK 0) A: [0, 1]  B: [0, 1]
+    - LOAD  A: {0: 0, 1: 1}  B: {0: 2, 1: 3}
   WAIT_LR
   SKIP_IF_LE(1, NLL)
   GR (MT 1):  A: [0, 1]  B: [0, 1]
@@ -145,7 +146,8 @@ MAINLOOP:
         - [(0, 0), (0, 1), (1, 0), (1, 1)]
         - USING  A: {0: 0, 1: 1}  B: {0: 2, 1: 3}
         before: [none]  after: [none]
-      LR (MT n, subIterK 1) A: {0: 4, 1: 5}  B: {0: 6, 1: 7}
+      LR (MT n, subIterK 1) A: [0, 1]  B: [0, 1]
+        - LOAD  A: {0: 4, 1: 5}  B: {0: 6, 1: 7}
         before: [none]  after: [WaitLROp]
       GR (MT n+2):  A: [0]  B: [0]
         before: [LR(MT n, sik 1), WaitLROp, SyncOp]  after: [none]
@@ -154,7 +156,8 @@ MAINLOOP:
         - [(0, 0), (0, 1), (1, 0), (1, 1)]
         - USING  A: {0: 4, 1: 5}  B: {0: 6, 1: 7}
         before: [none]  after: [none]
-      LR (MT n+1, subIterK 0) A: {0: 0, 1: 1}  B: {0: 2, 1: 3}
+      LR (MT n+1, subIterK 0) A: [0, 1]  B: [0, 1]
+        - LOAD  A: {0: 0, 1: 1}  B: {0: 2, 1: 3}
         before: [WaitGROp, SyncOp, LR_INCOp]  after: [WaitLROp]
       GR (MT n+2):  A: [1]  B: [1]
         before: [none]  after: [GR_INCOp]
@@ -166,14 +169,16 @@ NGLL (No Global Load Loop):
         - [(0, 0), (0, 1), (1, 0), (1, 1)]
         - USING  A: {0: 0, 1: 1}  B: {0: 2, 1: 3}
         before: [none]  after: [none]
-      LR (MT n, subIterK 1) A: {0: 4, 1: 5}  B: {0: 6, 1: 7}
+      LR (MT n, subIterK 1) A: [0, 1]  B: [0, 1]
+        - LOAD  A: {0: 4, 1: 5}  B: {0: 6, 1: 7}
         before: [none]  after: [WaitLROp, WaitLROp, SyncOp]
     subIterK=1:
       MFMAs (MT n, subIterK 1):
         - [(0, 0), (0, 1), (1, 0), (1, 1)]
         - USING  A: {0: 4, 1: 5}  B: {0: 6, 1: 7}
         before: [none]  after: [none]
-      LR (MT n+1, subIterK 0) A: {0: 0, 1: 1}  B: {0: 2, 1: 3}
+      LR (MT n+1, subIterK 0) A: [0, 1]  B: [0, 1]
+        - LOAD  A: {0: 0, 1: 1}  B: {0: 2, 1: 3}
         before: [WaitGROp, SyncOp, LR_INCOp]  after: [WaitLROp]
 
 NLL (No Load Loop):
@@ -183,7 +188,8 @@ NLL (No Load Loop):
         - [(0, 0), (0, 1), (1, 0), (1, 1)]
         - USING  A: {0: 0, 1: 1}  B: {0: 2, 1: 3}
         before: [none]  after: [none]
-      LR (MT n, subIterK 1) A: {0: 4, 1: 5}  B: {0: 6, 1: 7}
+      LR (MT n, subIterK 1) A: [0, 1]  B: [0, 1]
+        - LOAD  A: {0: 4, 1: 5}  B: {0: 6, 1: 7}
         before: [none]  after: [WaitLROp, WaitLROp]
     subIterK=1:
       MFMAs (MT n, subIterK 1):
@@ -219,7 +225,7 @@ def test_PGR2_64_64_2x2():
 
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
-        s.printSchedule()
+        s.printSchedule(showVgpr=True, showDeps=True, showSubtiles=True)
     actual = buf.getvalue()
 
     expected = """\
@@ -244,7 +250,8 @@ PRELOOP:
   GR_INC
   WAIT_GR (MT 0) A: [0, 1]  B: [0, 1] — inflight SubtileLoads A=0 B=0
   SYNC
-  LR (MT 0, subIterK 0) A: {0: 0}  B: {0: 1}
+  LR (MT 0, subIterK 0) A: [0]  B: [0]
+    - LOAD  A: {0: 0}  B: {0: 1}
   WAIT_LR
   SKIP_IF_LE(1, NLL)
   GR (MT 1):  A: [0]  B: [0]
@@ -257,7 +264,8 @@ MAINLOOP:
         - [(0, 0)]
         - USING  A: {0: 0}  B: {0: 1}
         before: [none]  after: [none]
-      LR (MT n, subIterK 1) A: {0: 2}  B: {0: 3}
+      LR (MT n, subIterK 1) A: [0]  B: [0]
+        - LOAD  A: {0: 2}  B: {0: 3}
         before: [none]  after: [WaitLROp]
       GR (MT n+1):  A: [1]  B: []
         before: [none]  after: [none]
@@ -266,7 +274,8 @@ MAINLOOP:
         - [(0, 0)]
         - USING  A: {0: 2}  B: {0: 3}
         before: [none]  after: [none]
-      LR (MT n, subIterK 0) A: {1: 4}  B: {}
+      LR (MT n, subIterK 0) A: [1]  B: []
+        - LOAD  A: {1: 4}  B: {}
         before: [WaitGROp, SyncOp]  after: [WaitLROp]
   Partition 1:
     subIterK=0:
@@ -274,7 +283,8 @@ MAINLOOP:
         - [(1, 0)]
         - USING  A: {1: 4}  B: {0: 1}
         before: [none]  after: [none]
-      LR (MT n, subIterK 1) A: {1: 5}  B: {}
+      LR (MT n, subIterK 1) A: [1]  B: []
+        - LOAD  A: {1: 5}  B: {}
         before: [none]  after: [WaitLROp]
       GR (MT n+1):  A: []  B: [1]
         before: [none]  after: [GR_INCOp]
@@ -283,7 +293,8 @@ MAINLOOP:
         - [(1, 0)]
         - USING  A: {1: 5}  B: {0: 3}
         before: [none]  after: [none]
-      LR (MT n, subIterK 0) A: {}  B: {1: 6}
+      LR (MT n, subIterK 0) A: []  B: [1]
+        - LOAD  A: {}  B: {1: 6}
         before: [WaitGROp, SyncOp]  after: [WaitLROp]
   Partition 2:
     subIterK=0:
@@ -291,14 +302,16 @@ MAINLOOP:
         - [(0, 1)]
         - USING  A: {0: 0}  B: {1: 6}
         before: [none]  after: [none]
-      LR (MT n, subIterK 1) A: {}  B: {1: 7}
+      LR (MT n, subIterK 1) A: []  B: [1]
+        - LOAD  A: {}  B: {1: 7}
         before: [none]  after: [WaitLROp]
     subIterK=1:
       MFMAs (MT n, subIterK 1):
         - [(0, 1)]
         - USING  A: {0: 2}  B: {1: 7}
         before: [none]  after: [none]
-      LR (MT n, subIterK 0) A: {}  B: {}
+      LR (MT n, subIterK 0) A: []  B: []
+        - LOAD  A: {}  B: {}
         before: [none]  after: [WaitLROp]
   Partition 3:
     subIterK=0:
@@ -306,7 +319,8 @@ MAINLOOP:
         - [(1, 1)]
         - USING  A: {1: 4}  B: {1: 6}
         before: [none]  after: [none]
-      LR (MT n, subIterK 1) A: {}  B: {}
+      LR (MT n, subIterK 1) A: []  B: []
+        - LOAD  A: {}  B: {}
         before: [none]  after: [WaitLROp]
       GR (MT n+2):  A: [0]  B: [0]
         before: [LR(MT n, sik 1), WaitLROp, SyncOp]  after: [none]
@@ -315,7 +329,8 @@ MAINLOOP:
         - [(1, 1)]
         - USING  A: {1: 5}  B: {1: 7}
         before: [none]  after: [none]
-      LR (MT n+1, subIterK 0) A: {0: 0}  B: {0: 1}
+      LR (MT n+1, subIterK 0) A: [0]  B: [0]
+        - LOAD  A: {0: 0}  B: {0: 1}
         before: [GR(MT n+1), WaitGROp, SyncOp, LR_INCOp]  after: [WaitLROp]
 
 NGLL (No Global Load Loop):
@@ -325,7 +340,8 @@ NGLL (No Global Load Loop):
         - [(0, 0)]
         - USING  A: {0: 0}  B: {0: 1}
         before: [none]  after: [none]
-      LR (MT n, subIterK 1) A: {0: 2}  B: {0: 3}
+      LR (MT n, subIterK 1) A: [0]  B: [0]
+        - LOAD  A: {0: 2}  B: {0: 3}
         before: [none]  after: [WaitLROp]
       GR (MT n+1):  A: [1]  B: []
         before: [none]  after: [none]
@@ -334,7 +350,8 @@ NGLL (No Global Load Loop):
         - [(0, 0)]
         - USING  A: {0: 2}  B: {0: 3}
         before: [none]  after: [none]
-      LR (MT n, subIterK 0) A: {1: 4}  B: {}
+      LR (MT n, subIterK 0) A: [1]  B: []
+        - LOAD  A: {1: 4}  B: {}
         before: [WaitGROp, SyncOp]  after: [WaitLROp]
   Partition 1:
     subIterK=0:
@@ -342,7 +359,8 @@ NGLL (No Global Load Loop):
         - [(1, 0)]
         - USING  A: {1: 4}  B: {0: 1}
         before: [none]  after: [none]
-      LR (MT n, subIterK 1) A: {1: 5}  B: {}
+      LR (MT n, subIterK 1) A: [1]  B: []
+        - LOAD  A: {1: 5}  B: {}
         before: [none]  after: [WaitLROp]
       GR (MT n+1):  A: []  B: [1]
         before: [none]  after: [none]
@@ -351,7 +369,8 @@ NGLL (No Global Load Loop):
         - [(1, 0)]
         - USING  A: {1: 5}  B: {0: 3}
         before: [none]  after: [none]
-      LR (MT n, subIterK 0) A: {}  B: {1: 6}
+      LR (MT n, subIterK 0) A: []  B: [1]
+        - LOAD  A: {}  B: {1: 6}
         before: [WaitGROp, SyncOp]  after: [WaitLROp]
   Partition 2:
     subIterK=0:
@@ -359,14 +378,16 @@ NGLL (No Global Load Loop):
         - [(0, 1)]
         - USING  A: {0: 0}  B: {1: 6}
         before: [none]  after: [none]
-      LR (MT n, subIterK 1) A: {}  B: {1: 7}
+      LR (MT n, subIterK 1) A: []  B: [1]
+        - LOAD  A: {}  B: {1: 7}
         before: [none]  after: [WaitLROp]
     subIterK=1:
       MFMAs (MT n, subIterK 1):
         - [(0, 1)]
         - USING  A: {0: 2}  B: {1: 7}
         before: [none]  after: [none]
-      LR (MT n, subIterK 0) A: {}  B: {}
+      LR (MT n, subIterK 0) A: []  B: []
+        - LOAD  A: {}  B: {}
         before: [none]  after: [WaitLROp]
   Partition 3:
     subIterK=0:
@@ -374,14 +395,16 @@ NGLL (No Global Load Loop):
         - [(1, 1)]
         - USING  A: {1: 4}  B: {1: 6}
         before: [none]  after: [none]
-      LR (MT n, subIterK 1) A: {}  B: {}
+      LR (MT n, subIterK 1) A: []  B: []
+        - LOAD  A: {}  B: {}
         before: [none]  after: [WaitLROp, WaitLROp, SyncOp]
     subIterK=1:
       MFMAs (MT n, subIterK 1):
         - [(1, 1)]
         - USING  A: {1: 5}  B: {1: 7}
         before: [none]  after: [none]
-      LR (MT n+1, subIterK 0) A: {0: 0}  B: {0: 1}
+      LR (MT n+1, subIterK 0) A: [0]  B: [0]
+        - LOAD  A: {0: 0}  B: {0: 1}
         before: [GR(MT n+1), WaitGROp, SyncOp, LR_INCOp]  after: [WaitLROp]
 
 NLL (No Load Loop):
@@ -391,14 +414,16 @@ NLL (No Load Loop):
         - [(0, 0)]
         - USING  A: {0: 0}  B: {0: 1}
         before: [none]  after: [none]
-      LR (MT n, subIterK 1) A: {0: 2}  B: {0: 3}
+      LR (MT n, subIterK 1) A: [0]  B: [0]
+        - LOAD  A: {0: 2}  B: {0: 3}
         before: [none]  after: [WaitLROp]
     subIterK=1:
       MFMAs (MT n, subIterK 1):
         - [(0, 0)]
         - USING  A: {0: 2}  B: {0: 3}
         before: [none]  after: [none]
-      LR (MT n, subIterK 0) A: {1: 4}  B: {}
+      LR (MT n, subIterK 0) A: [1]  B: []
+        - LOAD  A: {1: 4}  B: {}
         before: [WaitGROp, SyncOp]  after: [WaitLROp]
   Partition 1:
     subIterK=0:
@@ -406,14 +431,16 @@ NLL (No Load Loop):
         - [(1, 0)]
         - USING  A: {1: 4}  B: {0: 1}
         before: [none]  after: [none]
-      LR (MT n, subIterK 1) A: {1: 5}  B: {}
+      LR (MT n, subIterK 1) A: [1]  B: []
+        - LOAD  A: {1: 5}  B: {}
         before: [none]  after: [WaitLROp]
     subIterK=1:
       MFMAs (MT n, subIterK 1):
         - [(1, 0)]
         - USING  A: {1: 5}  B: {0: 3}
         before: [none]  after: [none]
-      LR (MT n, subIterK 0) A: {}  B: {1: 6}
+      LR (MT n, subIterK 0) A: []  B: [1]
+        - LOAD  A: {}  B: {1: 6}
         before: [WaitGROp, SyncOp]  after: [WaitLROp]
   Partition 2:
     subIterK=0:
@@ -421,14 +448,16 @@ NLL (No Load Loop):
         - [(0, 1)]
         - USING  A: {0: 0}  B: {1: 6}
         before: [none]  after: [none]
-      LR (MT n, subIterK 1) A: {}  B: {1: 7}
+      LR (MT n, subIterK 1) A: []  B: [1]
+        - LOAD  A: {}  B: {1: 7}
         before: [none]  after: [WaitLROp]
     subIterK=1:
       MFMAs (MT n, subIterK 1):
         - [(0, 1)]
         - USING  A: {0: 2}  B: {1: 7}
         before: [none]  after: [none]
-      LR (MT n, subIterK 0) A: {}  B: {}
+      LR (MT n, subIterK 0) A: []  B: []
+        - LOAD  A: {}  B: {}
         before: [none]  after: [WaitLROp]
   Partition 3:
     subIterK=0:
@@ -436,7 +465,8 @@ NLL (No Load Loop):
         - [(1, 1)]
         - USING  A: {1: 4}  B: {1: 6}
         before: [none]  after: [none]
-      LR (MT n, subIterK 1) A: {}  B: {}
+      LR (MT n, subIterK 1) A: []  B: []
+        - LOAD  A: {}  B: {}
         before: [none]  after: [WaitLROp, WaitLROp]
     subIterK=1:
       MFMAs (MT n, subIterK 1):
@@ -718,10 +748,11 @@ if __name__ == "__main__":
     writer = create_writer_with_tiles(kernel, tiA, tiB,
                                       scaleTiA=scaleTiA, scaleTiB=scaleTiB)
 
-    print("=== INITIAL ===")
-    s.printSchedule(mode="initial")
-    print("\n=== ANNOTATED ===")
-    s.printSchedule(mode="annotated")
+    print("=== DEFAULT ===")
+    s.printSchedule()
+    # print("\n=== VGPR + DEPS ===")
+    # s.printSchedule(showVgpr=True, showDeps=True, showSubtiles=True)
+    # s.printSchedule()
 
     s.allocVgprTiles(writer)
     s.printEmittedModules(writer, kernel, "MAINLOOP", s.mainloopSteps)
