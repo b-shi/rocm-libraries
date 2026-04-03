@@ -638,6 +638,16 @@ class Solution(collections.abc.Mapping):
       # Force BufferStore=1: UseSubtileImpl optimized storeD path is only implemented
       # for buffer stores for now.
       state["BufferStore"] = 1
+      # Not currently implemented in subtile implementation
+      state["Use64bShadowLimit"] = False
+      state["Use64bShadowLimitMX"] = False
+
+      #
+      bytesLoaded = state["NumThreads"] * 16
+      numBytesMXSA = (state["DepthU"] // state["ProblemType"]["MXBlockA"]) * state["MacroTile0"]
+      numBytesMXSB = (state["DepthU"] // state["ProblemType"]["MXBlockB"]) * state["MacroTile1"]
+      if bytesLoaded < numBytesMXSA or bytesLoaded < numBytesMXSB:
+        reject(state, printRejectionReason, "Unable to load mx scales using one load per wave")
 
     # done
     state["AssignedProblemIndependentDerivedParameters"] = True
