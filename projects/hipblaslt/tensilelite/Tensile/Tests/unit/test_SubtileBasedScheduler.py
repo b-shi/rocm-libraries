@@ -4,8 +4,8 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 from Tensile.Components.SubtileBasedKernel import TileInfo
 from Tensile.Components.SubtileBasedScheduler import (
-    SubtileBasedScheduler, SchedulerConfig, PrefetchMode, VGPRTileReUseStrategy,
-    SubgroupOrdering, MFMAOp, GROp, LROp, WaitGROp, WaitLROp, SyncOp, GR_INCOp, LR_INCOp,
+    SubtileBasedScheduler, SchedulerConfig, PrefetchMode,
+    MFMAOp, GROp, LROp, WaitGROp, WaitLROp, SyncOp, GR_INCOp, LR_INCOp,
 )
 from rocisa.code import Module, Label
 from rocisa import rocIsa
@@ -99,9 +99,7 @@ def test_PGR2_64_64_1x1():
     lsgA = tiA.localSubtileGrid[0]
     lsgB = tiB.localSubtileGrid[0]
 
-    cfg = SchedulerConfig(lsgA, lsgB, PrefetchMode.HALF_PREFETCH,
-                          VGPRTileReUseStrategy.ACROSS_SUBGROUP,
-                          SubgroupOrdering.COLUMN_MAJOR)
+    cfg = SchedulerConfig(lsgA, lsgB, PrefetchMode.HALF_PREFETCH)
     s = SubtileBasedScheduler(tiA, tiB, cfg)
 
     assert len(s.preloopSteps)  > 0
@@ -121,7 +119,7 @@ SubtileGridA=2, SubtileGridB=2
 Partition grid: 1 x 1
 Partition size: 2 x 2
 Prefetch: HALF_PREFETCH
-Reuse: ACROSS_SUBGROUP
+Reuse: ACROSS_PARTITIONS
 needsUnrolling: False
 totalVGPRTiles: 8 (32 VGPRs)
 totalScaleVGPRTiles: 0
@@ -179,9 +177,7 @@ def test_PGR2_64_64_1x1_fp4():
     lsgA = tiA.localSubtileGrid[0]
     lsgB = tiB.localSubtileGrid[0]
 
-    cfg = SchedulerConfig(lsgA, lsgB, PrefetchMode.HALF_PREFETCH,
-                          VGPRTileReUseStrategy.ACROSS_SUBGROUP,
-                          SubgroupOrdering.COLUMN_MAJOR)
+    cfg = SchedulerConfig(lsgA, lsgB, PrefetchMode.HALF_PREFETCH)
     s = SubtileBasedScheduler(tiA, tiB, cfg,
                               scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB)
 
@@ -232,9 +228,7 @@ def test_PGR2_64_64_2x2():
     lsgA = tiA.localSubtileGrid[0]//2
     lsgB = tiB.localSubtileGrid[0]//2
 
-    cfg = SchedulerConfig(lsgA, lsgB, PrefetchMode.HALF_PREFETCH,
-                          VGPRTileReUseStrategy.ACROSS_SUBGROUP,
-                          SubgroupOrdering.COLUMN_MAJOR)
+    cfg = SchedulerConfig(lsgA, lsgB, PrefetchMode.HALF_PREFETCH)
     s = SubtileBasedScheduler(tiA, tiB, cfg)
 
     assert len(s.preloopSteps)  > 0
@@ -254,7 +248,7 @@ SubtileGridA=2, SubtileGridB=2
 Partition grid: 2 x 2
 Partition size: 1 x 1
 Prefetch: HALF_PREFETCH
-Reuse: ACROSS_SUBGROUP
+Reuse: ACROSS_PARTITIONS
 needsUnrolling: False
 totalVGPRTiles: 8 (32 VGPRs)
 totalScaleVGPRTiles: 0
@@ -400,9 +394,7 @@ def _create_1x1_scheduler():
     tiB = TileInfo('B', kernel)
     lsgA = tiA.localSubtileGrid[0]
     lsgB = tiB.localSubtileGrid[0]
-    cfg = SchedulerConfig(lsgA, lsgB, PrefetchMode.HALF_PREFETCH,
-                          VGPRTileReUseStrategy.ACROSS_SUBGROUP,
-                          SubgroupOrdering.COLUMN_MAJOR)
+    cfg = SchedulerConfig(lsgA, lsgB, PrefetchMode.HALF_PREFETCH)
     return SubtileBasedScheduler(tiA, tiB, cfg)
 
 
@@ -472,9 +464,7 @@ def test_PGR2_64_64_1x1_emitted_modules_links(verbose=False):
     lsgA = tiA.localSubtileGrid[0]
     lsgB = tiB.localSubtileGrid[0]
 
-    cfg = SchedulerConfig(lsgA, lsgB, PrefetchMode.HALF_PREFETCH,
-                          VGPRTileReUseStrategy.ACROSS_SUBGROUP,
-                          SubgroupOrdering.COLUMN_MAJOR)
+    cfg = SchedulerConfig(lsgA, lsgB, PrefetchMode.HALF_PREFETCH)
     s = SubtileBasedScheduler(tiA, tiB, cfg)
     writer = create_writer_with_tiles(kernel, tiA, tiB)
 
@@ -524,9 +514,7 @@ def test_PGR2_256_256_1x1_extract_paths_from_before_deps():
     lsgA = tiA.localSubtileGrid[0]
     lsgB = tiB.localSubtileGrid[0]
 
-    cfg = SchedulerConfig(lsgA, lsgB, PrefetchMode.HALF_PREFETCH,
-                          VGPRTileReUseStrategy.ACROSS_SUBGROUP,
-                          SubgroupOrdering.COLUMN_MAJOR)
+    cfg = SchedulerConfig(lsgA, lsgB, PrefetchMode.HALF_PREFETCH)
     s = SubtileBasedScheduler(tiA, tiB, cfg)
     writer = create_writer_with_tiles(kernel, tiA, tiB)
 
@@ -636,9 +624,7 @@ def test_PGR2_256_256_fp4_instruction_schedule_exact():
     lsgA = tiA.localSubtileGrid[0]
     lsgB = tiB.localSubtileGrid[0]
 
-    cfg = SchedulerConfig(lsgA, lsgB, PrefetchMode.HALF_PREFETCH,
-                          VGPRTileReUseStrategy.ACROSS_SUBGROUP,
-                          SubgroupOrdering.COLUMN_MAJOR)
+    cfg = SchedulerConfig(lsgA, lsgB, PrefetchMode.HALF_PREFETCH)
     s = SubtileBasedScheduler(tiA, tiB, cfg,
                               scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB)
     writer = create_writer_with_tiles(kernel, tiA, tiB,
@@ -680,9 +666,7 @@ if __name__ == "__main__":
     lsgA = tiA.localSubtileGrid[0]
     lsgB = tiB.localSubtileGrid[0]
 
-    cfg = SchedulerConfig(lsgA, lsgB, PrefetchMode.HALF_PREFETCH,
-                          VGPRTileReUseStrategy.ACROSS_SUBGROUP,
-                          SubgroupOrdering.COLUMN_MAJOR)
+    cfg = SchedulerConfig(lsgA, lsgB, PrefetchMode.HALF_PREFETCH)
     s = SubtileBasedScheduler(tiA, tiB, cfg,
                               scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB)
 
@@ -717,10 +701,10 @@ if __name__ == "__main__":
     # lsgB = tiB.localSubtileGrid[0]
 
     # configs = [
-    #     # (f"lsg {lsgA}x{lsgB}, group {lsgA}x{lsgB}, HALF_PREFETCH, ACROSS_SUBGROUP, COLUMN_MAJOR",
-    #     #     SchedulerConfig(lsgA, lsgB, PrefetchMode.HALF_PREFETCH, VGPRTileReUseStrategy.ACROSS_SUBGROUP, SubgroupOrdering.COLUMN_MAJOR)),
-    #     (f"lsg {lsgA}x{lsgB}, group {lsgA//2}x{lsgB//2}, HALF_PREFETCH, ACROSS_SUBGROUP, COLUMN_MAJOR",
-    #         SchedulerConfig(lsgA//2, lsgB//2, PrefetchMode.HALF_PREFETCH, VGPRTileReUseStrategy.ACROSS_SUBGROUP, SubgroupOrdering.COLUMN_MAJOR)),
+    #     # (f"lsg {lsgA}x{lsgB}, group {lsgA}x{lsgB}, HALF_PREFETCH, ACROSS_PARTITIONS, COLUMN_MAJOR",
+    #     #     SchedulerConfig(lsgA, lsgB, PrefetchMode.HALF_PREFETCH, VGPRTileReUseStrategy.ACROSS_PARTITIONS, PartitionOrdering.COLUMN_MAJOR)),
+    #     (f"lsg {lsgA}x{lsgB}, group {lsgA//2}x{lsgB//2}, HALF_PREFETCH, ACROSS_PARTITIONS, COLUMN_MAJOR",
+    #         SchedulerConfig(lsgA//2, lsgB//2, PrefetchMode.HALF_PREFETCH, VGPRTileReUseStrategy.ACROSS_PARTITIONS, PartitionOrdering.COLUMN_MAJOR)),
     # ]
 
     # for name, cfg in configs:

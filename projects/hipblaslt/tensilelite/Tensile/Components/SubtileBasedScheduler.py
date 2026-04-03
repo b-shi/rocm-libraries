@@ -1,4 +1,3 @@
-import dataclasses
 from enum import Enum, auto
 from dataclasses import dataclass, field
 import math
@@ -22,12 +21,10 @@ class PrefetchMode(Enum):
 
 
 class VGPRTileReUseStrategy(Enum):
-    NONE = auto()
-    ACROSS_SUBGROUP = auto()
-    WITHIN_SUBGROUP = auto()
+    ACROSS_PARTITIONS = auto()
 
 
-class SubgroupOrdering(Enum):
+class PartitionOrdering(Enum):
     COLUMN_MAJOR = auto()
     SNAKE_COLUMN_MAJOR = auto()
 
@@ -37,8 +34,8 @@ class SchedulerConfig:
     partitionSizeA: int
     partitionSizeB: int
     prefetchMode: PrefetchMode
-    reuseStrategy: VGPRTileReUseStrategy
-    ordering: SubgroupOrdering = SubgroupOrdering.COLUMN_MAJOR
+    reuseStrategy: VGPRTileReUseStrategy = VGPRTileReUseStrategy.ACROSS_PARTITIONS
+    ordering: PartitionOrdering = PartitionOrdering.COLUMN_MAJOR
 
 
 @dataclass
@@ -551,11 +548,11 @@ class SubtileBasedScheduler:
 
     def _generateOrder(self) -> List[Tuple[int, int]]:
         order = []
-        if self.config.ordering == SubgroupOrdering.COLUMN_MAJOR:
+        if self.config.ordering == PartitionOrdering.COLUMN_MAJOR:
             for col in range(self.numPartitionsB):
                 for row in range(self.numPartitionsA):
                     order.append((row, col))
-        elif self.config.ordering == SubgroupOrdering.SNAKE_COLUMN_MAJOR:
+        elif self.config.ordering == PartitionOrdering.SNAKE_COLUMN_MAJOR:
             for col in range(self.numPartitionsB):
                 if col % 2 == 0:
                     for row in range(self.numPartitionsA):
@@ -677,7 +674,7 @@ class SubtileBasedScheduler:
         # Mark the last MT 0 GR as lastForMT
         for i in range(len(preloopOps) - 1, -1, -1):
             if isinstance(preloopOps[i], GROp):
-                preloopOps[i] = dataclasses.replace(preloopOps[i], lastForMT=True)
+                preloopOps[i].lastForMT = True
                 break
         preloopOps.append(GR_INCOp())
         preloopOps.append(WaitGROp(mtIteration="0",
@@ -704,6 +701,109 @@ class SubtileBasedScheduler:
 
         return set(preloadMT1_A), set(preloadMT1_B)
 
+    def _buildSubIterK(self, partition, pi, sik, numPartitions):
+        """Build MFMA + LR modules for one subIterK step within a partition."""
+        # MFMA: map subtile indices to VGPR tile IDs
+        vgprTileMapA = {tA: self.allocator.getVGPRTileId('A', tA, sik)
+                        for tA in partition.tileAIndices}
+        vgprTileMapB = {tB: self.allocator.getVGPRTileId('B', tB, sik)
+                        for tB in partition.tileBIndices}
+
+        # MFMA scale maps
+        scaleMapA, scaleMapB = {}, {}
+        if self.hasScale:
+            for tA in partition.tileAIndices:
+                gid, vid = self.scaleVid('A', tA)
+                scaleMapA.setdefault(gid, vid)
+            for tB in partition.tileBIndices:
+                gid, vid = self.scaleVid('B', tB)
+                scaleMapB.setdefault(gid, vid)
+
+        # LR: load targets determined by prefetch mode
+        loadATiles, loadBTiles, loadSubIterK = self._getLoadTargets(pi, sik, numPartitions)
+        isWrapAround = self._isWrapAroundLoad(pi, sik, numPartitions)
+
+        lrLoadA = {tA: v for tA in (loadATiles or [])
+                   if (v := self._loadTile('A', tA, loadSubIterK, isWrapAround)) is not None}
+        lrLoadB = {tB: v for tB in (loadBTiles or [])
+                   if (v := self._loadTile('B', tB, loadSubIterK, isWrapAround)) is not None}
+
+        # Scale VGPRs for loaded tiles (only for subIterK==0 loads)
+        lrScaleA, lrScaleB = {}, {}
+        if self.hasScale and loadSubIterK == 0:
+            for tA in (loadATiles or []):
+                gid, vid = self.scaleVid('A', tA)
+                lrScaleA.setdefault(gid, vid)
+            for tB in (loadBTiles or []):
+                gid, vid = self.scaleVid('B', tB)
+                lrScaleB.setdefault(gid, vid)
+
+        # Conflict detection
+        mfmaIds = set(vgprTileMapA.values()) | set(vgprTileMapB.values())
+        loadIds = set(lrLoadA.values()) | set(lrLoadB.values())
+        conflict = mfmaIds & loadIds
+        if conflict:
+            self.needsUnrolling = True
+
+        # Build modules
+        mfmas = [(a, b) for a in sorted(vgprTileMapA) for b in sorted(vgprTileMapB)]
+        mtLoad = "n+1" if isWrapAround else "n"
+        siks = SubIterKSchedule(subIterK=sik, conflict=conflict)
+        siks.modules.append(AnnotatedModule(op=MFMAOp(
+            mtIteration="n", subIterK=sik, subtiles=mfmas,
+            vgprTileMapA=vgprTileMapA, vgprTileMapB=vgprTileMapB,
+            scaleMapA=scaleMapA, scaleMapB=scaleMapB)))
+        siks.modules.append(AnnotatedModule(op=LROp(
+            mtIteration=mtLoad, subIterK=loadSubIterK,
+            lrLoadA=lrLoadA, lrLoadB=lrLoadB,
+            lrScaleA=lrScaleA, lrScaleB=lrScaleB)))
+
+        return siks
+
+    def _isLastGRForMT(self, pi, gr, numPartitions):
+        """Check if this partition's GR is the last one that completes a full MT load."""
+        if gr.mtIteration == "n+1":
+            return not any(
+                (self.partitionGRs[fpi].subtileA or self.partitionGRs[fpi].subtileB)
+                and self.partitionGRs[fpi].mtIteration == "n+1"
+                for fpi in range(pi + 1, numPartitions))
+        if gr.mtIteration == "n+2":
+            hasN1 = any(
+                (self.partitionGRs[p].subtileA or self.partitionGRs[p].subtileB)
+                and self.partitionGRs[p].mtIteration == "n+1"
+                for p in range(numPartitions))
+            if hasN1:
+                return False
+            return not any(
+                (self.partitionGRs[fpi].subtileA or self.partitionGRs[fpi].subtileB)
+                and self.partitionGRs[fpi].mtIteration == "n+2"
+                for fpi in range(pi + 1, numPartitions))
+        return False
+
+    def _insertGROps(self, pss, pi, gr, numPartitions):
+        """Insert GR ops for a partition, splitting across subIterK=0 and subIterK=1."""
+        if not gr.subtileA and not gr.subtileB:
+            return
+
+        totalGR_A = sorted(gr.subtileA)
+        totalGR_B = sorted(gr.subtileB)
+        splitA = (len(totalGR_A) + 1) // 2
+        splitB = (len(totalGR_B) + 1) // 2
+        gr0_A, gr1_A = totalGR_A[:splitA], totalGR_A[splitA:]
+        gr0_B, gr1_B = totalGR_B[:splitB], totalGR_B[splitB:]
+        isLast = self._isLastGRForMT(pi, gr, numPartitions)
+        hasSik1 = bool(gr1_A or gr1_B)
+        # handle case where gr1 is empty.
+        if gr0_A or gr0_B:
+            pss.subIterKSteps[0].modules.append(AnnotatedModule(op=GROp(
+                mtIteration=gr.mtIteration,
+                subtileA=gr0_A, subtileB=gr0_B,
+                lastForMT=isLast and not hasSik1)))
+        if hasSik1:
+            pss.subIterKSteps[1].modules.append(AnnotatedModule(op=GROp(
+                mtIteration=gr.mtIteration,
+                subtileA=gr1_A, subtileB=gr1_B, lastForMT=isLast)))
+
     def _runSchedule(self):
         if self.config.prefetchMode == PrefetchMode.NO:
             raise NotImplementedError("PrefetchMode.NO is not yet supported")
@@ -716,169 +816,16 @@ class SubtileBasedScheduler:
 
         for pi, partition in enumerate(self.partitions):
             pss = PartitionSchedule(partitionId=partition.partitionId)
-            gr = self.partitionGRs[pi]
-            subIterK0LoadAKeys: Set[int] = set()
-            subIterK0LoadBKeys: Set[int] = set()
 
             for sik in range(self.numSubIterK):
-                # USE: current group's tiles at current subIterK
-                # MFMA: map subtile indices to VGPR tile IDs
-                vgprTileMapA = {}
-                vgprTileMapB = {}
-                for tA in partition.tileAIndices:
-                    vgprTileMapA[tA] = self.allocator.getVGPRTileId('A', tA, sik)
-                for tB in partition.tileBIndices:
-                    vgprTileMapB[tB] = self.allocator.getVGPRTileId('B', tB, sik)
+                pss.subIterKSteps.append(
+                    self._buildSubIterK(partition, pi, sik, numPartitions))
 
-                # MFMA scale maps: look up already-allocated scale VGPR tile IDs
-                scaleMapA = {}
-                scaleMapB = {}
-                if self.hasScale:
-                    for tA in partition.tileAIndices:
-                        gid, vid = self.scaleVid('A', tA)
-                        scaleMapA.setdefault(gid, vid)
-                    for tB in partition.tileBIndices:
-                        gid, vid = self.scaleVid('B', tB)
-                        scaleMapB.setdefault(gid, vid)
-
-                # LOAD: determined by prefetch mode
-                loadATiles, loadBTiles, loadSubIterK = self._getLoadTargets(pi, sik, numPartitions)
-                isWrapAround = self._isWrapAroundLoad(pi, sik, numPartitions)
-                curA = set(partition.tileAIndices)
-                curB = set(partition.tileBIndices)
-                if sik == 0:
-                    self._pendingRemap = []
-
-                lrLoadA = {}
-                lrLoadB = {}
-                if loadATiles is not None:
-                    for tA in loadATiles:
-                        vid = self._loadTile('A', tA, loadSubIterK, isWrapAround, curA)
-                        if vid is not None:
-                            lrLoadA[tA] = vid
-
-                if loadBTiles is not None:
-                    for tB in loadBTiles:
-                        vid = self._loadTile('B', tB, loadSubIterK, isWrapAround, curB)
-                        if vid is not None:
-                            lrLoadB[tB] = vid
-
-                # Allocate scale VGPRs for loaded tiles (only when loading subIterK==0 data,
-                # since scale data is constant across subIterK within one MT iteration).
-                # Use loadSubIterK (not sik) because wrap-around loads target subIterK 0
-                # even though the current partition's sik may be > 0.
-                lrScaleA = {}
-                lrScaleB = {}
-                if self.hasScale and loadSubIterK == 0:
-                    if loadATiles is not None:
-                        for tA in loadATiles:
-                            gid, vid = self.scaleVid('A', tA)
-                            lrScaleA.setdefault(gid, vid)
-                    if loadBTiles is not None:
-                        for tB in loadBTiles:
-                            gid, vid = self.scaleVid('B', tB)
-                            lrScaleB.setdefault(gid, vid)
-
-                # Check MFMA and LOAD VGPRTile IDs don't overlap
-                mfmaIds = set(vgprTileMapA.values()) | set(vgprTileMapB.values())
-                loadIds = set(lrLoadA.values()) | set(lrLoadB.values())
-                overlap = mfmaIds & loadIds
-                conflict = set()
-                if overlap:
-                    conflict = overlap
-                    self.needsUnrolling = True
-
-                # Build SubIterKSchedule with MFMA and LR modules
-                siks = SubIterKSchedule(subIterK=sik)
-                mfmas = [(a, b) for a in sorted(vgprTileMapA.keys()) for b in sorted(vgprTileMapB.keys())]
-                mtLoad = "n+1" if isWrapAround else "n"
-                siks.modules.append(AnnotatedModule(op=MFMAOp(
-                    mtIteration="n", subIterK=sik,
-                    subtiles=mfmas,
-                    vgprTileMapA=vgprTileMapA, vgprTileMapB=vgprTileMapB,
-                    scaleMapA=scaleMapA, scaleMapB=scaleMapB)))
-                siks.modules.append(AnnotatedModule(op=LROp(
-                    mtIteration=mtLoad, subIterK=loadSubIterK,
-                    lrLoadA=lrLoadA, lrLoadB=lrLoadB,
-                    lrScaleA=lrScaleA, lrScaleB=lrScaleB)))
-                siks.conflict = conflict
-                pss.subIterKSteps.append(siks)
-
-                # save subtiles for subIterK=0 to check where to insert GR(n+2)
-                if sik == 0:
-                    subIterK0LoadAKeys = set(lrLoadA.keys())
-                    subIterK0LoadBKeys = set(lrLoadB.keys())
-
-                # WITHIN_SUBGROUP: release current subIterK's MFMA tiles for K-dim reuse
-                if self.config.reuseStrategy == VGPRTileReUseStrategy.WITHIN_SUBGROUP:
-                    for tA in vgprTileMapA:
-                        if self.allocator.isAllocated('A', tA, sik):
-                            self.allocator.release('A', tA, sik)
-                    for tB in vgprTileMapB:
-                        if self.allocator.isAllocated('B', tB, sik):
-                            self.allocator.release('B', tB, sik)
-
-            # Insert GROps split across subIterK=0 and subIterK=1
-            if gr.subtileA or gr.subtileB:
-                totalGR_A = sorted(gr.subtileA)
-                totalGR_B = sorted(gr.subtileB)
-                splitA = (len(totalGR_A) + 1) // 2
-                splitB = (len(totalGR_B) + 1) // 2
-                gr0_A, gr1_A = totalGR_A[:splitA], totalGR_A[splitA:]
-                gr0_B, gr1_B = totalGR_B[:splitB], totalGR_B[splitB:]
-
-                # lastForMT: true for the last GR that completes a full MT load
-                # within this loop iteration. One GR_INC per loop iteration.
-                # - For n+1 GRs: true when no more n+1 GRs follow.
-                # - For n+2 GRs: true only when there are no n+1 GRs at all
-                #   (1 partition case where n+2 loads all subtiles in one shot).
-                #   Otherwise n+2 is partial and continues in the next iteration.
-                isLastForThisMT = False
-                if gr.mtIteration == "n+1":
-                    isLastForThisMT = True
-                    for fpi in range(pi + 1, numPartitions):
-                        fgr = self.partitionGRs[fpi]
-                        if (fgr.subtileA or fgr.subtileB) and fgr.mtIteration == "n+1":
-                            isLastForThisMT = False
-                            break
-                elif gr.mtIteration == "n+2":
-                    # n+2 gets GR_INC only if no n+1 GRs exist (single partition)
-                    hasN1 = any((self.partitionGRs[p].subtileA or self.partitionGRs[p].subtileB)
-                                and self.partitionGRs[p].mtIteration == "n+1"
-                                for p in range(numPartitions))
-                    if not hasN1:
-                        # Check this is the last n+2 GR
-                        isLastForThisMT = True
-                        for fpi in range(pi + 1, numPartitions):
-                            fgr = self.partitionGRs[fpi]
-                            if (fgr.subtileA or fgr.subtileB) and fgr.mtIteration == "n+2":
-                                isLastForThisMT = False
-                                break
-
-                if gr0_A or gr0_B:
-                    pss.subIterKSteps[0].modules.append(AnnotatedModule(op=GROp(
-                        mtIteration=gr.mtIteration,
-                        subtileA=gr0_A, subtileB=gr0_B,
-                        lastForMT=False)))
-                if gr1_A or gr1_B:
-                    pss.subIterKSteps[1].modules.append(AnnotatedModule(op=GROp(
-                        mtIteration=gr.mtIteration,
-                        subtileA=gr1_A, subtileB=gr1_B,
-                        lastForMT=isLastForThisMT)))
-                elif isLastForThisMT:
-                    # All GRs fit in subIterK=0, mark that one as last
-                    grMod = pss.subIterKSteps[0].modules[-1]
-                    grMod.op = dataclasses.replace(grMod.op, lastForMT=True)
-
+            # split GR ops across subIterK steps and determine lastForMT
+            self._insertGROps(pss, pi, self.partitionGRs[pi], numPartitions)
             self.mainloopSteps.append(pss)
 
-            # Release after partition based on strategy
-            if self.config.reuseStrategy == VGPRTileReUseStrategy.WITHIN_SUBGROUP:
-                for tc, tileIdx, subIterK, shadowKey in self._pendingRemap:
-                    vid = self.allocator._allocMap(tc).pop((shadowKey, subIterK))
-                    self.allocator._allocMap(tc)[(tileIdx, subIterK)] = vid
-                self._pendingRemap = []
-            elif self.config.reuseStrategy == VGPRTileReUseStrategy.ACROSS_SUBGROUP:
+            if self.config.reuseStrategy == VGPRTileReUseStrategy.ACROSS_PARTITIONS:
                 self._releaseUnusedAfterPartition(pi)
 
         self._computeDependencies(numPartitions)
@@ -886,8 +833,7 @@ class SubtileBasedScheduler:
         self.nllSteps = self._buildNLL()
 
     def _loadTile(self, tc: str, tileIdx: int, loadSubIterK: int,
-                  isWrapAround: bool,
-                  currentPartitionTiles: Set[int]) -> Optional[int]:
+                  isWrapAround: bool) -> Optional[int]:
         """Determine the VGPRTile ID for a load. Returns None if no load needed."""
         allocated = self.allocator.isAllocated(tc, tileIdx, loadSubIterK)
 
@@ -896,21 +842,9 @@ class SubtileBasedScheduler:
             return self.allocator.getVGPRTileId(tc, tileIdx, loadSubIterK)
 
         if not allocated:
-            # Fresh allocation
             return self.allocator.allocate(tc, tileIdx, loadSubIterK)
 
-        if self.config.reuseStrategy == VGPRTileReUseStrategy.WITHIN_SUBGROUP \
-                and tileIdx in currentPartitionTiles:
-            # Tile is allocated by the current partition but will be released after it.
-            # Must allocate a new VGPR for the next partition's data.
-            # Use a shadow key to avoid overwriting the current allocation.
-            shadowKey = -(tileIdx + 1)  # negative to avoid collision
-            vid = self.allocator.allocate(tc, shadowKey, loadSubIterK)
-            # Store the real tileIdx mapping for later fixup
-            self._pendingRemap.append((tc, tileIdx, loadSubIterK, shadowKey))
-            return vid
-
-        # NONE / ACROSS_SUBGROUP: tile stays alive, reuse in place
+        # Tile stays alive, reuse in place
         return None
 
     def _isWrapAroundLoad(self, partitionIdx: int, subIterK: int, numPartitions: int) -> bool:
@@ -952,7 +886,7 @@ class SubtileBasedScheduler:
     # ── Reuse strategies ─────────────────────────────────────
 
     def _releaseUnusedAfterPartition(self, partitionIdx: int):
-        """ACROSS_SUBGROUP: release tiles not appearing in any future partition.
+        """ACROSS_PARTITIONS: release tiles not appearing in any future partition.
         Partition 0's tiles are always considered "future" because the wrap-around
         LR at the end of the loop loads back into partition 0's vgprTile IDs."""
         currentPartition = self.partitions[partitionIdx]
@@ -971,13 +905,6 @@ class SubtileBasedScheduler:
         for tB in currentPartition.tileBIndices:
             if tB not in futureB:
                 self.allocator.releaseAllForTile('B', tB)
-
-    def _releasePartitionTiles(self, partition: Partition):
-        """WITHIN_SUBGROUP: release all tiles (all subIterK) of this partition."""
-        for tA in partition.tileAIndices:
-            self.allocator.releaseAllForTile('A', tA)
-        for tB in partition.tileBIndices:
-            self.allocator.releaseAllForTile('B', tB)
 
     def _buildGREvents(self):
         """Build GR events list from modules for inflight counting."""
