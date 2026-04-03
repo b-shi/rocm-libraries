@@ -315,7 +315,7 @@ class _SlotPlacer:
         self._adjusters = adjusters or []
         self._onPlace = onPlace
 
-        self._placed: List[Optional[Tuple[int, object]]] = [None] * self.totalSlots
+        self._placed: List[List[Tuple[int, object]]] = [[] for _ in range(self.totalSlots)]
         self._firstPos: List[Optional[int]] = [None] * numModules
         self._lastPos: List[Optional[int]] = [None] * numModules
         self.leftovers: List[Tuple[int, object]] = []
@@ -323,7 +323,7 @@ class _SlotPlacer:
     # ── Placement ──
 
     def _canPlace(self, pos: int, inst) -> bool:
-        if pos < 0 or pos >= self.totalSlots or self._placed[pos] is not None:
+        if pos < 0 or pos >= self.totalSlots or len(self._placed[pos]) >= 2:
             return False
         return all(v(self, pos, inst) for v in self._validators)
 
@@ -356,21 +356,39 @@ class _SlotPlacer:
                 return pos
         return None
 
+    def _forceSlot(self, mid: int, limit: int, reverse: bool) -> int:
+        """Find the closest valid slot respecting dependencies, allowing >2 items per slot."""
+        lo, hi = self.bounds(mid)
+        if reverse:
+            hi = min(hi, limit)
+            lo = max(lo, 0)
+            if hi < lo:
+                hi = lo
+            return hi
+        else:
+            lo = max(lo, limit)
+            hi = min(hi, self.totalSlots - 1)
+            if lo > hi:
+                lo = hi
+            return lo
+
     def place(self, pos: int, item: Tuple[int, object]):
-        mid, inst = item[0], item[1]
-        self._placed[pos] = item
+        mid = item[0]
+        self._placed[pos].append(item)
         if self._firstPos[mid] is None or pos < self._firstPos[mid]:
             self._firstPos[mid] = pos
         if self._lastPos[mid] is None or pos > self._lastPos[mid]:
             self._lastPos[mid] = pos
         if self._onPlace:
-            self._onPlace(self, pos, inst)
+            self._onPlace(self, pos, item[1])
 
     def placePath(self, pathInsts: List[Tuple[int, object]], reverse: bool = False):
         """Place a sequence of (moduleId, instruction) items into slots.
 
         Walks pathInsts in order, applying adjusters (forward only) and
-        finding valid slots. Unplaced items go to leftovers.
+        finding valid slots. When no empty slot is found, force-places at
+        the closest valid position respecting dependencies (allowing >2
+        items per slot).
         """
         limit = (self.totalSlots - 1) if reverse else 0
         for idx, item in enumerate(pathInsts):
@@ -379,11 +397,7 @@ class _SlotPlacer:
                 limit = self.adjustLimit(limit, inst)
             pos = self.findSlot(mid, inst, limit, reverse=reverse)
             if pos is None:
-                remaining = pathInsts[idx:]
-                if reverse:
-                    remaining = list(reversed(remaining))
-                self.leftovers.extend(remaining)
-                return
+                pos = self._forceSlot(mid, limit, reverse)
             self.place(pos, item)
             limit = (pos - 1) if reverse else (pos + 1)
 
@@ -395,8 +409,8 @@ class _SlotPlacer:
         result.add(mfmas[0])
         for i in range(intervals):
             for slot in (2 * i, 2 * i + 1):
-                if self._placed[slot] is not None:
-                    result.add(self._placed[slot][1])
+                for item in self._placed[slot]:
+                    result.add(item[1])
             result.add(mfmas[i + 1])
         for _, inst in self.leftovers:
             result.add(inst)
@@ -440,8 +454,8 @@ class _SchedulingRules:
         if not _isDsRead(inst):
             return True
         peer = pos ^ 1
-        return not (0 <= peer < placer.totalSlots and placer._placed[peer] is not None
-                    and _isDsRead(placer._placed[peer][1]))
+        return not (0 <= peer < placer.totalSlots
+                    and any(_isDsRead(item[1]) for item in placer._placed[peer]))
 
     def minGapDsReadBeforeWait(self, placer, pos, inst):
         """Reject ds_read too close to an already-placed waitcnt ahead."""
@@ -1426,23 +1440,20 @@ class SubtileBasedScheduler:
 
     def emitWaitGR(self, inflightLoadsA, inflightLoadsB, hasScale=False):
         """Emit SWaitCnt for GR (buffer_load) based on inflight GR counts.
-        WARNING: current algo won't work in all cases. TBD
+
+        Only waits on vmcnt (data GR loads). Scale DTL loads complete via
+        lgkmcnt/dscnt and are handled separately by the barrier wait.
 
         Args:
             inflightLoadsA: Number of A GR loads still inflight.
             inflightLoadsB: Number of B GR loads still inflight.
-            hasScale:       True when MX scale DTL loads are active (they complete
-                            at lgkmcnt/dscnt, so dscnt=0 is required after the barrier).
+            hasScale:       Unused, kept for API compatibility.
         """
         module = Module()
         grCnt = int(inflightLoadsA / self.tileInfoA.loadRatioGR) + \
                 int(inflightLoadsB / self.tileInfoB.loadRatioGR)
-        # Scale DTL loads (buffer_load lds=True) complete at lgkmcnt (dscnt).
-        # Wait for both vmcnt (data GR) and lgkmcnt (scale DTL) before barrier.
-        dscnt = 0 if hasScale else -1
-        module.add(SWaitCnt(dscnt=dscnt, vlcnt=grCnt, vscnt=-1,
-                            comment=f"Wait GR: A={inflightLoadsA} B={inflightLoadsB} => vlcnt={grCnt}" +
-                                    (" dscnt=0 (scale DTL)" if hasScale else "")))
+        module.add(SWaitCnt(vlcnt=grCnt, vscnt=-1,
+                            comment=f"Wait GR: A={inflightLoadsA} B={inflightLoadsB} => vlcnt={grCnt}"))
         return module
 
     def emitGR(self, writer, kernel, op):

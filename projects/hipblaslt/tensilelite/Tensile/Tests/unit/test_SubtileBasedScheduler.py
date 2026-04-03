@@ -690,6 +690,7 @@ if __name__ == "__main__":
     nll = Module("NLL")
     nll.add(Label("SkipToNLL", ""))
     nll.add(s._emitLoop(writer, kernel, "NLL", s.nllSteps))
+    print(mainloop)
     # kernel = create_kernel()
     # tiA = TileInfo('A', kernel)
     # tiB = TileInfo('B', kernel)
