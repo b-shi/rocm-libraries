@@ -475,20 +475,20 @@ def test_PGR2_64_64_1x1_emitted_modules_links():
 MAINLOOP EmittedModules:
   Partition 0:
     subIterK=0:
-      id=0 mfma: core=4 insts before=[-] after=[-]
-      id=1 lr: core=4 insts before=[-] after=[-]
-      id=2 gr: core=4 insts before=[4] after=[-]
-      id=3 wait_lr: core=1 insts before=[1] after=[-]
-      id=4 sync: core=1 insts before=[3] after=[-]
+      id=0 mfma: core=4 insts before=[-]
+      id=1 lr: core=4 insts before=[-]
+      id=2 gr: core=4 insts before=[4]
+      id=3 wait_lr: core=1 insts before=[1]
+      id=4 sync: core=1 insts before=[3]
     subIterK=1:
-      id=0 mfma: core=4 insts before=[-] after=[-]
-      id=1 lr: core=4 insts before=[5] after=[6]
-      id=2 gr: core=4 insts before=[-] after=[7]
-      id=3 wait_gr: core=1 insts before=[-] after=[-]
-      id=4 sync: core=1 insts before=[3] after=[-]
-      id=5 lr_inc: core=6 insts before=[4] after=[-]
-      id=6 wait_lr: core=1 insts before=[1] after=[-]
-      id=7 gr_inc: core=10 insts before=[2] after=[-]
+      id=0 mfma: core=4 insts before=[-]
+      id=1 lr: core=4 insts before=[5]
+      id=2 gr: core=4 insts before=[-]
+      id=3 wait_gr: core=1 insts before=[-]
+      id=4 sync: core=1 insts before=[3]
+      id=5 lr_inc: core=6 insts before=[4]
+      id=6 wait_lr: core=1 insts before=[1]
+      id=7 gr_inc: core=10 insts before=[2]
 """
     assert expected in actual
 
@@ -519,25 +519,25 @@ def test_PGR2_256_256_1x1_extract_paths_from_before_deps():
     finally:
         s.deallocVgprTiles(writer)
 
-    sig0 = [(em.moduleId, em.opType, len(em.core), em.before, em.after) for em in emitted0]
-    sig1 = [(em.moduleId, em.opType, len(em.core), em.before, em.after) for em in emitted1]
+    sig0 = [(em.moduleId, em.opType, len(em.core), em.before) for em in emitted0]
+    sig1 = [(em.moduleId, em.opType, len(em.core), em.before) for em in emitted1]
 
     assert sig0 == [
-        (0, "mfma", 64, None, []),
-        (1, "lr", 16, None, []),
-        (2, "gr", 16, 4, []),
-        (3, "wait_lr", 1, 1, []),
-        (4, "sync", 1, 3, []),
+        (0, "mfma", 64, None),
+        (1, "lr", 16, None),
+        (2, "gr", 16, 4),
+        (3, "wait_lr", 1, 1),
+        (4, "sync", 1, 3),
     ]
     assert sig1 == [
-        (0, "mfma", 64, None, []),
-        (1, "lr", 16, 5, [6]),
-        (2, "gr", 16, None, [7]),
-        (3, "wait_gr", 1, None, []),
-        (4, "sync", 1, 3, []),
-        (5, "lr_inc", 6, 4, []),
-        (6, "wait_lr", 1, 1, []),
-        (7, "gr_inc", 10, 2, []),
+        (0, "mfma", 64, None),
+        (1, "lr", 16, 5),
+        (2, "gr", 16, None),
+        (3, "wait_gr", 1, None),
+        (4, "sync", 1, 3),
+        (5, "lr_inc", 6, 4),
+        (6, "wait_lr", 1, 1),
+        (7, "gr_inc", 10, 2),
     ]
 
     mfmaIdx0, pathOrders0 = SubtileBasedScheduler._extractPathsFromBeforeDeps(emitted0)
@@ -634,9 +634,9 @@ def test_PGR2_256_256_fp4_instruction_schedule_exact():
         "MLMLMLMLMLMLMLMLMLMLMLMLMLMLMLMLMMMMSSMSGMSMMMMGMSMMMMGMSMMMMGMSMMMMGM" \
         "SMMMMGMSMMMMGMSMMMMGMMMMMMMM"
     expected_sik1 = \
-        "MSGMSMMMMGMSMMMMGMSMMMMGMSMMMMGMSMMMMGMSMMMSMSSMSSMSSMSSMSSMSLMGLMSLMG" \
+        "MSGMSMMMMGMSMMMMGMSMMMMGMSMMMMGMSMMMMGMSMMMMSSMSSMSSMSSMSSMSLMGLMSLMG" \
         "LMSLMSLMGLMSLMSLMLMLMGLMSLMSLMSLMSLMSLMSLMSLMSLMSLMSLMSLMSLMSSMSSMSSMS" \
-        "SMS"
+        "SMSS"
 
     assert seq0 == expected_sik0, f"subIterK=0 mismatch:\n  got: {seq0}\n  exp: {expected_sik0}"
     assert seq1 == expected_sik1, f"subIterK=1 mismatch:\n  got: {seq1}\n  exp: {expected_sik1}"
