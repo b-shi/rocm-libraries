@@ -1109,6 +1109,7 @@ class SubtileBasedScheduler:
         """Filter dependency edges, removing ops of specified types."""
         return [e for e in edges if not isinstance(e.op, remove_types)]
 
+    # TODO. Re-test with multi-partitions
     def _buildNGLL(self) -> List[PartitionSchedule]:
         """NGLL (No Global Load Loop): mainloop without GR(n+2) and GR_INC."""
         ngll = []
@@ -1138,6 +1139,7 @@ class SubtileBasedScheduler:
             ngll.append(newPss)
         return ngll
 
+    # TODO. Re-test with multi-partitions
     def _buildNLL(self) -> List[PartitionSchedule]:
         """NLL (No Load Loop): mainloop without GR, GR_INC, LR_INC, LR(n+1),
         WaitGR(n+1) and their associated SyncOps. Keeps WaitGR(n) and its SYNC."""
@@ -1452,15 +1454,13 @@ class SubtileBasedScheduler:
             for sId0 in subtileList:
                 module.add(emitSingleBufferLoad(tileInfo, kernel, sId0, 0))
         # Scale DTL loads: only on the last GR of an MT (scale covers all subtiles)
-        if op.lastForMT and kernel["ProblemType"].get("MXBlockA", 0) and kernel["ProblemType"].get("MXBlockB", 0):
+        if op.lastForMT and self.hasScale:
             module.add(globalReadDoScaleSubtile('MXSA', writer, kernel))
             module.add(globalReadDoScaleSubtile('MXSB', writer, kernel))
         return module
 
     def _emitOp(self, writer, kernel, op, dtileInfo, scaleSet=0, scaleLRSet=0):
         """Emit a single ScheduleOp into a list of instructions."""
-        hasScale = (kernel["ProblemType"].get("MXBlockA", 0) and
-                    kernel["ProblemType"].get("MXBlockB", 0))
         module = Module()
         if isinstance(op, GROp):
             module.add(self.emitGR(writer, kernel, op))
@@ -1469,7 +1469,7 @@ class SubtileBasedScheduler:
             module.add(globalReadPtrUpdates('B', writer, kernel))
             module.add(globalReadLDSBufferSwap('A', writer, kernel))
             module.add(globalReadLDSBufferSwap('B', writer, kernel))
-            if hasScale:
+            if self.hasScale:
                 module.add(globalReadLDSBufferSwap('MXSA', writer, kernel))
                 module.add(globalReadLDSBufferSwap('MXSB', writer, kernel))
                 module.add(globalReadScalePtrUpdates('MXSA', writer, kernel))
@@ -1477,7 +1477,7 @@ class SubtileBasedScheduler:
         elif isinstance(op, MFMAOp):
             module.add(self.emitMFMA(writer, kernel, op, dtileInfo, scaleSet=scaleSet))
         elif isinstance(op, WaitGROp):
-            module.add(self.emitWaitGR(op.inflightLoadsA, op.inflightLoadsB, hasScale))
+            module.add(self.emitWaitGR(op.inflightLoadsA, op.inflightLoadsB, self.hasScale))
         elif isinstance(op, WaitLROp):
             module.add(SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for LR to complete"))
         elif isinstance(op, SyncOp):
@@ -1485,7 +1485,7 @@ class SubtileBasedScheduler:
         elif isinstance(op, LR_INCOp):
             module.add(localReadLDSBufferSwap('A', writer, kernel))
             module.add(localReadLDSBufferSwap('B', writer, kernel))
-            if hasScale:
+            if self.hasScale:
                 module.add(localReadLDSBufferSwap('MXSA', writer, kernel))
                 module.add(localReadLDSBufferSwap('MXSB', writer, kernel))
         elif isinstance(op, LROp):
@@ -1640,6 +1640,7 @@ class SubtileBasedScheduler:
             merged = self.instructionSchedule(emitted)
             module.add(merged)
         else:
+            # Special case for preloop (MFMA free)
             for m in dus.modules:
                 for inst in self._emitOp(writer, kernel, m.op, dtileInfo,
                                          scaleSet=scaleSet, scaleLRSet=scaleLRSet):
@@ -1759,11 +1760,7 @@ class SubtileBasedScheduler:
         return placer.assemble(mfmas)
 
     def _emitLoop(self, writer, kernel, label, steps, scaleSet=0, scaleLRSet=None):
-        """Emit a loop module (mainloop, NGLL, or NLL).
-
-        Emits each subIterK step as a separate module. For steps with
-        AnnotatedModules, instructionSchedule handles the merging inside
-        _emitSubIterK.
+        """Emit a loop section (preloop, mainloop, NGLL, or NLL).
 
         scaleSet: which scale VGPR set MFMA reads from (starting set for first partition).
         scaleLRSet: which scale VGPR set LR writes to (defaults to 1-scaleSet if None).
@@ -1781,5 +1778,6 @@ class SubtileBasedScheduler:
                 module.add(subModule)
             if self.hasScale:
                 scaleSet, scaleLRSet = scaleLRSet, scaleSet
+        module.addComment0(f"{label} end")
         return module
 
