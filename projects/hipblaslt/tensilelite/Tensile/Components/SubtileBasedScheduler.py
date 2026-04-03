@@ -1730,7 +1730,19 @@ class SubtileBasedScheduler:
             if not hasWaitGR:
                 sched["numBufLoads"] = sum(1 for _, inst in pathInsts if isBufferLoad(inst))
                 if sched["numBufLoads"] > 1:
-                    _, sched["bufLoadMaxSlot"] = bounds(pathInsts[-1][0])
+                    _, rawMax = bounds(pathInsts[-1][0])
+                    # Reserve slots for non-buffer-load instructions in modules that
+                    # follow the GR module (e.g. GR_INC SRD updates, LDS buffer swaps).
+                    # Instructions within the GR module (m0 writes) naturally pair with
+                    # their buffer_loads and don't need separate reservation.
+                    grModuleIds = set()
+                    for mid, inst in pathInsts:
+                        if isBufferLoad(inst):
+                            grModuleIds.add(mid)
+                    lastGrIdx = max(order.index(m) for m in grModuleIds if m in order)
+                    tailModuleIds = set(order[lastGrIdx + 1:])
+                    numTailInsts = sum(1 for mid, _ in pathInsts if mid in tailModuleIds)
+                    sched["bufLoadMaxSlot"] = max(0, rawMax - numTailInsts)
             limit = (totalSlots - 1) if hasWaitGR else 0
             failedIdx = None
             for idx, item in enumerate(pathInsts):

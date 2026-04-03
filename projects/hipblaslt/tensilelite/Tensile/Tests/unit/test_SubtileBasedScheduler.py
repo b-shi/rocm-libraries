@@ -549,6 +549,144 @@ def test_PGR2_256_256_1x1_extract_paths_from_before_deps():
     assert pathOrders1 == [[3, 4, 5, 1, 6], [2, 7]]
 
 
+def _classify_inst(inst):
+    """Classify an instruction into a single-char type tag."""
+    from rocisa.instruction import GlobalReadInstruction, LocalReadInstruction, MFMAInstruction
+    from Tensile.Components.SubtileBasedKernel import MXMFMAInstruction
+    if isinstance(inst, (MFMAInstruction, MXMFMAInstruction)):
+        return 'M'
+    if isinstance(inst, LocalReadInstruction):
+        return 'L'
+    if isinstance(inst, GlobalReadInstruction):
+        return 'G'
+    return 'S'
+
+
+def _get_scheduled_sequence(scheduler, writer, kernel, subIterK, scaleTiA=None, scaleTiB=None):
+    """Build emitted modules for a subIterK and return the instruction-scheduled type sequence."""
+    dtileInfo = writer.states.d.tileInfo
+    pss = scheduler.mainloopSteps[0]
+    dus = pss.subIterKSteps[subIterK]
+    emitted = scheduler._buildEmittedModules(writer, kernel, dus.modules, dtileInfo)
+    scheduled = SubtileBasedScheduler.instructionSchedule(emitted)
+    return ''.join(_classify_inst(i) for i in scheduled.flatitems())
+
+
+def _schedule_metrics(seq):
+    """Compute scheduling quality metrics from a type-tagged sequence string.
+
+    Returns (exposed, spacings) where:
+      exposed  - number of instructions beyond 2 per MFMA slot (0 = ideal)
+      spacings - list of MFMA-gap distances between consecutive buffer_loads
+    """
+    # Split into per-MFMA-slot buckets
+    slots = []
+    current = []
+    for ch in seq:
+        if ch == 'M':
+            slots.append(current)
+            current = []
+        else:
+            current.append(ch)
+    slots.append(current)  # after last MFMA
+
+    exposed = sum(max(0, len(s) - 2) for s in slots)
+
+    # Buffer load spacing: distance in MFMA count between consecutive G's
+    mfma_idx = 0
+    gr_mfma_positions = []
+    for ch in seq:
+        if ch == 'M':
+            mfma_idx += 1
+        elif ch == 'G':
+            gr_mfma_positions.append(mfma_idx)
+    spacings = [gr_mfma_positions[i + 1] - gr_mfma_positions[i]
+                for i in range(len(gr_mfma_positions) - 1)]
+    return exposed, spacings
+
+
+def test_PGR2_256_256_fp4_instruction_schedule_exact():
+    """Exact regression test for the mainloop instruction schedule (fp4 256x256)."""
+    kernel = create_kernel(256, 256, fp4=True)
+    tiA = TileInfo('A', kernel)
+    tiB = TileInfo('B', kernel)
+    scaleTiA = TileInfo('MXSA', kernel)
+    scaleTiB = TileInfo('MXSB', kernel)
+    lsgA = tiA.localSubtileGrid[0]
+    lsgB = tiB.localSubtileGrid[0]
+
+    cfg = SchedulerConfig(lsgA, lsgB, PrefetchMode.HALF_PREFETCH,
+                          VGPRTileReUseStrategy.ACROSS_SUBGROUP,
+                          SubgroupOrdering.COLUMN_MAJOR)
+    s = SubtileBasedScheduler(tiA, tiB, cfg,
+                              scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB)
+    writer = create_writer_with_tiles(kernel, tiA, tiB,
+                                      scaleTiA=scaleTiA, scaleTiB=scaleTiB)
+    s.allocVgprTiles(writer)
+    try:
+        seq0 = _get_scheduled_sequence(s, writer, kernel, 0)
+        seq1 = _get_scheduled_sequence(s, writer, kernel, 1)
+    finally:
+        s.deallocVgprTiles(writer)
+
+    # M=MFMA, L=LocalRead, G=GlobalRead(buffer_load), S=scalar ALU/wait/sync
+    expected_sik0 = \
+        "MLMLMLMLMLMLMLMLMLMLMLMLMLMLMLMLMMMMSSMSGMSMMMMGMSMMMMGMSMMMMGMSMMMMGM" \
+        "SMMMMGMSMMMMGMSMMMMGMMMMMMMM"
+    expected_sik1 = \
+        "MSGMSMMMMGMSMMMMGMSMMMMGMSMMMMGMSMMMMGMSMMMSMSSMSSMSSMSSMSSMSLMGLMSLMG" \
+        "LMSLMSLMGLMSLMSLMLMLMGLMSLMSLMSLMSLMSLMSLMSLMSLMSLMSLMSLMSLMSSMSSMSSMS" \
+        "SMS"
+
+    assert seq0 == expected_sik0, f"subIterK=0 mismatch:\n  got: {seq0}\n  exp: {expected_sik0}"
+    assert seq1 == expected_sik1, f"subIterK=1 mismatch:\n  got: {seq1}\n  exp: {expected_sik1}"
+
+
+def test_PGR2_256_256_fp4_instruction_schedule_metrics():
+    """Check scheduling quality: no exposed instructions, well-spaced buffer_loads."""
+    kernel = create_kernel(256, 256, fp4=True)
+    tiA = TileInfo('A', kernel)
+    tiB = TileInfo('B', kernel)
+    scaleTiA = TileInfo('MXSA', kernel)
+    scaleTiB = TileInfo('MXSB', kernel)
+    lsgA = tiA.localSubtileGrid[0]
+    lsgB = tiB.localSubtileGrid[0]
+
+    cfg = SchedulerConfig(lsgA, lsgB, PrefetchMode.HALF_PREFETCH,
+                          VGPRTileReUseStrategy.ACROSS_SUBGROUP,
+                          SubgroupOrdering.COLUMN_MAJOR)
+    s = SubtileBasedScheduler(tiA, tiB, cfg,
+                              scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB)
+    writer = create_writer_with_tiles(kernel, tiA, tiB,
+                                      scaleTiA=scaleTiA, scaleTiB=scaleTiB)
+    s.allocVgprTiles(writer)
+    try:
+        seq0 = _get_scheduled_sequence(s, writer, kernel, 0)
+        seq1 = _get_scheduled_sequence(s, writer, kernel, 1)
+    finally:
+        s.deallocVgprTiles(writer)
+
+    exposed0, spacings0 = _schedule_metrics(seq0)
+    exposed1, spacings1 = _schedule_metrics(seq1)
+
+    # No exposed instructions (nothing beyond 2 per MFMA slot)
+    assert exposed0 == 0, f"subIterK=0: {exposed0} exposed instructions"
+    assert exposed1 == 0, f"subIterK=1: {exposed1} exposed instructions"
+
+    # Buffer load spacing quality:
+    # - No gap larger than 12 MFMAs (avoid long stalls)
+    # - Standard deviation < 4 (reasonably uniform spread)
+    import statistics
+    for label, spacings in [("subIterK=0", spacings0), ("subIterK=1", spacings1)]:
+        assert len(spacings) > 0, f"{label}: no buffer_load spacings"
+        assert max(spacings) <= 12, (
+            f"{label}: max buffer_load gap {max(spacings)} > 12 MFMAs, spacings={spacings}")
+        if len(spacings) > 1:
+            sd = statistics.stdev(spacings)
+            assert sd < 4.0, (
+                f"{label}: buffer_load spacing stdev {sd:.1f} >= 4.0, spacings={spacings}")
+
+
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
