@@ -1374,23 +1374,6 @@ class SubtileBasedScheduler:
         print("NLL (No Load Loop):")
         self._printLoopSteps(self.nllSteps, indent="  ", **opts)
 
-    def printEmittedModules(self, writer, kernel, label, steps):
-        """Print EmittedModules for a loop section (before instructionSchedule).
-
-        Emits each subIterK into EmittedModules and prints per-module links.
-        """
-        dtileInfo = writer.states.d.tileInfo
-        print(f"\n{label} EmittedModules:")
-        for pss in steps:
-            print(f"  Partition {pss.partitionId}:")
-            for dus in pss.subIterKSteps:
-                print(f"    subIterK={dus.subIterK}:")
-                emitted = self._buildEmittedModules(writer, kernel, dus.modules, dtileInfo)
-                for em in emitted:
-                    beforeStr = str(em.before) if em.before is not None else "-"
-                    print(f"      id={em.moduleId} {em.opType}: {len(em.instructions)} insts "
-                          f"before=[{beforeStr}]")
-
     # Allocate totalVGPRTiles vpgrTile
     def allocVgprTiles(self, writer):
         """Allocate a shared VGPR tile array for A and B, indexed by the scheduler's vgprTileId.
@@ -1849,7 +1832,6 @@ class SubtileBasedScheduler:
             scaleLRSet = 1 - scaleSet if self.hasScale else scaleSet
         module = Module(label)
         module.addComment0(f"{label} start")
-        print("Emmitting loop :", label)
         for pss in steps:
             for dus in pss.subIterKSteps:
                 subModule = self._emitSubIterK(writer, kernel, pss, dus,
@@ -1859,21 +1841,3 @@ class SubtileBasedScheduler:
                 scaleSet, scaleLRSet = scaleLRSet, scaleSet
         return module
 
-    def generateCode(self, writer, kernel):
-        self.allocVgprTiles(writer)
-
-        preloop  = self._emitLoop(writer, kernel, "PRELOOP", self.preloopSteps)
-        mainloop = self._emitLoop(writer, kernel, "MAINLOOP", self.mainloopSteps)
-
-        ngll = Module("NGLL")
-        ngll.add(Label("SkipToNGLL", ""))
-        ngll.add(self._emitLoop(writer, kernel, "NGLL", self.ngllSteps))
-
-        nll = Module("NLL")
-        nll.add(Label("SkipToNLL", ""))
-        nll.add(self._emitLoop(writer, kernel, "NLL", self.nllSteps))
-
-        for label, module in [("PRELOOP", preloop), ("MAINLOOP", mainloop),
-                              ("NGLL", ngll), ("NLL", nll)]:
-            print(f"\n{label}:")
-            print(module)

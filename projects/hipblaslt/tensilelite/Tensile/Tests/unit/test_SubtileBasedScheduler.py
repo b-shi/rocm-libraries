@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 from Tensile.Components.SubtileBasedKernel import TileInfo
 from Tensile.Components.SubtileBasedScheduler import SubtileBasedScheduler, SchedulerConfig, PrefetchMode, VGPRTileReUseStrategy, SubgroupOrdering
+from rocisa.code import Module, Label
 from rocisa import rocIsa
 from rocisa.register import RegisterPool
 from rocisa.enum import RegisterType
@@ -478,7 +479,7 @@ NLL (No Load Loop):
     assert actual == expected
 
 
-def test_PGR2_64_64_1x1_emitted_modules_links():
+def test_PGR2_64_64_1x1_emitted_modules_links(verbose=False):
     MT0 = MT1 = 64
     kernel = create_kernel(MT0, MT1)
     tiA = TileInfo('A', kernel)
@@ -494,33 +495,40 @@ def test_PGR2_64_64_1x1_emitted_modules_links():
 
     s.allocVgprTiles(writer)
     try:
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            s.printEmittedModules(writer, kernel, "MAINLOOP", s.mainloopSteps)
-        actual = buf.getvalue()
+        dtileInfo = writer.states.d.tileInfo
+        pss = s.mainloopSteps[0]
+        emitted0 = s._buildEmittedModules(writer, kernel, pss.subIterKSteps[0].modules, dtileInfo)
+        emitted1 = s._buildEmittedModules(writer, kernel, pss.subIterKSteps[1].modules, dtileInfo)
     finally:
         s.deallocVgprTiles(writer)
 
-    expected = """\
-MAINLOOP EmittedModules:
-  Partition 0:
-    subIterK=0:
-      id=0 mfma: 4 insts before=[-]
-      id=1 lr: 4 insts before=[-]
-      id=2 gr: 4 insts before=[4]
-      id=3 wait_lr: 1 insts before=[1]
-      id=4 sync: 1 insts before=[3]
-    subIterK=1:
-      id=0 mfma: 4 insts before=[-]
-      id=1 lr: 4 insts before=[5]
-      id=2 gr: 4 insts before=[-]
-      id=3 wait_gr: 1 insts before=[-]
-      id=4 sync: 1 insts before=[3]
-      id=5 lr_inc: 6 insts before=[4]
-      id=6 wait_lr: 1 insts before=[1]
-      id=7 gr_inc: 10 insts before=[2]
-"""
-    assert expected in actual
+    sig = lambda ems: [(em.moduleId, em.opType, len(em.instructions), em.before) for em in ems]
+
+    assert sig(emitted0) == [
+        (0, "mfma", 4, None),
+        (1, "lr", 4, None),
+        (2, "gr", 4, 4),
+        (3, "wait_lr", 1, 1),
+        (4, "sync", 1, 3),
+    ]
+    assert sig(emitted1) == [
+        (0, "mfma", 4, None),
+        (1, "lr", 4, 5),
+        (2, "gr", 4, None),
+        (3, "wait_gr", 1, None),
+        (4, "sync", 1, 3),
+        (5, "lr_inc", 6, 4),
+        (6, "wait_lr", 1, 1),
+        (7, "gr_inc", 10, 2),
+    ]
+
+    if verbose:
+        for label, emitted in [("subIterK=0", emitted0), ("subIterK=1", emitted1)]:
+            print(f"  {label}:")
+            for em in emitted:
+                beforeStr = str(em.before) if em.before is not None else "-"
+                print(f"    id={em.moduleId} {em.opType}: {len(em.instructions)} insts "
+                      f"before=[{beforeStr}]")
 
 
 def test_PGR2_256_256_1x1_extract_paths_from_before_deps():
@@ -755,10 +763,15 @@ if __name__ == "__main__":
     # s.printSchedule()
 
     s.allocVgprTiles(writer)
-    s.printEmittedModules(writer, kernel, "MAINLOOP", s.mainloopSteps)
-    s.deallocVgprTiles(writer)
 
-    s.generateCode(writer, kernel)
+    preloop  = s._emitLoop(writer, kernel, "PRELOOP", s.preloopSteps)
+    mainloop = s._emitLoop(writer, kernel, "MAINLOOP", s.mainloopSteps)
+    ngll = Module("NGLL")
+    ngll.add(Label("SkipToNGLL", ""))
+    ngll.add(s._emitLoop(writer, kernel, "NGLL", s.ngllSteps))
+    nll = Module("NLL")
+    nll.add(Label("SkipToNLL", ""))
+    nll.add(s._emitLoop(writer, kernel, "NLL", s.nllSteps))
     # kernel = create_kernel()
     # tiA = TileInfo('A', kernel)
     # tiB = TileInfo('B', kernel)
