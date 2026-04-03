@@ -182,8 +182,9 @@ globalParameters["DataInitTypeScaleD"] = 2
 globalParameters["DataInitTypeScaleAlphaVec"] = 3
 globalParameters["DataInitTypeMXSA"] = 1
 globalParameters["DataInitTypeMXSB"] = 1
-globalParameters["MXScaleBlockI"] = 0  # Tile row index for MXScaleSparseBlock/Random init modes
-globalParameters["MXScaleBlockJ"] = 0  # Tile col index for MXScaleSparseBlock/Random init modes
+# In MXScaleSparseBlock/Random modes, (I,J) selects the only scale block with non-zero init values; all other blocks are zero
+globalParameters["MXScaleBlockI"] = 0  # tile row index
+globalParameters["MXScaleBlockJ"] = 0  # tile col index
 globalParameters["DataInitValueActivationArgs"] = [2.0, 2.0]
 globalParameters["CEqualD"] = (
     False  # Set to true if testing for the case where the pointer to C is the same as D.
