@@ -4321,7 +4321,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
       # TMP HACK to still use legacy path for PGR=0
       for tileInfo in [atileInfo, btileInfo]:
         tileInfo.allocVgprTileRegisters(self, kernel)
-      
+
       for tileInfo in [mxsatileInfo, mxsbtileInfo]:
         if tileInfo:
           tileInfo.allocVgprTileRegisters(self, kernel)
@@ -4329,7 +4329,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
     for tileInfo in [dtileInfo]:
         tileInfo.allocVgprTileRegisters(self, kernel)
 
-    
+
 
     module.add(initVgprTilesToZero(self, kernel, dtileInfo))
 
@@ -5810,6 +5810,8 @@ class KernelWriter(metaclass=abc.ABCMeta):
       self.ldsTotalSize = sizeA + sizeB + sizeMXSA + sizeMXSB
 
       kernel["LdsNumBytes"] = max(1, int(self.ldsTotalSize * kernel["NumLdsBlk"]))
+      if kernel["LdsNumBytes"] > self.states.archCaps["DeviceLDS"]:
+        self.states.overflowedResources = 8
 
 
     #print(self.states.a.tileInfo.getLocalSubtileId(1,0))
@@ -8125,26 +8127,22 @@ class KernelWriter(metaclass=abc.ABCMeta):
     else:
       self.defineSgpr("LocalWriteBaseAddrA", 1)
       self.defineSgpr("LocalWriteBaseAddrB", 1)
-      self.defineSgpr("LocalWriteSwapA", 1)
-      self.defineSgpr("LocalWriteSwapB", 1)
       if kernel["ProblemType"]["MXBlockA"]:
         self.defineSgpr("LocalWriteBaseAddrMXSA", 1)
-        self.defineSgpr("LocalWriteSwapMXSA", 1)
       if kernel["ProblemType"]["MXBlockB"]:
         self.defineSgpr("LocalWriteBaseAddrMXSB", 1)
-        self.defineSgpr("LocalWriteSwapMXSB", 1)
 
     # Allocate registers to swap between lds buffers
-    if self.states.useCommonSgprSwap:
+    if self.states.useCommonSgprSwap and not kernel["UseSubtileImpl"]:
       self.defineSgpr("SwapCommon", 1)
-    elif kernel["StoreSwapAddr"]:
-      if kernel["LocalWriteUseSgprA"]:
+    elif kernel["StoreSwapAddr"] or kernel["UseSubtileImpl"]:
+      if kernel["LocalWriteUseSgprA"] or kernel["UseSubtileImpl"]:
         self.defineSgpr("SwapA", 1)
-      if kernel["LocalWriteUseSgprB"]:
+      if kernel["LocalWriteUseSgprB"] or kernel["UseSubtileImpl"]:
         self.defineSgpr("SwapB", 1)
-      if kernel["ProblemType"]["MXBlockA"] and kernel["LocalWriteUseSgprMXSA"]:
+      if kernel["ProblemType"]["MXBlockA"] and (kernel["LocalWriteUseSgprMXSA"] or kernel["UseSubtileImpl"]):
           self.defineSgpr("SwapMXSA", 1)
-      if kernel["ProblemType"]["MXBlockB"] and kernel["LocalWriteUseSgprMXSB"]:
+      if kernel["ProblemType"]["MXBlockB"] and (kernel["LocalWriteUseSgprMXSB"] or kernel["UseSubtileImpl"]):
           self.defineSgpr("SwapMXSB", 1)
       if kernel["ProblemType"]["Sparse"] and kernel["LocalWriteUseSgprMetadata"]:
         self.defineSgpr("SwapMetadata", 1)
@@ -8161,17 +8159,31 @@ class KernelWriter(metaclass=abc.ABCMeta):
       self.defineSgpr("GSU", 1)  # Can't move to the front because of the preload arguments
 
     if kernel["StreamK"]:
-      # StreamK vars.
+      requiredUnalignedSKVar = []
       if not self.isStreamKConstantsToVgprEnabled(kernel):
-        self.defineSgpr("StreamKIdx", 1)
-      self.defineSgpr("StreamKIter", 1)
-      self.defineSgpr("StreamKIterEnd", 1)
-      self.defineSgpr("StreamKLocalStart", 1)
-      self.defineSgpr("StreamKLocalEnd", 1)
+        requiredUnalignedSKVar.append("StreamKIdx")
+      requiredUnalignedSKVar += [
+        "StreamKIter",
+        "StreamKIterEnd",
+        "StreamKLocalStart",
+        "StreamKLocalEnd",
+      ]
+      requiredAligned4SKVar = []
+
       if len(kernel["SpaceFillingAlgo"]):
-        self.defineSgpr("StreamKTileID", 1)
+        requiredUnalignedSKVar.append("StreamKTileID")
+
       if kernel["StreamKAtomic"] == 0:
-        self.defineSgpr("SrdWS", 4, 4)
+        requiredAligned4SKVar.append("SrdWS")
+
+      while len(requiredUnalignedSKVar) or len(requiredAligned4SKVar):
+        if self.sgprPool.size() % 4 == 0 and len(requiredAligned4SKVar):
+          var = requiredAligned4SKVar.pop()
+          self.defineSgpr(var, 4, 4)
+        elif len(requiredUnalignedSKVar):
+          var = requiredUnalignedSKVar.pop()
+          self.defineSgpr(var, 1)
+
     # These SGPRs aren't used right away, add them to sgpr pool temporarily
     if self.states.doShadowInit and kernel["BufferStore"]:
       self.addSgprVarToPool("SrdC")
