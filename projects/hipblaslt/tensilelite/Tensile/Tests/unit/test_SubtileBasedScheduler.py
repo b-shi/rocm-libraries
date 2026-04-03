@@ -23,7 +23,7 @@ def _mock_dtype(num_bytes=2):
 
 def create_kernel(MT0=256, MT1=256, fp4=False):
     mxblock = 32 if fp4 else 0
-    bpe = 1 if fp4 else 2
+    bpe = 0.5 if fp4 else 2
     matrixInstK = 128 if fp4 else 32
     depthU = 256 if fp4 else 64
     dtype = _mock_dtype(bpe)
