@@ -582,6 +582,8 @@ class SubtileBasedScheduler:
 
     def _computePartitionGRs(self, preloadedMTn1_A: Set[int], preloadedMTn1_B: Set[int]) -> Dict[int, PartitionGR]:
         """Compute each partition's GR target (mtIteration, targetPartition, subtiles).
+        Current behavior is : load MT n+1, partition + 1.
+        TODO. Change this to allow better GR spreading accross partition when using multi-partitions config
 
         Args:
             preloadedMTn1_A/B: MT n+1 subtiles already loaded by the preloop's GR(MT 1).
