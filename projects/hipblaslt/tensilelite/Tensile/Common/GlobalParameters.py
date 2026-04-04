@@ -161,9 +161,11 @@ globalParameters["CSVMergeSameProblemID"] = False
 #       - Problem-Independent: 0=0, 1=1, 2=2, 3=rand, 4=Nan, 5=Infinity, 6=BadInput(Nan), 7=BadOutput(Inf), 16=RandomNarrow,
 #                              21=RandomNegPosLimited(-128~128 or -1~1), 23~26=Ind Cos/Sin Abs or Not
 #       - Problem-dependent: 8=SerialID, 9=SerialDim0, 10=SerialDim1, 11=Identity, 12~15= Cos/Sin, Abs or Not
+#       - MXScale-specific (problem-dependent): 27=MXScaleBlockSerial, 28=MXScaleSparseBlock, 29=MXScaleSparseBlockRandom
 #       For A, B, C, D: All the InitMode (0~16) can be used
 #       For Alpha/Beta: Only problem-independent init (0~7, 16, 23~26) can be used,
 #                       problem-dependent init (8~15) would cause a exception (Invalid InitMode) in New Client
+#       For MXSA/MXSB: Also supports 27~29 for scale-tile-aware init patterns
 globalParameters["DataInitTypeAB"] = 3
 globalParameters["DataInitTypeA"] = -1
 globalParameters["DataInitTypeB"] = -1
@@ -180,6 +182,9 @@ globalParameters["DataInitTypeScaleD"] = 2
 globalParameters["DataInitTypeScaleAlphaVec"] = 3
 globalParameters["DataInitTypeMXSA"] = 1
 globalParameters["DataInitTypeMXSB"] = 1
+# In MXScaleSparseBlock/Random modes, (I,J) selects the only scale block with non-zero init values; all other blocks are zero
+globalParameters["MXScaleBlockI"] = 0  # tile row index
+globalParameters["MXScaleBlockJ"] = 0  # tile col index
 globalParameters["DataInitValueActivationArgs"] = [2.0, 2.0]
 globalParameters["CEqualD"] = (
     False  # Set to true if testing for the case where the pointer to C is the same as D.
