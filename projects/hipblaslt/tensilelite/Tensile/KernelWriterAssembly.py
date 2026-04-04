@@ -2108,20 +2108,22 @@ class KernelWriterAssembly(KernelWriter):
       # B address interleave (restricted) - compute runtime G once and reuse later.
       if kernel["BAddrInterleave"]:
         moduleRegInit.addComment1("Interleave: define SGPR and init runtime G once")
-        sgprG  = self.defineSgprIdx("BInterleaveG", 1)
+        self.removeSgprVarFromPool("BInterleaveG")
+        sgprG = self.sgprs["BInterleaveG"]
+        moduleRegInit.add(RegSet("s", "sgprBInterleaveG", sgprG))
         if "BInterleaveG" not in self.states.nonPostLoopSgpr:
           self.states.nonPostLoopSgpr.append("BInterleaveG")
-        moduleRegInit.add(RegSet("s", "sgprBInterleaveG", sgprG))
         moduleRegInit.addModuleAsFlatItems(self.initBInterleaveG(kernel))
 
       # K ring-shift (restricted) - compute per-WG shift once and reuse later.
       if kernel["KRingShift"]:
         moduleRegInit.addComment1("KRS: KRingShift define SGPR and init per-WG shift once")
-        sgprShift = self.defineSgprIdx("KRingShift", 1)
+        self.removeSgprVarFromPool("KRingShift")
+        sgprShift = self.sgprs["KRingShift"]
+        moduleRegInit.add(RegSet("s", "sgprKRingShift", sgprShift))
         # Keep this SGPR live into post-loop (tail + store) - prevent endSummation from undefining it.
         if "KRingShift" not in self.states.nonPostLoopSgpr:
           self.states.nonPostLoopSgpr.append("KRingShift")
-        moduleRegInit.add(RegSet("s", "sgprKRingShift", sgprShift))
 
     self.sgprPool.checkIn(sgprPackedArgs)
 

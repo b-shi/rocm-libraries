@@ -7238,21 +7238,50 @@ class KernelWriter(metaclass=abc.ABCMeta):
 
     if kernel["StreamK"]:
       # StreamK vars
-      self.defineSgpr("StreamKIdx", 1)
-      self.defineSgpr("StreamKIter", 1)
-      self.defineSgpr("StreamKIterEnd", 1)
-      self.defineSgpr("StreamKLocalStart", 1)
-      self.defineSgpr("StreamKLocalEnd", 1)
+      # Specify list of SK Variables we need to allocate in a list first
+      # to allow allocation in a order to minimize allocation holes due to
+      # alignment
+      requiredUnalignedSKVar = [
+        "StreamKIdx",
+        "StreamKIter",
+        "StreamKIterEnd",
+        "StreamKLocalStart",
+        "StreamKLocalEnd",
+      ]
+      requiredAligned4SKVar = []
+
       if len(kernel["SpaceFillingAlgo"]):
-        self.defineSgpr("StreamKTileID", 1)
+        requiredUnalignedSKVar.append("StreamKTileID")
+
       if kernel["StreamKAtomic"] == 0:
-        self.defineSgpr("SrdWS", 4, 4)
+        requiredAligned4SKVar.append("SrdWS")
+
+      # Actual allocation of SGPRs
+      # Prioritize SGPRs what require alignment first
+      #
+      while len(requiredUnalignedSKVar) or len(requiredAligned4SKVar):
+        if self.sgprPool.size() % 4 == 0 and len(requiredAligned4SKVar):
+          var = requiredAligned4SKVar.pop()
+          self.defineSgpr(var, 4, 4)
+        elif len(requiredUnalignedSKVar):
+          var = requiredUnalignedSKVar.pop()
+          self.defineSgpr(var, 1)
 
     # These SGPRs aren't used right away, add them to spr pool temporarily
     if self.states.doShadowInit and kernel["BufferStore"]:
       self.addSgprVarToPool("SrdC")
     if kernel["StreamK"] and kernel["StreamKAtomic"] == 0:
       self.addSgprVarToPool("SrdWS")
+
+    # Define BInterleaveG and KRingShift early (before scratch checkOuts in
+    # defineAndResources) so they get high pool indices that won't collide with
+    # freeSgprVarPool members. Add to pool temporarily; removed at the point of use.
+    if kernel["BAddrInterleave"]:
+      self.defineSgpr("BInterleaveG", 1)
+      self.addSgprVarToPool("BInterleaveG")
+    if kernel["KRingShift"]:
+      self.defineSgpr("KRingShift", 1)
+      self.addSgprVarToPool("KRingShift")
 
     #------------------------
     # Registers defined below this point are not available in the post-loop
