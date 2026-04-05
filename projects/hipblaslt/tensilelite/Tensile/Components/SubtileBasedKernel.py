@@ -1,41 +1,46 @@
-
+import math
+from collections import deque
+from contextlib import contextmanager
+from copy import deepcopy
+from dataclasses import dataclass, field
+from typing import Dict, List, NamedTuple, Optional, Tuple, Type
 
 from ..Common import printWarning, roundUp, print2, DebugConfig, DataDirection, \
   INDEX_CHARS, IsaVersion
 
-
-from rocisa.code import Module, TextBlock, StructuredModule, KernelBody, Label
-from rocisa.label import LabelManager
-
-from rocisa.container import MUBUFModifiers, vgpr, sgpr, accvgpr, mgpr
-from rocisa.enum import InstType, SelectBit, CacheScope
-from rocisa.instruction import MFMAInstruction
-
-import math
-from copy import deepcopy
-from dataclasses import dataclass, field
-from typing import Dict, List, NamedTuple, Optional,Tuple, Type
-from contextlib import contextmanager
-from collections import deque
 from rocisa import rocIsa, countInstruction, countGlobalRead, \
-            countLocalRead, countLocalWrite, countDSStoreB256, getMFMAs
-from rocisa.code import Module, TextBlock, StructuredModule, KernelBody
-from rocisa.container import RegisterContainer, replaceHolder, HWRegContainer, VCC, vgpr, sgpr, DPPModifiers, DSModifiers, EXEC, VOP3PModifiers
-from rocisa.label import LabelManager
+  countLocalRead, countLocalWrite, countDSStoreB256, getMFMAs
 from rocisa.asmpass import rocIsaPass, rocIsaPassOption
-from rocisa.instruction import BufferLoadB128, BufferLoadB32, BufferLoadB64, \
-  BufferLoadD16B16, BufferLoadD16U8, DSLoad2B32, DSLoad2B64, DSLoadB128, \
-  DSLoadB32, DSLoadB64, DSLoadB64TrB16, DSLoadInstruction, DSLoadU16, \
-  DSLoadU8, DSStore2B32, DSStore2B64, DSStoreB128, DSStoreB16, DSStoreB256, \
-  DSStoreB32, DSStoreB64, DSStoreB8, DSStoreInstruction, FlatLoadB128, FlatLoadB32, \
-  FlatLoadB64, FlatStoreB128, FlatStoreB32, FlatStoreB64, Instruction, MacroInstruction, \
-  MFMAInstruction, MXMFMAInstruction, SAddU32, SAddCU32, SBarrier, SBranch, SCBranchSCC0, SCBranchSCC1, SCBranchVCCNZ, SCmpEQU32, SCmpLeU32, \
-  SLShiftLeftB32, SMFMAInstruction, SNop, SSetPrior, SSetRegIMM32B32, SSubU32, SSubBU32, SWaitCnt, SWaitAlu, SXorB32, \
-  SLongBranchPositive, VAccvgprWrite, VFmaMixF32, VMadMixF32, VMovB32, VAndB32, VCmpXEqU32, VCndMaskB32, VReadfirstlaneB32, \
-  VMovB64, VLShiftRightB32, VLShiftLeftB32, VMulLOU32, VAddU32, VAddCOU32, VAddCCOU32, VXorB32, \
-  SMovB32, SMulI32, FlatStoreB32, SWaitCnt, SMovB64, VSubU32, VPermlane16SwapB32, MFMAInstruction
+from rocisa.code import KernelBody, Label, Module, StructuredModule, TextBlock
+from rocisa.container import (
+  DPPModifiers, DSModifiers, EXEC, HWRegContainer, MUBUFModifiers,
+  RegisterContainer, VCC, VOP3PModifiers,
+  accvgpr, mgpr, replaceHolder, sgpr, vgpr,
+)
+from rocisa.enum import CacheScope, DataTypeEnum, InstType, RegisterType, SelectBit
+from rocisa.instruction import (
+  BufferLoadB128, BufferLoadB32, BufferLoadB64,
+  BufferLoadD16B16, BufferLoadD16U8,
+  DSLoad2B32, DSLoad2B64, DSLoadB128, DSLoadB32, DSLoadB64,
+  DSLoadB64TrB16, DSLoadInstruction, DSLoadU16, DSLoadU8,
+  DSStore2B32, DSStore2B64, DSStoreB128, DSStoreB16, DSStoreB256,
+  DSStoreB32, DSStoreB64, DSStoreB8, DSStoreInstruction,
+  FlatLoadB128, FlatLoadB32, FlatLoadB64,
+  FlatStoreB128, FlatStoreB32, FlatStoreB64,
+  Instruction, MacroInstruction,
+  MFMAInstruction, MXMFMAInstruction, SMFMAInstruction,
+  SAddCU32, SAddU32, SBarrier, SBranch,
+  SCBranchSCC0, SCBranchSCC1, SCBranchVCCNZ,
+  SCmpEQU32, SCmpLeU32, SLShiftLeftB32, SLongBranchPositive,
+  SMovB32, SMovB64, SMulI32, SNop,
+  SSetPrior, SSetRegIMM32B32, SSubBU32, SSubU32, SWaitAlu, SWaitCnt, SXorB32,
+  VAccvgprWrite, VAddCCOU32, VAddCOU32, VAddU32, VAndB32,
+  VCmpXEqU32, VCndMaskB32, VFmaMixF32, VMadMixF32,
+  VLShiftLeftB32, VLShiftRightB32, VMovB32, VMovB64,
+  VMulLOU32, VPermlane16SwapB32, VReadfirstlaneB32, VSubU32, VXorB32,
+)
+from rocisa.label import LabelManager
 from rocisa.register import RegisterPool
-from rocisa.enum import RegisterType, DataTypeEnum
 # Store various scheduling info
 class ScheduleInfo:
 
@@ -1487,7 +1492,6 @@ def globalReadLDSBufferSwap(tc, writer, kernel):
   module = Module()
   module.addComment0("Emit code to swap %s GR m0 offsets"%tc)
   module.add(SXorB32(dst=sgpr("LocalWriteBaseAddr%s"%tc), src0=sgpr("LocalWriteBaseAddr%s"%tc), src1=sgpr("Swap%s"%tc), comment=""))
-  #module.add(SMovB32(dst=sgpr("LocalWriteBaseAddr%s"%tc), src=sgpr("Swap%s"%tc), comment=""))
   return module
 
 ##################################################
