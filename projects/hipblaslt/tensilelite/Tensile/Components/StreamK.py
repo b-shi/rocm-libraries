@@ -197,9 +197,10 @@ class StreamK(Component):
             _DepthU = (_DepthU * 16)
         elif (tP["isSwizzled"] and tc == 'B'):
             _DepthU = (_DepthU * 16)
-        elif tc in ("MXSA", "MXSB"):
-            # MX swizzled(pre shuffle) case, swizzled block size is 32 * 256
-            # Number of block is DepthU // 256 (assuming DepthU is multiple of 256)
+        elif tc in ("MXSA", "MXSB") and kernel.get("UseSubtileImpl"):
+            # UseSubtileImpl MX swizzled(pre shuffle) case: swizzled block size is 32 * 256,
+            # so the effective K stride for the scale tensor is DepthU * 32.
+            # Non-subtile MX kernels use the raw _DepthU (scale elements per tile in K).
             _DepthU = (_DepthU * 32)
 
         tileStart = sTmp + 2
@@ -1034,9 +1035,14 @@ class StreamK(Component):
             element = batchElements[elementIdx]
             addrCalc: AddrCalculation = ss.elementAddr[elementIdx]
             addr = addrCalc.addrDVgpr
-            # TODO: Check this later, updates vgpr indices to account for vgprValuC macro value
-            # previously this was assumes to zero. Need to check if this is the only change needed
-            sumIdx = ss.elementSumIdx[elementIdx] + writer.states.c.startVgprValu
+            # For UseSubtileImpl, vgprValuC is remapped; add the base offset so the
+            # WS store reads from the correct accumulator VGPRs.  For the regular path
+            # (non-subtile), startVgprValu is already accounted for by the vgprValuC
+            # assembler macro, so no offset is needed (matches rebase behaviour).
+            if kernel.get("UseSubtileImpl"):
+                sumIdx = ss.elementSumIdx[elementIdx] + writer.states.c.startVgprValu
+            else:
+                sumIdx = ss.elementSumIdx[elementIdx]
             storeWidth = kernel["StoreVectorWidth"]
             # storeWidth = 2
             if batchIdx == 0 and elementIdx == 0:
