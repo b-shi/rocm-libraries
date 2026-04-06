@@ -5037,9 +5037,6 @@ class KernelWriter(metaclass=abc.ABCMeta):
 
     self.asmAssert = Assert(self.states.laneSGPRCount, kernel["WavefrontSize"], self.db["EnableAsserts"])
 
-
-    print("================= Macro Tile config: %u x %u x %u ========================"%(kernel["MacroTile0"], kernel["MacroTile1"], kernel["DepthU"]))
-
     def initSubTileInfo(tc):
       tileMap = {
         'A' : self.states.a,
@@ -7275,6 +7272,16 @@ class KernelWriter(metaclass=abc.ABCMeta):
       self.addSgprVarToPool("SrdC")
     if kernel["StreamK"] and kernel["StreamKAtomic"] == 0:
       self.addSgprVarToPool("SrdWS")
+
+    # Define BInterleaveG and KRingShift early (before scratch checkOuts in
+    # defineAndResources) so they get high pool indices that won't collide with
+    # freeSgprVarPool members. Add to pool temporarily; removed at the point of use.
+    if kernel["BAddrInterleave"]:
+      self.defineSgpr("BInterleaveG", 1)
+      self.addSgprVarToPool("BInterleaveG")
+    if kernel["KRingShift"]:
+      self.defineSgpr("KRingShift", 1)
+      self.addSgprVarToPool("KRingShift")
 
     #------------------------
     # Registers defined below this point are not available in the post-loop

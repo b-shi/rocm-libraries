@@ -44,7 +44,6 @@ def joblibParallelSupportsGenerator():
 def CPUThreadCount(enable=True):
     from .GlobalParameters import globalParameters
 
-    return 1
     if not enable:
         return 1
     else:

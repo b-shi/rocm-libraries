@@ -2108,20 +2108,22 @@ class KernelWriterAssembly(KernelWriter):
       # B address interleave (restricted) - compute runtime G once and reuse later.
       if kernel["BAddrInterleave"]:
         moduleRegInit.addComment1("Interleave: define SGPR and init runtime G once")
-        sgprG  = self.defineSgprIdx("BInterleaveG", 1)
+        self.removeSgprVarFromPool("BInterleaveG")
+        sgprG = self.sgprs["BInterleaveG"]
+        moduleRegInit.add(RegSet("s", "sgprBInterleaveG", sgprG))
         if "BInterleaveG" not in self.states.nonPostLoopSgpr:
           self.states.nonPostLoopSgpr.append("BInterleaveG")
-        moduleRegInit.add(RegSet("s", "sgprBInterleaveG", sgprG))
         moduleRegInit.addModuleAsFlatItems(self.initBInterleaveG(kernel))
 
       # K ring-shift (restricted) - compute per-WG shift once and reuse later.
       if kernel["KRingShift"]:
         moduleRegInit.addComment1("KRS: KRingShift define SGPR and init per-WG shift once")
-        sgprShift = self.defineSgprIdx("KRingShift", 1)
+        self.removeSgprVarFromPool("KRingShift")
+        sgprShift = self.sgprs["KRingShift"]
+        moduleRegInit.add(RegSet("s", "sgprKRingShift", sgprShift))
         # Keep this SGPR live into post-loop (tail + store) - prevent endSummation from undefining it.
         if "KRingShift" not in self.states.nonPostLoopSgpr:
           self.states.nonPostLoopSgpr.append("KRingShift")
-        moduleRegInit.add(RegSet("s", "sgprKRingShift", sgprShift))
 
     self.sgprPool.checkIn(sgprPackedArgs)
 
@@ -3960,12 +3962,16 @@ class KernelWriterAssembly(KernelWriter):
     isMX = tc in ("MXSA", "MXSB")
     useFixedSrd2 = False # True means use fixed Srd+2 value. No need to calculate tensor2dSize, ShadowLimit
     if isMX:
-      useFixedSrd2 = True
       tcab = "A" if tc == "MXSA" else "B"
       mxBlock = kernel["ProblemType"]["MXBlock%s"%tcab]
       mxSwizzleSize0 = 32 # M,N direction
       mxSwizzleSize1 = 256 # K direction
       mxSwizzleBlockSize = mxSwizzleSize0 * mxSwizzleSize1 // mxBlock
+      # UseSubtileImpl uses swizzled (pre-shuffled) scale layout; a simpler fixed
+      # tile-boundary limit replaces the full tensor2dSize computation.
+      # Non-subtile MX kernels use the standard tensor2dSize path (same as rebase).
+      if kernel.get("UseSubtileImpl"):
+        useFixedSrd2 = True
     allocateTensor2dSize = use64bShadowLimit and not isMX
     numDim = len(indices)
     with self.allocTmpSgpr(2 + 2 + (0 if allocateTensor2dSize else 2)) as tmpSgprInfo:
@@ -3990,8 +3996,8 @@ class KernelWriterAssembly(KernelWriter):
         #tP['ia'][1]
 
         # This is guaranteed to fit in 32-bit since the WG*MT is a number of elements in some unsigned direction:
-        if isMX:
-          # MX (pre shuffle) case, wg * roundup(mt/mxSwizzleBlockSize0)
+        if isMX and kernel.get("UseSubtileImpl"):
+          # UseSubtileImpl MX swizzled (pre-shuffle) case: tile start uses roundup(MT/mxSwizzleSize0)
           mt = roundUp(kernel[tP["mt"]] / mxSwizzleSize0)
           module.addModuleAsFlatItems(self.s_mul_u64_u32(sgpr(tileStart+0), sgpr(tileStart+1), sgpr(tP["wg"]), mt, comment="WorkGroup[01] * roundup(MT/%u)"%mxSwizzleSize0))
         else:
@@ -4042,8 +4048,8 @@ class KernelWriterAssembly(KernelWriter):
           module.add(SMovB32(dst=sgpr(tileStart+1), src=0))
         strideF = self.strideRef(tc, tP['tileIdx'])
         if not self.isConstUnitStride(strideF):
-          if isMX:
-            # MX (pre shuffle) case, stride = (roundup(sizeL/mxSwizzleSize1) * (mxSwizzleSize0*mxSwizzleSize1/mxBlock))
+          if isMX and kernel.get("UseSubtileImpl"):
+            # UseSubtileImpl MX swizzled (pre-shuffle) case: SRD+2 limit uses tile-boundary formula
             for i in range(0, numDim):
               idx = indices[i]
               if idx == kernel["ProblemType"]["Index0"] or idx == kernel["ProblemType"]["Index1"]:
@@ -4078,7 +4084,9 @@ class KernelWriterAssembly(KernelWriter):
         module.add(SMovB64(dst=sgpr(tileStart, 2), src=0, comment="set default tileStart"))
 
       #Calculate tensor 2d size
-      if not isMX:
+      # For UseSubtileImpl MX kernels, useFixedSrd2=True so tensor2dSize is not needed.
+      # For non-subtile MX kernels and all non-MX kernels, always initialize tensor2dSize.
+      if not isMX or not kernel.get("UseSubtileImpl"):
         if use64bShadowLimit or ((not use64bShadowLimit) and tensor2dSize0 % 2 == 0):
           module.add(SMovB64(dst=sgpr(tensor2dSize0, 2), src=0x1, comment="Init tensor size"))
         else:
