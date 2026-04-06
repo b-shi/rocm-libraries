@@ -436,6 +436,7 @@ defaultBenchmarkCommonParameters = [
     {"BAddrInterleave": [False]},
     {"KRingShift": [False]},
     {"DirectToLds": [0]},
+    {"UseSubtileImpl": [False]},
     {"UseSgprForGRO": [-1]},
     {"UseInstOffsetForGRO": [0]},
     {"AssertSummationElementMultiple": [1]},

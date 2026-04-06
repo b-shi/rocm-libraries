@@ -1924,7 +1924,7 @@ namespace TensileLite
 
                 auto& pristineA
                     = m_vdata[ContractionProblemGemm::TENSOR::A].pristine[rocisa::DataType::Float4];
-                auto& pristineE8A
+                auto& pristineMXScaleA
                     = m_vdata[ContractionProblemGemm::TENSOR::MXSA].pristine[problem.mxsa().dataType()];
 
                 auto initMethodA = InitModeToMXInitMethod(
@@ -1936,7 +1936,7 @@ namespace TensileLite
                 generateMXInput((hipDataType)HIP_R_4F_E2M1,
                                 hipMxScaleTypeForDataGenerator(problem.mxTypeA()),
                                 pristineA.cpuInput.valid.get(),
-                                pristineE8A.cpuInput.valid.get(),
+                                pristineMXScaleA.cpuInput.valid.get(),
                                 rows,
                                 cols,
                                 stride,
@@ -1987,7 +1987,7 @@ namespace TensileLite
 
                 auto& pristineB
                     = m_vdata[ContractionProblemGemm::TENSOR::B].pristine[rocisa::DataType::Float4];
-                auto& pristineE8B
+                auto& pristineMXScaleB
                     = m_vdata[ContractionProblemGemm::TENSOR::MXSB].pristine[problem.mxsb().dataType()];
 
                 auto initMethodB = InitModeToMXInitMethod(
@@ -1999,7 +1999,7 @@ namespace TensileLite
                 generateMXInput((hipDataType)HIP_R_4F_E2M1,
                                 hipMxScaleTypeForDataGenerator(problem.mxTypeB()),
                                 pristineB.cpuInput.valid.get(),
-                                pristineE8B.cpuInput.valid.get(),
+                                pristineMXScaleB.cpuInput.valid.get(),
                                 rows,
                                 cols,
                                 stride,

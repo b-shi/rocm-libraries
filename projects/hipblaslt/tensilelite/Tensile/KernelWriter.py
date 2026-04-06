@@ -5757,7 +5757,6 @@ class KernelWriter(metaclass=abc.ABCMeta):
     self.asmAssert = Assert(self.states.laneSGPRCount, kernel["WavefrontSize"], self.db["EnableAsserts"])
 
 
-
     print("================= Macro Tile config: %u x %u x %u ========================"%(kernel["MacroTile0"], kernel["MacroTile1"], kernel["DepthU"]))
 
     def initSubTileInfo(tc):
@@ -8190,8 +8189,13 @@ class KernelWriter(metaclass=abc.ABCMeta):
     if kernel["StreamK"] and kernel["StreamKAtomic"] == 0:
       self.addSgprVarToPool("SrdWS")
     # gfx1250 frees the SK constant SGPRs later in moveStreamKConstantsToVgpr
-    # after their values have been copied to VGPRs. Freeing them here would let
-    # temp allocs clobber kernel arguments before they are copied.
+    if kernel["BAddrInterleave"]:
+      self.defineSgpr("BInterleaveG", 1)
+      self.addSgprVarToPool("BInterleaveG")
+    if kernel["KRingShift"]:
+      self.defineSgpr("KRingShift", 1)
+      self.addSgprVarToPool("KRingShift")
+
     #------------------------
     # Registers defined below this point are not available in the post-loop
     # Post-loop is after tail loop exits, ie the store code.

@@ -633,12 +633,7 @@ class Solution(collections.abc.Mapping):
         state["UseMFMAF32XEmulation"] = True # MFMA version for gfx950 etc.
 
     state["MfmaInitCVgprs"] = False
-    # TODOBS: This is currently hardcoded, will need to add logic to enable this
-    # selectively.
-    #state["UseSubtileImpl"] = False
-    state["UseSubtileImpl"] = True
-
-    # Only enable for GFX950 for now.
+    # Only enable UseSubtileImpl on gfx950; ignore user request on other ISAs.
     state["UseSubtileImpl"] = state["UseSubtileImpl"] and state["ISA"] == IsaVersion(9,5,0)
 
     if state["UseSubtileImpl"]:
@@ -2029,6 +2024,9 @@ class Solution(collections.abc.Mapping):
 
     # backup UsePLRPack from yaml before calling hasCustomSchedule
     backup_UsePLRPack = state["UsePLRPack"]
+    # UseSubtileImpl has its own main loop scheduler; CMS is not compatible.
+    if state["UseSubtileImpl"]:
+      state["UseCustomMainLoopSchedule"] = 0
     # Check if CMS is available for this solution
     if state["UseCustomMainLoopSchedule"] in [-1, 1]:
       # initialize CMS related config parameters (for CMS only)
