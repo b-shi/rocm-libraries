@@ -42,7 +42,7 @@ from Tensile.Components.SubtileBasedKernel import globalReadPtrUpdates, globalRe
 from Tensile.Components.SubtileBasedKernel import globalReadDoScaleSubtile, globalReadScalePtrUpdates
 from rocisa.code import Module, Label
 from rocisa.instruction import SWaitCnt, SBarrier, SCmpEQU32, SCmpLeU32, SCBranchSCC1, MFMAInstruction, \
-    MXMFMAInstruction, LocalReadInstruction, GlobalReadInstruction, DSLoadB32
+    MXMFMAInstruction, LocalReadInstruction, GlobalReadInstruction, DSLoadB32, CommonInstruction
 from rocisa.container import sgpr, vgpr, DSModifiers
 
 
@@ -428,6 +428,7 @@ _MIN_MFMA_GAP_DS_READ_TO_WAIT = 4
 _isDsRead = lambda x: isinstance(x, LocalReadInstruction)
 _isBufferLoad = lambda x: isinstance(x, GlobalReadInstruction)
 _isWaitCnt = lambda x: isinstance(x, SWaitCnt)
+_isM0Update = lambda x: isinstance(x, CommonInstruction) and hasattr(x, 'dst') and hasattr(x.dst, 'regType') and x.dst.regType == 'm'
 
 
 class _SchedulingRules:
@@ -473,6 +474,18 @@ class _SchedulingRules:
             return True
         gap = _MIN_MFMA_GAP_DS_READ_TO_WAIT * 2
         return pos - self.lastDsReadPos >= gap
+
+    def noM0WithBufferLoad(self, placer, pos, inst):
+        """Avoid placing M0 updates and buffer_loads in the same MFMA interval."""
+        if not _isM0Update(inst) and not _isBufferLoad(inst):
+            return True
+        peer = pos ^ 1
+        slots = [pos]
+        if 0 <= peer < placer.totalSlots:
+            slots.append(peer)
+        if _isM0Update(inst):
+            return not any(_isBufferLoad(item[1]) for s in slots for item in placer._placed[s])
+        return not any(_isM0Update(item[1]) for s in slots for item in placer._placed[s])
 
     # ── Adjusters: (placer, limit, inst) -> limit ──
 
@@ -1794,7 +1807,7 @@ class SubtileBasedScheduler:
         rules = _SchedulingRules(totalSlots=(len(mfmas) - 1) * 2)
         placer = _SlotPlacer(
             len(mfmas) - 1, n, pathOrders,
-            validators=[rules.oneDsReadPerInterval, rules.minGapDsReadBeforeWait, rules.minGapDsReadToWait],
+            validators=[rules.oneDsReadPerInterval, rules.minGapDsReadBeforeWait, rules.minGapDsReadToWait, rules.noM0WithBufferLoad],
             adjusters=[rules.spreadBufferLoads],
             onPlace=rules.trackPlacement)
 
