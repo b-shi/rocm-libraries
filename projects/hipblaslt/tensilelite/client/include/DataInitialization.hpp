@@ -35,8 +35,6 @@
 #include "Rotating.hpp"
 
 #include <cstddef>
-#include <cstdlib>
-#include <cstring>
 #include <random>
 
 #include "RunListener.hpp"
@@ -90,9 +88,6 @@ namespace TensileLite
             TrigIndCos, // 24
             TrigIndAbsSin, // 25
             TrigIndAbsCos, // 26
-            MXScaleBlockSerial, // 27 - each 32x8 scale tile gets incrementing constant
-            MXScaleSparseBlock, // 28 - one tile (env MXSCALE_BLOCK_I/J) = 0x7F, rest = 0x00
-            MXScaleSparseBlockRandom, // 29 - one tile = random 0x00/0x7F, rest = 0x00
             Count
         };
 
@@ -108,10 +103,7 @@ namespace TensileLite
             return mode == InitMode::SerialIdx || mode == InitMode::SerialDim0
                    || mode == InitMode::SerialDim1 || mode == InitMode::Identity
                    || mode == InitMode::TrigSin || mode == InitMode::TrigCos
-                   || mode == InitMode::TrigAbsSin || mode == InitMode::TrigAbsCos
-                   || mode == InitMode::MXScaleBlockSerial
-                   || mode == InitMode::MXScaleSparseBlock
-                   || mode == InitMode::MXScaleSparseBlockRandom;
+                   || mode == InitMode::TrigAbsSin || mode == InitMode::TrigAbsCos;
         }
 
         std::string ToString(InitMode mode);
@@ -541,9 +533,6 @@ namespace TensileLite
                 case InitMode::TrigIndCos:
                 case InitMode::TrigIndAbsSin:
                 case InitMode::TrigIndAbsCos:
-                case InitMode::MXScaleBlockSerial:
-                case InitMode::MXScaleSparseBlock:
-                case InitMode::MXScaleSparseBlockRandom:
                 case InitMode::Count:
                     throw std::runtime_error("Invalid InitMode.");
                 }
@@ -634,11 +623,6 @@ namespace TensileLite
                 case InitMode::TrigIndAbsCos:
                     initArrayTrig<T, true, true>(array, elements);
                     break;
-                case InitMode::MXScaleBlockSerial:
-                case InitMode::MXScaleSparseBlock:
-                case InitMode::MXScaleSparseBlockRandom:
-                    throw std::runtime_error(
-                        "MXScale-specific init modes require tensor descriptor.");
                 case InitMode::Count:
                     throw std::runtime_error("Invalid InitMode.");
                 }
@@ -728,11 +712,6 @@ namespace TensileLite
                 case InitMode::RandomNegPosLimited:
                     initArray<T, InitMode::RandomNegPosLimited>(array, tensor);
                     break;
-                case InitMode::MXScaleBlockSerial:
-                case InitMode::MXScaleSparseBlock:
-                case InitMode::MXScaleSparseBlockRandom:
-                    throw std::runtime_error(
-                        "MXScale init modes are handled by mxDataGenerator.");
                 case InitMode::Free:
                 case InitMode::Count:
                     throw std::runtime_error("Invalid InitMode.");
@@ -1110,9 +1089,6 @@ namespace TensileLite
             /// and must be reinitialized for each problem. Pristine copy on GPU
             /// cannot be used with problem dependent data.
             bool m_problemDependentData = false;
-
-            int m_mxScaleBlockI = 0;
-            int m_mxScaleBlockJ = 0;
 
             int64_t                         m_rotatingBuffer = 0;
             std::shared_ptr<RotatingMemory> m_rm;
@@ -2668,6 +2644,7 @@ namespace TensileLite
             uint8_t x = 0xff;
             return reinterpret_cast<E5M3&>(x);
         }
+
         template <>
         inline bool DataInitialization::isBadInput<float>(float value)
         {

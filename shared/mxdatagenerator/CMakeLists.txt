@@ -12,7 +12,6 @@ find_package(OpenMP)
 add_library(mxDataGenerator INTERFACE)
 add_library(roc::mxDataGenerator ALIAS mxDataGenerator)
 target_link_libraries(mxDataGenerator INTERFACE OpenMP::OpenMP_CXX)
-target_compile_definitions(mxDataGenerator INTERFACE HIPBLASLT_ENABLE_MXDATAGENERATOR)
 target_include_directories(mxDataGenerator
     INTERFACE
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/lib/include>
