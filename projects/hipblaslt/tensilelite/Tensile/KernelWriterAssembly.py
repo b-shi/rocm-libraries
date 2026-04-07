@@ -4054,8 +4054,8 @@ class KernelWriterAssembly(KernelWriter):
             #   Srd+2   = numLine * stride_bytes + mxSwizzleBlockSize*(DepthU/mxSwizzleSize1)
             #
             # Data A/B:  tileStart is in element units (WG * MT).
-            #   numElems = min(size - WG*MT, MT)
-            #   Srd+2    = numElems * stride_elements * bpe
+            #   numLine = min(size - WG*MT, MT) - 1
+            #   Srd+2   = (numLine * stride_elements + DepthU) * bpe
             #
             # Key: numLine/numElems <= MT (compile-time), so the multiply stays in 32 bits.
             if isMX:
@@ -4063,7 +4063,7 @@ class KernelWriterAssembly(KernelWriter):
               extra_bytes = mxSwizzleBlockSize * (kernel["DepthU"] // mxSwizzleSize1)
             else:
               mt_units    = kernel[tP["mt"]]  # MT0 or MT1, compile-time
-              extra_bytes = 0
+              extra_bytes = kernel["DepthU"]  # one K step in elements
 
             for i in range(0, numDim):
               idx = indices[i]
@@ -4080,11 +4080,14 @@ class KernelWriterAssembly(KernelWriter):
                   # tileStart in element units (WG * MT); no block rounding needed
                   module.add(SSubU32(dst=sgpr(stmp+0), src0=size, src1=sgpr(tileStart+0), comment="numToEnd = size - WG*MT"))
                   module.add(SMinU32(dst=sgpr(stmp+0), src0=sgpr(stmp+0), src1=mt_units, comment="min(numToEnd, MT)"))
+                  module.add(SSubU32(dst=sgpr(stmp+0), src0=sgpr(stmp+0), src1=1, comment="numLine = min - 1 (0-based index)"))
                 module.addModuleAsFlatItems(self.s_mul_u64_u32(sgpr(stmp+0), sgpr(stmp+1), sgpr(stmp+0), \
-                          strideF, comment="numLine/numElems * stride"))
+                          strideF, comment="numLine * stride"))
                 if isMX:
                   module.add(SAddU32(dst=sgpr("Srd%s+2"%tc), src0=sgpr(stmp+0), src1=extra_bytes, comment="buffer_load limit for %s"%tc))
                 else:
+                  # (numLine * stride + DepthU) * bpe  — mirrors scale path structure
+                  module.add(SAddU32(dst=sgpr(stmp+0), src0=sgpr(stmp+0), src1=extra_bytes, comment="+ DepthU (one K step)"))
                   module.add(scalarMultiplyBpe(sgpr("Srd%s+2"%tc), sgpr(stmp+0), tP["bpeGR"], comment="buffer_load limit for %s (tile-boundary, avoids 32-bit overflow)"%tc))
           module.addModuleAsFlatItems(self.s_mul_u64_u32(sgpr(tileStart), sgpr(tileStart+1), sgpr(tileStart+0), \
                     strideF, comment="tlu=0, scaled tile-offset by stride"))
