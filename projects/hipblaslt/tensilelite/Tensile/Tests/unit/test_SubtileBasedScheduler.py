@@ -163,7 +163,7 @@ MAINLOOP:
         before: [none]  after: [none]
       LR (MT n+1, subIterK 0) A: [0, 1]  B: [0, 1]
         - LOAD  A: {0: 0, 1: 1}  B: {0: 2, 1: 3}
-        before: [WaitGROp(A=2 B=2 S=0), SyncOp, LR_INCOp]  after: [WaitLROp]
+        before: [WaitGROp(A=1 B=1 S=0), SyncOp, LR_INCOp]  after: [WaitLROp]
       GR (MT n+2):  A: [1]  B: [1]
         before: [none]  after: [GR_INCOp]
 """
@@ -214,7 +214,7 @@ MAINLOOP:
       LR (MT n+1, subIterK 0) A: [0, 1]  B: [0, 1]
         - LOAD  A: {0: 0, 1: 1}  B: {0: 2, 1: 3}
         - SCALE  A: {0: 0}  B: {0: 1}
-        before: [WaitGROp(A=2 B=2 S=2), SyncOp, LR_INCOp]  after: [WaitLROp]
+        before: [WaitGROp(A=1 B=1 S=2), SyncOp, LR_INCOp]  after: [WaitLROp]
       GR (MT n+2):  A: [1]  B: [1]
         before: [none]  after: [GR_INCOp]
 """

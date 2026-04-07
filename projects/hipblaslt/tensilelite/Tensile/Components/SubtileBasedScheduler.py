@@ -1001,8 +1001,9 @@ class SubtileBasedScheduler:
             return int(mt[2:])
         return None
 
-    def _countInflightSubtileLoads(self, grEvents, waitOpIndex, waitMT, waitSubtileA, waitSubtileB):
-        """Count GR subtile loads still in flight at the point where WAIT_GR will be inserted.
+    def _countInflightSubtileLoads(self, grEvents, sikStart, sikEnd, waitMT, waitSubtileA, waitSubtileB):
+        """Count GR subtile loads still in flight before the current subIterK.
+        Excludes any loads within the current subIterK [sikStart, sikEnd).
         Returns (inflightA, inflightB, scaleLoads) where scaleLoads counts
         scale DTL buffer_loads (scaleLoadsPerMT_A + scaleLoadsPerMT_B per MT)."""
         waitOffset = self._parseMTOffset(waitMT)
@@ -1010,8 +1011,8 @@ class SubtileBasedScheduler:
             return 0, 0, 0
 
         targetA, targetB = set(waitSubtileA), set(waitSubtileB)
-        before = [(mt, a, b, first) for (idx, mt, a, b, first) in grEvents if idx < waitOpIndex]
-        after  = [(mt, a, b, first) for (idx, mt, a, b, first) in grEvents if idx >= waitOpIndex]
+        before = [(mt, a, b, first) for (idx, mt, a, b, first) in grEvents if idx < sikStart]
+        after  = [(mt, a, b, first) for (idx, mt, a, b, first) in grEvents if idx >= sikEnd]
         totalA, totalB, scaleLoads = 0, 0, 0
 
         for (grMT, grA, grB, firstForMT) in reversed(before):
@@ -1038,7 +1039,7 @@ class SubtileBasedScheduler:
 
         return totalA, totalB, scaleLoads
 
-    def _buildWaitGROp(self, lrOp, pendingA, pendingB, opIdx, numModules, grEvents):
+    def _buildWaitGROp(self, lrOp, pendingA, pendingB, sikStart, sikEnd, grEvents):
         """Determine if a WAIT_GR is needed before this LR. Returns (waitGROp, waitA, waitB)."""
         if not lrOp or lrOp.subIterK != 0:
             return None, set(), set()
@@ -1050,7 +1051,7 @@ class SubtileBasedScheduler:
 
         #TODO. fix _countInflightSubtileLoads . Not working well in 1x4,4x1 or multi-parition configs
         inflightA, inflightB, inflightScale = self._countInflightSubtileLoads(
-            grEvents, opIdx + numModules, lrOp.mtIteration, sorted(waitA), sorted(waitB))
+            grEvents, sikStart, sikEnd, lrOp.mtIteration, sorted(waitA), sorted(waitB))
         waitGROp = WaitGROp(
             mtIteration=lrOp.mtIteration,
             subtileA=sorted(waitA), subtileB=sorted(waitB),
@@ -1127,7 +1128,7 @@ class SubtileBasedScheduler:
 
                 # build WAIT_GR is the LROp needs subtile that are still pending.
                 waitGROp, waitA, waitB = self._buildWaitGROp(
-                    lrOp, pendingA, pendingB, opIdx, len(dus.modules), grEvents)
+                    lrOp, pendingA, pendingB, opIdx, opIdx + len(dus.modules), grEvents)
 
                 self._annotateGRInc(grMods)
 
@@ -1479,14 +1480,14 @@ class SubtileBasedScheduler:
         Args:
             inflightLoadsA: Number of A subtile loads still inflight.
             inflightLoadsB: Number of B subtile loads still inflight.
-            inflightScaleLoads: Number of scale DTL buffer_loads still inflight
-                                (2 per MT: one MXSA + one MXSB).
+            inflightScaleLoads: Number of scale loads still inflight
+
         """
         module = Module()
         grCnt = int(inflightLoadsA / self.tileInfoA.loadRatioGR) + \
                 int(inflightLoadsB / self.tileInfoB.loadRatioGR) + \
-                inflightScaleLoads
-        module.add(SWaitCnt(vlcnt=14, vscnt=-1,
+                inflightScaleLoads # 1 scale load =  1 GR load
+        module.add(SWaitCnt(vlcnt=grCnt, vscnt=-1,
                             comment=f"Wait GR: A={inflightLoadsA} B={inflightLoadsB} scale={inflightScaleLoads} => vlcnt={grCnt}"))
         return module
 
@@ -1802,7 +1803,18 @@ class SubtileBasedScheduler:
                 rules.setupBufLoadSpreading(placer, pathInsts, order)
             placer.placePath(pathInsts, reverse=hasWaitGR)
 
-        return placer.assemble(mfmas)
+        scheduled = placer.assemble(mfmas)
+
+        # Post-pass: adjust vmcnt of any SWaitCnt to account for buffer_loads
+        # that the scheduler placed before it within this subIterK.
+        bufLoadCount = 0
+        for inst in scheduled.items():
+            if _isBufferLoad(inst):
+                bufLoadCount += 1
+            elif _isWaitCnt(inst) and inst.vlcnt >= 0:
+                inst.vlcnt += bufLoadCount
+
+        return scheduled
 
     def _emitLoop(self, writer, kernel, label, steps, scaleSet=0, scaleLRSet=None):
         """Emit a loop section (preloop, mainloop, NGLL, or NLL).
