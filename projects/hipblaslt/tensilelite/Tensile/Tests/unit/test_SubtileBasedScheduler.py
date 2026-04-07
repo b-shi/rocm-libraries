@@ -54,6 +54,8 @@ def create_kernel(MT0=256, MT1=256, fp4=False):
         "WavefrontSize": 64,
         "SourceSwap": False,
         "MIArchVgpr": False,
+        "NonTemporalA": 0,
+        "NonTemporalB": 0,
         "ProblemType": problemType,
     }
     if fp4:
