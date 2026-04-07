@@ -573,14 +573,19 @@ def _classify_inst(inst):
     return 'S'
 
 
-def _get_scheduled_sequence(scheduler, writer, kernel, subIterK, scaleTiA=None, scaleTiB=None):
-    """Build emitted modules for a subIterK and return the instruction-scheduled type sequence."""
+def _get_scheduled_instructions(scheduler, writer, kernel, subIterK):
+    """Build emitted modules for a subIterK and return the flat instruction list."""
     dtileInfo = writer.states.d.tileInfo
     pss = scheduler.mainloopSteps[0]
     dus = pss.subIterKSteps[subIterK]
     emitted = scheduler._buildEmittedModules(writer, kernel, dus.modules, dtileInfo)
     scheduled = SubtileBasedScheduler.instructionSchedule(emitted)
-    return ''.join(_classify_inst(i) for i in scheduled.flatitems())
+    return scheduled.flatitems()
+
+
+def _get_scheduled_sequence(scheduler, writer, kernel, subIterK, scaleTiA=None, scaleTiB=None):
+    """Build emitted modules for a subIterK and return the instruction-scheduled type sequence."""
+    return ''.join(_classify_inst(i) for i in _get_scheduled_instructions(scheduler, writer, kernel, subIterK))
 
     """Compute scheduling quality metrics from a type-tagged sequence string.
 
@@ -646,6 +651,51 @@ def test_PGR2_256_256_fp4_instruction_schedule_exact():
 
     assert seq0 == expected_sik0, f"subIterK=0 mismatch:\n  got: {seq0}\n  exp: {expected_sik0}"
     assert seq1 == expected_sik1, f"subIterK=1 mismatch:\n  got: {seq1}\n  exp: {expected_sik1}"
+
+
+def test_PGR2_256_256_fp4_vmcnt():
+    """Verify vmcnt values in SWaitCnt instructions for 256x256 fp4 mainloop.
+
+    The scheduler's post-pass sets vlcnt = initial_inflight + buffer_loads_before_wait.
+    We verify that for each SWaitCnt with vlcnt >= 0, the value equals the number
+    of buffer_load instructions that appear before it in the scheduled sequence.
+    The initial inflight count (from prior subIterK GRs) is baked into the
+    pre-adjustment vlcnt by emitWaitGR, so the final vlcnt must be at least
+    the number of buffer_loads placed before the wait in this subIterK.
+    """
+    from rocisa.instruction import SWaitCnt, GlobalReadInstruction
+
+    kernel = create_kernel(256, 256, fp4=True)
+    tiA = TileInfo('A', kernel)
+    tiB = TileInfo('B', kernel)
+    scaleTiA = TileInfo('MXSA', kernel)
+    scaleTiB = TileInfo('MXSB', kernel)
+    lsgA = tiA.localSubtileGrid[0]
+    lsgB = tiB.localSubtileGrid[0]
+
+    cfg = SchedulerConfig(lsgA, lsgB, PrefetchMode.HALF_PREFETCH)
+    s = SubtileBasedScheduler(tiA, tiB, cfg,
+                              scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB)
+    writer = create_writer_with_tiles(kernel, tiA, tiB,
+                                      scaleTiA=scaleTiA, scaleTiB=scaleTiB)
+    s.allocVgprTiles(writer)
+    try:
+        for sik in range(len(s.mainloopSteps[0].subIterKSteps)):
+            insts = _get_scheduled_instructions(s, writer, kernel, sik)
+
+            # Walk instructions: count buffer_loads before each SWaitCnt
+            buf_loads_before = 0
+            for inst in insts:
+                if isinstance(inst, GlobalReadInstruction):
+                    buf_loads_before += 1
+                elif isinstance(inst, SWaitCnt) and inst.vlcnt >= 0:
+                    # vlcnt must be >= buffer_loads placed before this wait
+                    # (the difference is the initial inflight from prior GRs)
+                    assert inst.vlcnt >= buf_loads_before, \
+                        f"subIterK={sik}: SWaitCnt vlcnt={inst.vlcnt} < " \
+                        f"buf_loads_before={buf_loads_before}"
+    finally:
+        s.deallocVgprTiles(writer)
 
 
 if __name__ == "__main__":
