@@ -8,6 +8,20 @@ from typing import Dict, List, NamedTuple, Optional, Tuple, Type
 from ..Common import printWarning, roundUp, print2, DebugConfig, DataDirection, \
   INDEX_CHARS, IsaVersion
 
+
+from rocisa.code import Module, TextBlock, StructuredModule, KernelBody, Label
+from rocisa.label import LabelManager
+
+from rocisa.container import MUBUFModifiers, vgpr, sgpr, accvgpr, mgpr
+from rocisa.enum import InstType, SelectBit, CacheScope
+from rocisa.instruction import MFMAInstruction
+
+import math
+from copy import deepcopy
+from dataclasses import dataclass, field
+from typing import Dict, List, NamedTuple, Optional, Tuple, Type
+from contextlib import contextmanager
+from collections import deque
 from rocisa import rocIsa, countInstruction, countGlobalRead, \
   countLocalRead, countLocalWrite, countDSStoreB256, getMFMAs
 from rocisa.asmpass import rocIsaPass, rocIsaPassOption
@@ -1245,25 +1259,33 @@ def globalReadScalePtrUpdates(tc, writer, kernel):
 def emitSingleBufferLoad(tileInfo, kernel, sId0, sId1):
   """Emit buffer_load instructions for a single subtile (sId0, sId1).
 
+  When loadRatioGR > 1, multiple local subtiles share the same global read.
+  Only the first subtile in each group emits the load; others return empty.
+
   Args:
       tileInfo: TileInfo for the tensor component
       sId0:     Subtile row index
       sId1:     Subtile column index (K-dimension)
   """
   module = Module()
-  tc = tileInfo.tc
 
+  subtileInfo = tileInfo.localSubtiles[tileInfo.getLocalSubtileLinearId(sId0, sId1)]
+  grBaseId = subtileInfo.globalReadMap[0]
+
+  # When loadRatioGR > 1, multiple subtiles share one global read.
+  # Only emit the load for the first subtile of each group.
+  if sId0 != int(grBaseId * tileInfo.loadRatioGR):
+    return module
+
+  tc = tileInfo.tc
   isGlc = bool(kernel["NonTemporal%s"%tc] & 0x1)
   isSlc = bool(kernel["NonTemporal%s"%tc] & 0x2)
   isNT  = bool(kernel["NonTemporal%s"%tc] & 0x4)
 
-  subtileInfo = tileInfo.localSubtiles[tileInfo.getLocalSubtileLinearId(sId0, sId1)]
   regList = tileInfo.localSubtilesRegister[subtileInfo.regListId]
 
   offsetK = sId1 * int(tileInfo.mmaTileShape[1] * tileInfo.subtileShape[1] * tileInfo.bpe)
-  # TODO: grBaseId is probably not needed..
-  grBaseId = subtileInfo.globalReadMap[0]
-  
+
   subtileOffset = math.ceil(tileInfo.loadRatioGR*tileInfo.subtileSize)
   WriteBaseAddr = "LocalWriteBaseAddr%s"%tc
   # Emit number of buffer loads equal to number of loads needed to load a subtile
@@ -1297,17 +1319,10 @@ def globalReadDoSubtile(tc, writer, kernel):
 
   tileInfo = writer.states.a.tileInfo if tc == 'A' else writer.states.b.tileInfo
 
-  grTracker = set()
   for j in range(tileInfo.localSubtileGrid[1]):
     for i in range(tileInfo.localSubtileGrid[0]):
-      grIds = tileInfo.localSubtiles[tileInfo.getLocalSubtileLinearId(i ,j)].globalReadMap
-      if not set(grIds).issubset(grTracker):
-        for grId in grIds:
-          grTracker.add(grId)
-        module.addComment0("Emit load for %s subtile: [%u, %u]"%(tc, i, j))
-        module.add(emitSubtileBufferLoad(tc, writer, kernel, [i, j]))
-      else:
-        module.addComment0("Emit load for %s subtile: [%u, %u] - already covered"%(tc, i, j))
+      module.addComment0("Emit load for %s subtile: [%u, %u]"%(tc, i, j))
+      module.add(emitSubtileBufferLoad(tc, writer, kernel, [i, j]))
 
   return module
 

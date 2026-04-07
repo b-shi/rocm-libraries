@@ -1514,7 +1514,7 @@ class SubtileBasedScheduler:
         if op.firstForMT and self.hasScale:
             module.add(globalReadDoScaleSubtile('MXSA', writer, kernel))
             module.add(globalReadDoScaleSubtile('MXSB', writer, kernel))
-        # A and B data loads
+        # A and B data loads — emitSingleBufferLoad skips redundant loads internally
         for subtileList, tileInfo in [(op.subtileA, self.tileInfoA),
                                       (op.subtileB, self.tileInfoB)]:
             for sId0 in subtileList:
