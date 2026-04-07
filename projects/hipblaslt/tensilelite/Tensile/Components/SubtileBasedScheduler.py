@@ -185,6 +185,7 @@ class GROp:
     subtileA: List[int]
     subtileB: List[int]
     lastForMT: bool = False  # True = last partition's GR for this MT → emit ptrUpdate+swap
+    firstForMT: bool = False # True = first partition's GR for this MT → emit scale loads
 
 
 @dataclass
@@ -194,6 +195,7 @@ class WaitGROp:
     subtileB: List[int]
     inflightLoadsA: Optional[int] = None
     inflightLoadsB: Optional[int] = None
+    inflightScaleLoads: int = 0
 
 
 @dataclass
@@ -544,6 +546,9 @@ class SubtileBasedScheduler:
         self.scaleTileInfoA = scaleTileInfoA
         self.scaleTileInfoB = scaleTileInfoB
         self.hasScale = scaleTileInfoA is not None and scaleTileInfoB is not None
+        # Number of scale loads per MT (one load covers the entire MT)
+        self.scaleLoadsPerMT_A = 1 if self.hasScale else 0
+        self.scaleLoadsPerMT_B = 1 if self.hasScale else 0
         self.config = config
 
         self.MTA = tileInfoA.localSubtileGrid[0]
@@ -715,6 +720,11 @@ class SubtileBasedScheduler:
                 preloopOps.append(GROp(mtIteration="0",
                                        subtileA=grA, subtileB=grB,
                                        lastForMT=False))
+        # Mark the first MT 0 GR as firstForMT
+        for i in range(len(preloopOps)):
+            if isinstance(preloopOps[i], GROp):
+                preloopOps[i].firstForMT = True
+                break
         # Mark the last MT 0 GR as lastForMT
         for i in range(len(preloopOps) - 1, -1, -1):
             if isinstance(preloopOps[i], GROp):
@@ -734,7 +744,7 @@ class SubtileBasedScheduler:
         mt1Complete = (set(preloadMT1_A) == set(allA) and set(preloadMT1_B) == set(allB))
         preloopOps.append(GROp(mtIteration="1",
                                subtileA=preloadMT1_A, subtileB=preloadMT1_B,
-                               lastForMT=mt1Complete))
+                               firstForMT=True, lastForMT=mt1Complete))
         if mt1Complete:
             preloopOps.append(GR_INCOp())
         preloopOps.append(SkipOp(compare="LE", value=2, target="NGLL"))
@@ -827,6 +837,15 @@ class SubtileBasedScheduler:
                 for fpi in range(pi + 1, numPartitions))
         return False
 
+    def _isFirstGRForMT(self, pi, gr, numPartitions):
+        """Check if this partition's GR is the first one for its MT iteration."""
+        if gr.mtIteration in ("n+1", "n+2"):
+            return not any(
+                (self.partitionGRs[fpi].subtileA or self.partitionGRs[fpi].subtileB)
+                and self.partitionGRs[fpi].mtIteration == gr.mtIteration
+                for fpi in range(0, pi))
+        return False
+
     def _insertGROps(self, pss, pi, gr, numPartitions):
         """Insert GR ops for a partition, splitting across subIterK=0 and subIterK=1."""
         if not gr.subtileA and not gr.subtileB:
@@ -839,12 +858,14 @@ class SubtileBasedScheduler:
         gr0_A, gr1_A = totalGR_A[:splitA], totalGR_A[splitA:]
         gr0_B, gr1_B = totalGR_B[:splitB], totalGR_B[splitB:]
         isLast = self._isLastGRForMT(pi, gr, numPartitions)
+        isFirst = self._isFirstGRForMT(pi, gr, numPartitions)
         hasSik1 = bool(gr1_A or gr1_B)
         # handle case where gr1 is empty.
         if gr0_A or gr0_B:
             pss.subIterKSteps[0].modules.append(AnnotatedModule(op=GROp(
                 mtIteration=gr.mtIteration,
                 subtileA=gr0_A, subtileB=gr0_B,
+                firstForMT=isFirst,
                 lastForMT=isLast and not hasSik1)))
         if hasSik1:
             pss.subIterKSteps[1].modules.append(AnnotatedModule(op=GROp(
@@ -967,7 +988,8 @@ class SubtileBasedScheduler:
                 for mod in dus.modules:
                     if isinstance(mod.op, GROp):
                         grEvents.append((opIdx, mod.op.mtIteration,
-                                         set(mod.op.subtileA), set(mod.op.subtileB)))
+                                         set(mod.op.subtileA), set(mod.op.subtileB),
+                                         mod.op.firstForMT))
                     opIdx += 1
         return grEvents
 
@@ -980,35 +1002,41 @@ class SubtileBasedScheduler:
         return None
 
     def _countInflightSubtileLoads(self, grEvents, waitOpIndex, waitMT, waitSubtileA, waitSubtileB):
-        """Count GR subtile loads still in flight at the point where WAIT_GR will be inserted."""
+        """Count GR subtile loads still in flight at the point where WAIT_GR will be inserted.
+        Returns (inflightA, inflightB, scaleLoads) where scaleLoads counts
+        scale DTL buffer_loads (scaleLoadsPerMT_A + scaleLoadsPerMT_B per MT)."""
         waitOffset = self._parseMTOffset(waitMT)
         if waitOffset is None:
-            return 0, 0
+            return 0, 0, 0
 
         targetA, targetB = set(waitSubtileA), set(waitSubtileB)
-        before = [(mt, a, b) for (idx, mt, a, b) in grEvents if idx < waitOpIndex]
-        after  = [(mt, a, b) for (idx, mt, a, b) in grEvents if idx >= waitOpIndex]
-        totalA, totalB = 0, 0
+        before = [(mt, a, b, first) for (idx, mt, a, b, first) in grEvents if idx < waitOpIndex]
+        after  = [(mt, a, b, first) for (idx, mt, a, b, first) in grEvents if idx >= waitOpIndex]
+        totalA, totalB, scaleLoads = 0, 0, 0
 
-        for (grMT, grA, grB) in reversed(before):
+        for (grMT, grA, grB, firstForMT) in reversed(before):
             grOffset = self._parseMTOffset(grMT)
             if grOffset is None:
                 continue
             if grOffset == waitOffset and grA == targetA and grB == targetB:
-                return totalA, totalB
+                return totalA, totalB, scaleLoads
             totalA += len(grA)
             totalB += len(grB)
+            if firstForMT and self.hasScale:
+                scaleLoads += self.scaleLoadsPerMT_A + self.scaleLoadsPerMT_B
 
-        for (grMT, grA, grB) in reversed(after):
+        for (grMT, grA, grB, firstForMT) in reversed(after):
             grOffset = self._parseMTOffset(grMT)
             if grOffset is None:
                 continue
             if grOffset - 1 == waitOffset and grA == targetA and grB == targetB:
-                return totalA, totalB
+                return totalA, totalB, scaleLoads
             totalA += len(grA)
             totalB += len(grB)
+            if firstForMT and self.hasScale:
+                scaleLoads += self.scaleLoadsPerMT_A + self.scaleLoadsPerMT_B
 
-        return totalA, totalB
+        return totalA, totalB, scaleLoads
 
     def _buildWaitGROp(self, lrOp, pendingA, pendingB, opIdx, numModules, grEvents):
         """Determine if a WAIT_GR is needed before this LR. Returns (waitGROp, waitA, waitB)."""
@@ -1020,13 +1048,14 @@ class SubtileBasedScheduler:
         if not waitA and not waitB:
             return None, set(), set()
 
-        #TODO. fix _countInflightSubtileLoads . Scale load not taken into account and likely not working well in 1x4,4x1 or multi-parition configs
-        inflightA, inflightB = self._countInflightSubtileLoads(
+        #TODO. fix _countInflightSubtileLoads . Not working well in 1x4,4x1 or multi-parition configs
+        inflightA, inflightB, inflightScale = self._countInflightSubtileLoads(
             grEvents, opIdx + numModules, lrOp.mtIteration, sorted(waitA), sorted(waitB))
         waitGROp = WaitGROp(
             mtIteration=lrOp.mtIteration,
             subtileA=sorted(waitA), subtileB=sorted(waitB),
-            inflightLoadsA=inflightA, inflightLoadsB=inflightB)
+            inflightLoadsA=inflightA, inflightLoadsB=inflightB,
+            inflightScaleLoads=inflightScale)
         pendingA -= waitA
         pendingB -= waitB
         return waitGROp, waitA, waitB
@@ -1226,7 +1255,10 @@ class SubtileBasedScheduler:
         elif isinstance(op, GROp):
             print(f"{indent}GR (MT {op.mtIteration}):  A: {op.subtileA}  B: {op.subtileB}")
         elif isinstance(op, WaitGROp):
-            inflight = f" — inflight SubtileLoads A={op.inflightLoadsA} B={op.inflightLoadsB}" if op.inflightLoadsA is not None else ""
+            if op.inflightLoadsA is not None:
+                inflight = f" — inflight SubtileLoads A={op.inflightLoadsA} B={op.inflightLoadsB} scale={op.inflightScaleLoads}"
+            else:
+                inflight = ""
             print(f"{indent}WAIT_GR (MT {op.mtIteration}) A: {op.subtileA}  B: {op.subtileB}{inflight}")
         elif isinstance(op, WaitLROp):
             print(f"{indent}WAIT_LR")
@@ -1257,7 +1289,10 @@ class SubtileBasedScheduler:
             elif isinstance(op, GROp):
                 return f"GR(MT {op.mtIteration})"
             return type(op).__name__
-        return type(e.op).__name__
+        op = e.op
+        if isinstance(op, WaitGROp) and op.inflightLoadsA is not None:
+            return f"WaitGROp(A={op.inflightLoadsA} B={op.inflightLoadsB} S={op.inflightScaleLoads})"
+        return type(op).__name__
 
     def _printModules(self, modules: List[AnnotatedModule], indent: str,
                       showVgpr: bool = False, showDeps: bool = False,
@@ -1438,36 +1473,35 @@ class SubtileBasedScheduler:
                                  ds=DSModifiers(offset=dsOffset),
                                  comment="scale%s[group%u]: load 4B from LDS" % (tc, scaleGroupIdx)))
 
-    def emitWaitGR(self, inflightLoadsA, inflightLoadsB, hasScale=False):
+    def emitWaitGR(self, inflightLoadsA, inflightLoadsB, inflightScaleLoads=0):
         """Emit SWaitCnt for GR (buffer_load) based on inflight GR counts.
 
-        Only waits on vmcnt (data GR loads). Scale DTL loads complete via
-        lgkmcnt/dscnt and are handled separately by the barrier wait.
-
         Args:
-            inflightLoadsA: Number of A GR loads still inflight.
-            inflightLoadsB: Number of B GR loads still inflight.
-            hasScale:       Unused, kept for API compatibility.
+            inflightLoadsA: Number of A subtile loads still inflight.
+            inflightLoadsB: Number of B subtile loads still inflight.
+            inflightScaleLoads: Number of scale DTL buffer_loads still inflight
+                                (2 per MT: one MXSA + one MXSB).
         """
         module = Module()
         grCnt = int(inflightLoadsA / self.tileInfoA.loadRatioGR) + \
-                int(inflightLoadsB / self.tileInfoB.loadRatioGR)
-        module.add(SWaitCnt(vlcnt=grCnt, vscnt=-1,
-                            comment=f"Wait GR: A={inflightLoadsA} B={inflightLoadsB} => vlcnt={grCnt}"))
+                int(inflightLoadsB / self.tileInfoB.loadRatioGR) + \
+                inflightScaleLoads
+        module.add(SWaitCnt(vlcnt=14, vscnt=-1,
+                            comment=f"Wait GR: A={inflightLoadsA} B={inflightLoadsB} scale={inflightScaleLoads} => vlcnt={grCnt}"))
         return module
 
     def emitGR(self, writer, kernel, op):
         """Emit GR (Global Read) buffer_load instructions for a single GROp."""
         module = Module()
+        # Scale DTL loads: emitted on the first GR of an MT to maximize overlap
+        if op.firstForMT and self.hasScale:
+            module.add(globalReadDoScaleSubtile('MXSA', writer, kernel))
+            module.add(globalReadDoScaleSubtile('MXSB', writer, kernel))
         # A and B data loads
         for subtileList, tileInfo in [(op.subtileA, self.tileInfoA),
                                       (op.subtileB, self.tileInfoB)]:
             for sId0 in subtileList:
                 module.add(emitSingleBufferLoad(tileInfo, kernel, sId0, 0))
-        # Scale DTL loads: only on the last GR of an MT (scale covers all subtiles)
-        if op.lastForMT and self.hasScale:
-            module.add(globalReadDoScaleSubtile('MXSA', writer, kernel))
-            module.add(globalReadDoScaleSubtile('MXSB', writer, kernel))
         return module
 
     def _emitOp(self, writer, kernel, op, dtileInfo, scaleSet=0, scaleLRSet=0):
@@ -1488,7 +1522,7 @@ class SubtileBasedScheduler:
         elif isinstance(op, MFMAOp):
             module.add(self.emitMFMA(writer, kernel, op, dtileInfo, scaleSet=scaleSet))
         elif isinstance(op, WaitGROp):
-            module.add(self.emitWaitGR(op.inflightLoadsA, op.inflightLoadsB, self.hasScale))
+            module.add(self.emitWaitGR(op.inflightLoadsA, op.inflightLoadsB, op.inflightScaleLoads))
         elif isinstance(op, WaitLROp):
             module.add(SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for LR to complete"))
         elif isinstance(op, SyncOp):

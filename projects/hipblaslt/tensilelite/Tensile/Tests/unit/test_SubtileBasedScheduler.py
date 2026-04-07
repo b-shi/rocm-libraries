@@ -56,6 +56,8 @@ def create_kernel(MT0=256, MT1=256, fp4=False):
         "MIArchVgpr": False,
         "NonTemporalA": 0,
         "NonTemporalB": 0,
+        "NonTemporalMXSA": 0,
+        "NonTemporalMXSB": 0,
         "ProblemType": problemType,
     }
     if fp4:
@@ -132,7 +134,7 @@ Ordering grid (COLUMN_MAJOR):
 PRELOOP:
   GR (MT 0):  A: [0, 1]  B: [0, 1]
   GR_INC
-  WAIT_GR (MT 0) A: [0, 1]  B: [0, 1] — inflight SubtileLoads A=0 B=0
+  WAIT_GR (MT 0) A: [0, 1]  B: [0, 1] — inflight SubtileLoads A=0 B=0 scale=0
   SYNC
   LR (MT 0, subIterK 0) A: [0, 1]  B: [0, 1]
     - LOAD  A: {0: 0, 1: 1}  B: {0: 2, 1: 3}
@@ -161,7 +163,7 @@ MAINLOOP:
         before: [none]  after: [none]
       LR (MT n+1, subIterK 0) A: [0, 1]  B: [0, 1]
         - LOAD  A: {0: 0, 1: 1}  B: {0: 2, 1: 3}
-        before: [WaitGROp, SyncOp, LR_INCOp]  after: [WaitLROp]
+        before: [WaitGROp(A=2 B=2 S=0), SyncOp, LR_INCOp]  after: [WaitLROp]
       GR (MT n+2):  A: [1]  B: [1]
         before: [none]  after: [GR_INCOp]
 """
@@ -212,7 +214,7 @@ MAINLOOP:
       LR (MT n+1, subIterK 0) A: [0, 1]  B: [0, 1]
         - LOAD  A: {0: 0, 1: 1}  B: {0: 2, 1: 3}
         - SCALE  A: {0: 0}  B: {0: 1}
-        before: [WaitGROp, SyncOp, LR_INCOp]  after: [WaitLROp]
+        before: [WaitGROp(A=2 B=2 S=2), SyncOp, LR_INCOp]  after: [WaitLROp]
       GR (MT n+2):  A: [1]  B: [1]
         before: [none]  after: [GR_INCOp]
 """
@@ -263,7 +265,7 @@ PRELOOP:
   GR (MT 0):  A: [1]  B: []
   GR (MT 0):  A: []  B: [1]
   GR_INC
-  WAIT_GR (MT 0) A: [0, 1]  B: [0, 1] — inflight SubtileLoads A=0 B=0
+  WAIT_GR (MT 0) A: [0, 1]  B: [0, 1] — inflight SubtileLoads A=0 B=0 scale=0
   SYNC
   LR (MT 0, subIterK 0) A: [0]  B: [0]
     - LOAD  A: {0: 0}  B: {0: 1}
@@ -291,7 +293,7 @@ MAINLOOP:
         before: [none]  after: [none]
       LR (MT n, subIterK 0) A: [1]  B: []
         - LOAD  A: {1: 4}  B: {}
-        before: [WaitGROp, SyncOp]  after: [WaitLROp]
+        before: [WaitGROp(A=2 B=2 S=0), SyncOp]  after: [WaitLROp]
   Partition 1:
     subIterK=0:
       MFMAs (MT n, subIterK 0):
@@ -310,7 +312,7 @@ MAINLOOP:
         before: [none]  after: [none]
       LR (MT n, subIterK 0) A: []  B: [1]
         - LOAD  A: {}  B: {1: 6}
-        before: [WaitGROp, SyncOp]  after: [WaitLROp]
+        before: [WaitGROp(A=2 B=2 S=0), SyncOp]  after: [WaitLROp]
   Partition 2:
     subIterK=0:
       MFMAs (MT n, subIterK 0):
@@ -346,7 +348,7 @@ MAINLOOP:
         before: [none]  after: [none]
       LR (MT n+1, subIterK 0) A: [0]  B: [0]
         - LOAD  A: {0: 0}  B: {0: 1}
-        before: [GR(MT n+1), WaitGROp, SyncOp, LR_INCOp]  after: [WaitLROp]
+        before: [GR(MT n+1), WaitGROp(A=2 B=2 S=0), SyncOp, LR_INCOp]  after: [WaitLROp]
 """
 
     assert expected in actual
@@ -636,12 +638,11 @@ def test_PGR2_256_256_fp4_instruction_schedule_exact():
 
     # M=MFMA, L=LocalRead, G=GlobalRead(buffer_load), S=scalar ALU/wait/sync
     expected_sik0 = \
-        "MLMLMLMLMLMLMLMLMLMLMLMLMLMLMLMLMMMMSSMSGMSMMMMGMSMMMMGMSMMMMGMSMMMMGM" \
-        "SMMMMGMSMMMMGMSMMMMGMMMMMMMM"
+        "MLMLMLMLMLMLMLMLMLMLMLMLMLMLMLMLMMMMSSMSSMGSMSMMMGSMMMMGSMMMMGSMMMMGSM" \
+        "MMMGSMMMMGSMMMMGSMMMMGSMMMMGMMMMMM"
     expected_sik1 = \
-        "MSGMSMMMMGMSMMMMGMSMMMMGMSMMMMGMSMMMMGMSMMMMSSMSSMSSMSSMSSMSLMGLMSLMG" \
-        "LMSLMSLMGLMSLMSLMLMLMGLMSLMSLMSLMSLMSLMSLMSLMSLMSLMSLMSLMSLMSSMSSMSSMS" \
-        "SMSS"
+        "MSGMSMMMMMMGSMMMMMMGMSMMMMMMGSMMMMMMGMSMMSMSSMSSMSSMSGSSMSSMSLMLMLMLML" \
+        "GMSLMLMLMLMLMLMGLSMSLSMSLSMSLSMSLSMSLSMSLSMSLSMSLSMSLSMSLMLMLMMMMSM"
 
     assert seq0 == expected_sik0, f"subIterK=0 mismatch:\n  got: {seq0}\n  exp: {expected_sik0}"
     assert seq1 == expected_sik1, f"subIterK=1 mismatch:\n  got: {seq1}\n  exp: {expected_sik1}"
