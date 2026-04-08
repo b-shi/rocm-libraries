@@ -1867,6 +1867,7 @@ namespace TensileLite
                 std::memset(pristineMXScaleA.cpuInput.valid.get(),
                             0x00,
                             problem.mxsa().totalAllocatedElements());
+
                 for(size_t b = 0; b < batchCount; b++)
                 {
                     auto* dataPtr  = static_cast<uint8_t*>(pristineA.cpuInput.valid.get())
@@ -1920,6 +1921,7 @@ namespace TensileLite
                 std::memset(pristineMXScaleB.cpuInput.valid.get(),
                             0x00,
                             problem.mxsb().totalAllocatedElements());
+
                 for(size_t b = 0; b < batchCount; b++)
                 {
                     auto* dataPtr  = static_cast<uint8_t*>(pristineB.cpuInput.valid.get())
