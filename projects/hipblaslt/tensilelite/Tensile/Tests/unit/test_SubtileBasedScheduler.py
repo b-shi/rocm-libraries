@@ -29,7 +29,7 @@ def create_kernel(MT0=256, MT1=256, fp4=False):
     mxblock = 32 if fp4 else 0
     bpe = 0.5 if fp4 else 2
     matrixInstK = 128 if fp4 else 32
-    depthU = 256 if fp4 else 64
+    depthU = 512 if fp4 else 64
     dtype = _mock_dtype(bpe)
     problemType = {
         "DataTypeA": dtype,
@@ -99,6 +99,7 @@ def test_PGR2_64_64_1x1():
     kernel = create_kernel(MT0,MT1)
     tiA = TileInfo('A', kernel)
     tiB = TileInfo('B', kernel)
+  
     # 2x2 partition grid
     lsgA = tiA.localSubtileGrid[0]
     lsgB = tiB.localSubtileGrid[0]
@@ -119,7 +120,7 @@ def test_PGR2_64_64_1x1():
     actual = buf.getvalue()
 
     expected = """\
-SubtileGridA=2, SubtileGridB=2
+SubtileGridA=2x1, SubtileGridB=2x1
 Partition grid: 1 x 1
 Partition size: 2 x 2
 Prefetch: HALF_PREFETCH
@@ -132,39 +133,39 @@ Ordering grid (COLUMN_MAJOR):
    0
 
 PRELOOP:
-  GR (MT 0):  A: [0, 1]  B: [0, 1]
+  GR (MT 0, sId1 0):  A: [0, 1]  B: [0, 1]
   GR_INC
   WAIT_GR (MT 0) A: [0, 1]  B: [0, 1] — inflight SubtileLoads A=0 B=0 scaleA=0 scaleB=0
   SYNC
-  LR (MT 0, subIterK 0) A: [0, 1]  B: [0, 1]
+  LR (MT 0, sId1 0, subIterK 0) A: [0, 1]  B: [0, 1]
     - LOAD  A: {0: 0, 1: 1}  B: {0: 2, 1: 3}
   WAIT_LR
   SKIP_IF_LE(1, NLL)
-  GR (MT 1):  A: [0, 1]  B: [0, 1]
+  GR (MT 1, sId1 0):  A: [0, 1]  B: [0, 1]
   GR_INC
   SKIP_IF_LE(2, NGLL)
 
 MAINLOOP:
   Partition 0:
-    subIterK=0:
-      MFMAs (MT n, subIterK 0):
+    sId1=0 subIterK=0:
+      MFMAs (MT n, sId1 0, subIterK 0):
         - [(0, 0), (0, 1), (1, 0), (1, 1)]
         - USING  A: {0: 0, 1: 1}  B: {0: 2, 1: 3}
         before: [none]  after: [none]
-      LR (MT n, subIterK 1) A: [0, 1]  B: [0, 1]
+      LR (MT n, sId1 0, subIterK 1) A: [0, 1]  B: [0, 1]
         - LOAD  A: {0: 4, 1: 5}  B: {0: 6, 1: 7}
         before: [none]  after: [WaitLROp]
-      GR (MT n+2):  A: [0]  B: [0]
-        before: [LR(MT n, sik 1), WaitLROp, SyncOp]  after: [none]
-    subIterK=1:
-      MFMAs (MT n, subIterK 1):
+      GR (MT n+2, sId1 0):  A: [0]  B: [0]
+        before: [LR(MT n, sId1 0, sik 1), WaitLROp, SyncOp]  after: [none]
+    sId1=0 subIterK=1:
+      MFMAs (MT n, sId1 0, subIterK 1):
         - [(0, 0), (0, 1), (1, 0), (1, 1)]
         - USING  A: {0: 4, 1: 5}  B: {0: 6, 1: 7}
         before: [none]  after: [none]
-      LR (MT n+1, subIterK 0) A: [0, 1]  B: [0, 1]
+      LR (MT n+1, sId1 0, subIterK 0) A: [0, 1]  B: [0, 1]
         - LOAD  A: {0: 0, 1: 1}  B: {0: 2, 1: 3}
         before: [WaitGROp(A=1 B=1 SA=0 SB=0), SyncOp, LR_INCOp]  after: [WaitLROp]
-      GR (MT n+2):  A: [1]  B: [1]
+      GR (MT n+2, sId1 0):  A: [1]  B: [1]
         before: [none]  after: [GR_INCOp]
 """
 
@@ -184,6 +185,7 @@ def test_PGR2_64_64_1x1_fp4():
     s = SubtileBasedScheduler(tiA, tiB, cfg,
                               scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB)
 
+    # HALF_PREFETCH: only 2 flatK alive at a time → 2 × 2 subtiles × 2 (A+B) = 8
     assert s.totalVGPRTiles == 8
     assert s.totalScaleVGPRTiles == 2
     assert s.hasScale
@@ -196,26 +198,26 @@ def test_PGR2_64_64_1x1_fp4():
     expected = """\
 MAINLOOP:
   Partition 0:
-    subIterK=0:
-      MFMAs (MT n, subIterK 0):
+    sId1=0 subIterK=0:
+      MFMAs (MT n, sId1 0, subIterK 0):
         - USING  A: {0: 0, 1: 1}  B: {0: 2, 1: 3}
         - SCALE  A: {0: 0}  B: {0: 1}
         before: [none]  after: [none]
-      LR (MT n, subIterK 1) A: [0, 1]  B: [0, 1]
+      LR (MT n, sId1 0, subIterK 1) A: [0, 1]  B: [0, 1]
         - LOAD  A: {0: 4, 1: 5}  B: {0: 6, 1: 7}
         before: [none]  after: [WaitLROp]
-      GR (MT n+2):  A: [0]  B: [0]
-        before: [LR(MT n, sik 1), WaitLROp, SyncOp]  after: [none]
-    subIterK=1:
-      MFMAs (MT n, subIterK 1):
+      GR (MT n+2, sId1 0):  A: [0]  B: [0]
+        before: [LR(MT n, sId1 0, sik 1), WaitLROp, SyncOp]  after: [none]
+    sId1=0 subIterK=1:
+      MFMAs (MT n, sId1 0, subIterK 1):
         - USING  A: {0: 4, 1: 5}  B: {0: 6, 1: 7}
         - SCALE  A: {0: 0}  B: {0: 1}
         before: [none]  after: [none]
-      LR (MT n+1, subIterK 0) A: [0, 1]  B: [0, 1]
+      LR (MT n+1, sId1 0, subIterK 0) A: [0, 1]  B: [0, 1]
         - LOAD  A: {0: 0, 1: 1}  B: {0: 2, 1: 3}
         - SCALE  A: {0: 0}  B: {0: 1}
         before: [WaitGROp(A=1 B=1 SA=1 SB=1), SyncOp, LR_INCOp]  after: [WaitLROp]
-      GR (MT n+2):  A: [1]  B: [1]
+      GR (MT n+2, sId1 0):  A: [1]  B: [1]
         before: [none]  after: [GR_INCOp]
 """
 
@@ -247,7 +249,7 @@ def test_PGR2_64_64_2x2():
     actual = buf.getvalue()
 
     expected = """\
-SubtileGridA=2, SubtileGridB=2
+SubtileGridA=2x1, SubtileGridB=2x1
 Partition grid: 2 x 2
 Partition size: 1 x 1
 Prefetch: HALF_PREFETCH
@@ -261,94 +263,94 @@ Ordering grid (COLUMN_MAJOR):
    1   3
 
 PRELOOP:
-  GR (MT 0):  A: [0]  B: [0]
-  GR (MT 0):  A: [1]  B: []
-  GR (MT 0):  A: []  B: [1]
+  GR (MT 0, sId1 0):  A: [0]  B: [0]
+  GR (MT 0, sId1 0):  A: [1]  B: []
+  GR (MT 0, sId1 0):  A: []  B: [1]
   GR_INC
   WAIT_GR (MT 0) A: [0, 1]  B: [0, 1] — inflight SubtileLoads A=0 B=0 scaleA=0 scaleB=0
   SYNC
-  LR (MT 0, subIterK 0) A: [0]  B: [0]
+  LR (MT 0, sId1 0, subIterK 0) A: [0]  B: [0]
     - LOAD  A: {0: 0}  B: {0: 1}
   WAIT_LR
   SKIP_IF_LE(1, NLL)
-  GR (MT 1):  A: [0]  B: [0]
+  GR (MT 1, sId1 0):  A: [0]  B: [0]
   SKIP_IF_LE(2, NGLL)
 
 MAINLOOP:
   Partition 0:
-    subIterK=0:
-      MFMAs (MT n, subIterK 0):
+    sId1=0 subIterK=0:
+      MFMAs (MT n, sId1 0, subIterK 0):
         - [(0, 0)]
         - USING  A: {0: 0}  B: {0: 1}
         before: [none]  after: [none]
-      LR (MT n, subIterK 1) A: [0]  B: [0]
+      LR (MT n, sId1 0, subIterK 1) A: [0]  B: [0]
         - LOAD  A: {0: 2}  B: {0: 3}
         before: [none]  after: [WaitLROp]
-      GR (MT n+1):  A: [1]  B: []
+      GR (MT n+1, sId1 0):  A: [1]  B: []
         before: [none]  after: [none]
-    subIterK=1:
-      MFMAs (MT n, subIterK 1):
+    sId1=0 subIterK=1:
+      MFMAs (MT n, sId1 0, subIterK 1):
         - [(0, 0)]
         - USING  A: {0: 2}  B: {0: 3}
         before: [none]  after: [none]
-      LR (MT n, subIterK 0) A: [1]  B: []
+      LR (MT n, sId1 0, subIterK 0) A: [1]  B: []
         - LOAD  A: {1: 4}  B: {}
         before: [WaitGROp(A=2 B=2 SA=0 SB=0), SyncOp]  after: [WaitLROp]
   Partition 1:
-    subIterK=0:
-      MFMAs (MT n, subIterK 0):
+    sId1=0 subIterK=0:
+      MFMAs (MT n, sId1 0, subIterK 0):
         - [(1, 0)]
         - USING  A: {1: 4}  B: {0: 1}
         before: [none]  after: [none]
-      LR (MT n, subIterK 1) A: [1]  B: []
+      LR (MT n, sId1 0, subIterK 1) A: [1]  B: []
         - LOAD  A: {1: 5}  B: {}
         before: [none]  after: [WaitLROp]
-      GR (MT n+1):  A: []  B: [1]
+      GR (MT n+1, sId1 0):  A: []  B: [1]
         before: [none]  after: [GR_INCOp]
-    subIterK=1:
-      MFMAs (MT n, subIterK 1):
+    sId1=0 subIterK=1:
+      MFMAs (MT n, sId1 0, subIterK 1):
         - [(1, 0)]
         - USING  A: {1: 5}  B: {0: 3}
         before: [none]  after: [none]
-      LR (MT n, subIterK 0) A: []  B: [1]
+      LR (MT n, sId1 0, subIterK 0) A: []  B: [1]
         - LOAD  A: {}  B: {1: 6}
         before: [WaitGROp(A=2 B=2 SA=0 SB=0), SyncOp]  after: [WaitLROp]
   Partition 2:
-    subIterK=0:
-      MFMAs (MT n, subIterK 0):
+    sId1=0 subIterK=0:
+      MFMAs (MT n, sId1 0, subIterK 0):
         - [(0, 1)]
         - USING  A: {0: 0}  B: {1: 6}
         before: [none]  after: [none]
-      LR (MT n, subIterK 1) A: []  B: [1]
+      LR (MT n, sId1 0, subIterK 1) A: []  B: [1]
         - LOAD  A: {}  B: {1: 7}
         before: [none]  after: [WaitLROp]
-    subIterK=1:
-      MFMAs (MT n, subIterK 1):
+    sId1=0 subIterK=1:
+      MFMAs (MT n, sId1 0, subIterK 1):
         - [(0, 1)]
         - USING  A: {0: 2}  B: {1: 7}
         before: [none]  after: [none]
-      LR (MT n, subIterK 0) A: []  B: []
+      LR (MT n, sId1 0, subIterK 0) A: []  B: []
         - LOAD  A: {}  B: {}
         before: [none]  after: [WaitLROp]
   Partition 3:
-    subIterK=0:
-      MFMAs (MT n, subIterK 0):
+    sId1=0 subIterK=0:
+      MFMAs (MT n, sId1 0, subIterK 0):
         - [(1, 1)]
         - USING  A: {1: 4}  B: {1: 6}
         before: [none]  after: [none]
-      LR (MT n, subIterK 1) A: []  B: []
+      LR (MT n, sId1 0, subIterK 1) A: []  B: []
         - LOAD  A: {}  B: {}
         before: [none]  after: [WaitLROp]
-      GR (MT n+2):  A: [0]  B: [0]
-        before: [LR(MT n, sik 1), WaitLROp, SyncOp]  after: [none]
-    subIterK=1:
-      MFMAs (MT n, subIterK 1):
+      GR (MT n+2, sId1 0):  A: [0]  B: [0]
+        before: [LR(MT n, sId1 0, sik 1), WaitLROp, SyncOp]  after: [none]
+    sId1=0 subIterK=1:
+      MFMAs (MT n, sId1 0, subIterK 1):
         - [(1, 1)]
         - USING  A: {1: 5}  B: {1: 7}
         before: [none]  after: [none]
-      LR (MT n+1, subIterK 0) A: [0]  B: [0]
+      LR (MT n+1, sId1 0, subIterK 0) A: [0]  B: [0]
         - LOAD  A: {0: 0}  B: {0: 1}
-        before: [GR(MT n+1), WaitGROp(A=2 B=2 SA=0 SB=0), SyncOp, LR_INCOp]  after: [WaitLROp]
+        before: [GR(MT n+1, sId1 0), WaitGROp(A=2 B=2 SA=0 SB=0), SyncOp, LR_INCOp]  after: [WaitLROp]
 """
 
     assert expected in actual
@@ -704,10 +706,11 @@ if __name__ == "__main__":
     parser.add_argument("--fp4", action="store_true", help="Enable FP4 path with MX scales")
     args = parser.parse_args()
 
-    MT0=MT1=256
+    MT0=MT1=64
     kernel = create_kernel(MT0, MT1, fp4=args.fp4)
     tiA = TileInfo('A', kernel)
     tiB = TileInfo('B', kernel)
+    print("TileInfo A:", tiA)
 
     scaleTiA = TileInfo('MXSA', kernel) if args.fp4 else None
     scaleTiB = TileInfo('MXSB', kernel) if args.fp4 else None
