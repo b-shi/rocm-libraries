@@ -159,7 +159,7 @@ globalParameters["CSVMergeSameProblemID"] = False
 # not tensileEqual for checking the result.
 # See ClientWriter.py, the DataInitName(Enum) for a list of initialization patterns
 #       - Problem-Independent: 0=0, 1=1, 2=2, 3=rand, 4=Nan, 5=Infinity, 6=BadInput(Nan), 7=BadOutput(Inf), 16=RandomNarrow,
-#                              21=RandomNegPosLimited(-128~128 or -1~1), 23~26=Ind Cos/Sin Abs or Not
+#                              21=RandomNegPosLimited(-128~128 or -1~1), 23~26=Ind Cos/Sin Abs or Not, 27=Fast1({-1,0,1})
 #       - Problem-dependent: 8=SerialID, 9=SerialDim0, 10=SerialDim1, 11=Identity, 12~15= Cos/Sin, Abs or Not
 #       For A, B, C, D: All the InitMode (0~16) can be used
 #       For Alpha/Beta: Only problem-independent init (0~7, 16, 23~26) can be used,
@@ -180,6 +180,7 @@ globalParameters["DataInitTypeScaleD"] = 2
 globalParameters["DataInitTypeScaleAlphaVec"] = 3
 globalParameters["DataInitTypeMXSA"] = 1
 globalParameters["DataInitTypeMXSB"] = 1
+globalParameters["Fast1Verbose"] = False  # Print detailed Fast1 init/validation stats; off by default
 globalParameters["DataInitValueActivationArgs"] = [2.0, 2.0]
 globalParameters["CEqualD"] = (
     False  # Set to true if testing for the case where the pointer to C is the same as D.

@@ -375,6 +375,7 @@ namespace TensileLite
                 ("use-e",                     po::value<bool>()->default_value(false), "Use E.")
                 ("use-gradient",              po::value<bool>()->default_value(false), "Use gradient.")
                 ("use-user-args",             po::value<bool>()->default_value(false), "Use user argument structure as kernel input.")
+                ("fast1-verbose",             po::value<bool>()->default_value(false), "Print detailed Fast1 init and validation statistics.")
                 ("rotating-buffer-size",      po::value<int32_t>()->default_value(0), "Size of rotating buffer in the unit of MB.")
                 ("rotating-buffer-mode",      po::value<int32_t>()->default_value(0), "Rotating mode.")
                 ("output-amaxD",              po::value<bool>()->default_value(false), "Output AmaxD.")

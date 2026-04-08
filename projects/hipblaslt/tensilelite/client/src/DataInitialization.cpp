@@ -27,6 +27,7 @@
 #include "DataInitialization.hpp"
 #include "TensorDataManipulation.hpp"
 #include "Utility.hpp"
+#include <mxDataGenerator/PreSwizzle.hpp>
 // #include "DataInitializationTyped.hpp"
 
 #include <Tensile/Utils.hpp>
@@ -196,6 +197,8 @@ namespace TensileLite
                 return "TrigIndAbsSin";
             case InitMode::TrigIndAbsCos:
                 return "TrigIndAbsCos";
+            case InitMode::Fast1:
+                return "Fast1";
 
             case InitMode::Count:
                 break;
@@ -267,6 +270,8 @@ namespace TensileLite
                 mode = InitMode::TrigIndAbsSin;
             else if(strValue == ToString(InitMode::TrigIndAbsCos))
                 mode = InitMode::TrigIndAbsCos;
+            else if(strValue == ToString(InitMode::Fast1))
+                mode = InitMode::Fast1;
             else if(std::all_of(strValue.begin(), strValue.end(), isdigit))
             {
                 int value = atoi(strValue.c_str());
@@ -888,6 +893,7 @@ namespace TensileLite
             , m_workspaceSize(problemFactory.workspaceSize())
             , m_pruneMode(args["prune-mode"].as<PruneSparseMode>())
             , m_mxScaleFormat(args["mx-scale-format"].as<int>())
+            , m_fast1Verbose(args["fast1-verbose"].as<bool>())
 
         {
             m_rotatingBuffer
@@ -1698,6 +1704,27 @@ namespace TensileLite
 
         void DataInitialization::initializeCPUInputs(ContractionProblemGemm const& problem)
         {
+            if(isFast1())
+            {
+                if(!isMXFP4Problem(problem))
+                    throw std::runtime_error(
+                        "[Fast1] Fast1 data initialization is only supported for MX FP4 (Float4) A/B tensors.");
+                // If only one of A/B is Fast1, promote the other so both share the same init mode.
+                m_vdata[ContractionProblemGemm::TENSOR::A].init = InitMode::Fast1;
+                m_vdata[ContractionProblemGemm::TENSOR::B].init = InitMode::Fast1;
+                if(problem.useBias())
+                    throw std::runtime_error(
+                        "[Fast1] Bias is not supported with Fast1 data initialization.");
+                if(problem.activationType() != ActivationType::None)
+                    throw std::runtime_error(
+                        "[Fast1] Activation/epilogue is not supported with Fast1 data initialization.");
+                if(problem.useE())
+                    throw std::runtime_error(
+                        "[Fast1] E output is not supported with Fast1 data initialization.");
+                // Force C = 0 so beta*C = 0 for all elements; ref = alpha * dotProduct.
+                m_vdata[ContractionProblemGemm::TENSOR::C].init = InitMode::Zero;
+            }
+
             bool useMXGenerator = isMXFP4Problem(problem);
             if(useMXGenerator)
                 initializeMXDataForFP4(problem);
@@ -1770,6 +1797,7 @@ namespace TensileLite
                     }
                 }
             }
+
         }
 
         static std::string_view initModeToMXMethod(InitMode mode)
@@ -1786,9 +1814,42 @@ namespace TensileLite
             case InitMode::SerialDim0:
             case InitMode::SerialDim1:
                 return "Sequential";
+            case InitMode::Fast1:
+                return "Fast1";
             default:
                 return "Bounded";
             }
+        }
+
+        // Count {-1, 0, 1} values along the K dimension of a packed FP4 buffer.
+        // kDim elements from the first row are sampled (M/N rows repeat the same pattern).
+        // E2M1 bit patterns: 0=0x0, 1=0x1 (also 0x2,0x3), -1=0x9 (also 0xa,0xb), 0x8=−0.
+        static void printFast1ValueCounts(const char* label,
+                                          const void* buf,
+                                          size_t      kDim)
+        {
+            const auto* packed = static_cast<const uint8_t*>(buf);
+            size_t      numPacks = kDim / 2;
+            size_t      cntNeg = 0, cntZero = 0, cntPos = 0, cntOther = 0;
+            for(size_t i = 0; i < numPacks; i++)
+            {
+                union { uint8_t bits; Float4x2 v; } u;
+                u.bits = packed[i];
+                for(int lane = 0; lane < 2; lane++)
+                {
+                    float val = u.v.getElement(lane);
+                    if(val < -0.5f)       cntNeg++;
+                    else if(val > 0.5f)   cntPos++;
+                    else if(val == 0.0f)  cntZero++;
+                    else                  cntOther++;
+                }
+            }
+            std::cout << "[Fast1] " << label << " K-dim value counts (K=" << kDim << "):"
+                      << "  -1=" << cntNeg
+                      << "  0=" << cntZero
+                      << "  1=" << cntPos;
+            if(cntOther) std::cout << "  other=" << cntOther;
+            std::cout << std::endl;
         }
 
         void DataInitialization::initializeMXDataForFP4(ContractionProblemGemm const& problem)
@@ -1834,12 +1895,62 @@ namespace TensileLite
                 }
             }
 
+            // Helper: E2M1 nibble for Fast1 integer values {-1, 0, 1}.
+            // -1 → 0xA (0b1010: sign=1, exp=01, mant=0 → -1.0), 0 → 0x0, 1 → 0x2 (0b0010 → 1.0)
+            auto toNibble = [](int8_t v) -> uint8_t {
+                if(v < 0) return 0xA;
+                if(v > 0) return 0x2;
+                return 0x0;
+            };
+
+            // Fill a FP4 buffer: only columns listed in `active` get the pattern; others are zero.
+            // For both transA=1 (K×M) and transB=0 (K×N) storage is column-major with strides={1,K}:
+            // column m occupies bytes [m*K/2, (m+1)*K/2).
+            auto fillTiledFP4 = [&](void* buf, const std::vector<int8_t>& pat,
+                                    size_t K, size_t MN, const std::vector<bool>& active) {
+                auto*  fp4      = static_cast<uint8_t*>(buf);
+                size_t colBytes = K / 2;
+                // Build the packed pattern for one active column
+                std::vector<uint8_t> colPat(colBytes);
+                for(size_t j = 0; j < colBytes; j++)
+                    colPat[j] = toNibble(pat[2*j]) | (toNibble(pat[2*j+1]) << 4);
+                // Write each column: pattern if active, zeros otherwise
+                for(size_t m = 0; m < MN; m++)
+                {
+                    if(active[m])
+                        std::memcpy(fp4 + m * colBytes, colPat.data(), colBytes);
+                    else
+                        std::memset(fp4 + m * colBytes, 0, colBytes);
+                }
+            };
+
+            // Fill a scale buffer: only rows listed in `active` get the kBlock pattern; others are
+            // zero (0x00 = zero scale block → contributes nothing to the dot product).
+            // Un-swizzled layout is row-major MN × kBlocks; optional GFX950 swizzle applied last.
+            auto fillTiledScale = [&](void* buf, const std::vector<uint8_t>& pat,
+                                      size_t MN, size_t kBlocks, bool doSwizzle,
+                                      const std::vector<bool>& active) {
+                std::vector<uint8_t> unswizzled(MN * kBlocks, 0x00);
+                for(size_t m = 0; m < MN; m++)
+                    if(active[m])
+                        for(size_t kb = 0; kb < kBlocks; kb++)
+                            unswizzled[m * kBlocks + kb] = pat[kb];
+                if(doSwizzle)
+                {
+                    auto swizzled = DGen::preSwizzleScalesGFX950(unswizzled, {MN, kBlocks});
+                    std::memcpy(buf, swizzled.data(), swizzled.size());
+                }
+                else
+                {
+                    std::memcpy(buf, unswizzled.data(), unswizzled.size());
+                }
+            };
+
             if(isMXFP4Tensor(problem.a(), problem.mxBlockA()))
             {
                 auto const& tensorA = problem.a();
-                auto        rows    = tensorA.sizes()[0];
-                auto        cols    = tensorA.sizes()[1];
-                auto        stride  = tensorA.strides()[1];
+                auto        rows    = tensorA.sizes()[0];  // K for transA=1
+                auto        cols    = tensorA.sizes()[1];  // M for transA=1
 
                 auto& pristineA
                     = m_vdata[ContractionProblemGemm::TENSOR::A].pristine[rocisa::DataType::Float4];
@@ -1847,29 +1958,76 @@ namespace TensileLite
                     = m_vdata[ContractionProblemGemm::TENSOR::MXSA].pristine[problem.mxsa().dataType()];
 
                 auto initA = m_vdata[ContractionProblemGemm::TENSOR::A].init;
-                generateMXInput((hipDataType)HIP_R_4F_E2M1,
-                                pristineA.cpuInput.valid.get(),
-                                pristineMXScaleA.cpuInput.valid.get(),
-                                rows,
-                                cols,
-                                stride,
-                                problem.transA(),
-                                preSwizzleA,
-                                preTileA,
-                                problem.mxBlockA(),
-                                1,
-                                true,
-                                initModeToMXMethod(initA),
-                                -1.0f,
-                                1.0f);
+                if(initA == InitMode::Fast1)
+                {
+                    size_t K       = rows;
+                    size_t M       = cols;
+                    size_t kBlocks = K / problem.mxBlockA();
+
+                    // Generate 1D K-element integer pattern {-1,0,1} shared by active rows of A
+                    m_fast1IntPatA.resize(K);
+                    static const int8_t kFast1Vals[3] = {-1, 0, 1};
+                    for(size_t k = 0; k < K; k++)
+                        m_fast1IntPatA[k] = kFast1Vals[getThreadLocalRandInt() % 3];
+
+                    // Generate 1D kBlock scale pattern {0x00, 0x7F} shared by active rows
+                    m_fast1ScalePatA.resize(kBlocks);
+                    for(size_t kb = 0; kb < kBlocks; kb++)
+                        m_fast1ScalePatA[kb] = (getThreadLocalRandInt() % 2) ? 0x7F : 0x00;
+                    m_fast1MxBlockA = problem.mxBlockA();
+
+                    // Randomly select which rows of A carry the pattern (~50% active)
+                    m_fast1ActiveRowsA.resize(M);
+                    size_t activeRowCount = 0;
+                    for(size_t m = 0; m < M; m++)
+                    {
+                        m_fast1ActiveRowsA[m] = (getThreadLocalRandInt() % 2) != 0;
+                        if(m_fast1ActiveRowsA[m]) activeRowCount++;
+                    }
+
+                    bool verbose = m_fast1Verbose;
+                    if(verbose)
+                        std::cout << "[Fast1] CPU init A: FP4 " << K << "x" << M
+                                  << " (tiled, kBlocks=" << kBlocks
+                                  << ", activeRows=" << activeRowCount << "/" << M << ")"
+                                  << std::endl;
+
+                    fillTiledFP4(pristineA.cpuInput.valid.get(), m_fast1IntPatA, K, M,
+                                 m_fast1ActiveRowsA);
+                    fillTiledScale(pristineMXScaleA.cpuInput.valid.get(),
+                                   m_fast1ScalePatA, M, kBlocks, !preSwizzleA.empty(),
+                                   m_fast1ActiveRowsA);
+
+                    if(verbose)
+                    {
+                        printFast1ValueCounts("A", pristineA.cpuInput.valid.get(), K);
+                        size_t cnt0 = 0, cnt1 = 0;
+                        for(uint8_t s : m_fast1ScalePatA)
+                            (s == 0x7F ? cnt1 : cnt0)++;
+                        std::cout << "[Fast1] scaleA K-dim scale counts (kBlocks=" << kBlocks << "):"
+                                  << "  0=" << cnt0 << "  1=" << cnt1 << std::endl;
+                        std::cout << "[Fast1] CPU copy A -> GPU" << std::endl;
+                    }
+                }
+                else
+                {
+                    auto stride = tensorA.strides()[1];
+                    generateMXInput((hipDataType)HIP_R_4F_E2M1,
+                                    pristineA.cpuInput.valid.get(),
+                                    pristineMXScaleA.cpuInput.valid.get(),
+                                    rows, cols, stride,
+                                    problem.transA(),
+                                    preSwizzleA, preTileA,
+                                    problem.mxBlockA(), 1, true,
+                                    initModeToMXMethod(initA), -1.0f, 1.0f);
+                }
             }
 
             if(isMXFP4Tensor(problem.b(), problem.mxBlockB()))
             {
                 auto const& tensorB = problem.b();
-                auto        rows    = tensorB.sizes()[0];
-                auto        cols    = tensorB.sizes()[1];
-                auto        stride  = tensorB.strides()[1];
+                auto        rows    = tensorB.sizes()[0];  // K for transB=0
+                auto        cols    = tensorB.sizes()[1];  // N for transB=0
 
                 auto& pristineB
                     = m_vdata[ContractionProblemGemm::TENSOR::B].pristine[rocisa::DataType::Float4];
@@ -1877,21 +2035,69 @@ namespace TensileLite
                     = m_vdata[ContractionProblemGemm::TENSOR::MXSB].pristine[problem.mxsb().dataType()];
 
                 auto initB = m_vdata[ContractionProblemGemm::TENSOR::B].init;
-                generateMXInput((hipDataType)HIP_R_4F_E2M1,
-                                pristineB.cpuInput.valid.get(),
-                                pristineMXScaleB.cpuInput.valid.get(),
-                                rows,
-                                cols,
-                                stride,
-                                problem.transB(),
-                                preSwizzleB,
-                                preTileB,
-                                problem.mxBlockB(),
-                                1,
-                                false,
-                                initModeToMXMethod(initB),
-                                -1.0f,
-                                1.0f);
+                if(initB == InitMode::Fast1)
+                {
+                    size_t K       = rows;
+                    size_t N       = cols;
+                    size_t kBlocks = K / problem.mxBlockB();
+
+                    // Generate 1D K-element integer pattern {-1,0,1} shared by active cols of B
+                    m_fast1IntPatB.resize(K);
+                    static const int8_t kFast1Vals[3] = {-1, 0, 1};
+                    for(size_t k = 0; k < K; k++)
+                        m_fast1IntPatB[k] = kFast1Vals[getThreadLocalRandInt() % 3];
+
+                    // Generate 1D kBlock scale pattern {0x00, 0x7F} shared by active cols
+                    m_fast1ScalePatB.resize(kBlocks);
+                    for(size_t kb = 0; kb < kBlocks; kb++)
+                        m_fast1ScalePatB[kb] = (getThreadLocalRandInt() % 2) ? 0x7F : 0x00;
+                    m_fast1MxBlockB = problem.mxBlockB();
+
+                    // Randomly select which cols of B carry the pattern (~50% active)
+                    m_fast1ActiveColsB.resize(N);
+                    size_t activeColCount = 0;
+                    for(size_t n = 0; n < N; n++)
+                    {
+                        m_fast1ActiveColsB[n] = (getThreadLocalRandInt() % 2) != 0;
+                        if(m_fast1ActiveColsB[n]) activeColCount++;
+                    }
+
+                    bool verbose = m_fast1Verbose;
+                    if(verbose)
+                        std::cout << "[Fast1] CPU init B: FP4 " << K << "x" << N
+                                  << " (tiled, kBlocks=" << kBlocks
+                                  << ", activeCols=" << activeColCount << "/" << N << ")"
+                                  << std::endl;
+
+                    fillTiledFP4(pristineB.cpuInput.valid.get(), m_fast1IntPatB, K, N,
+                                 m_fast1ActiveColsB);
+                    fillTiledScale(pristineMXScaleB.cpuInput.valid.get(),
+                                   m_fast1ScalePatB, N, kBlocks, !preSwizzleB.empty(),
+                                   m_fast1ActiveColsB);
+
+                    if(verbose)
+                    {
+                        printFast1ValueCounts("B", pristineB.cpuInput.valid.get(), K);
+                        size_t cnt0 = 0, cnt1 = 0;
+                        for(uint8_t s : m_fast1ScalePatB)
+                            (s == 0x7F ? cnt1 : cnt0)++;
+                        std::cout << "[Fast1] scaleB K-dim scale counts (kBlocks=" << kBlocks << "):"
+                                  << "  0=" << cnt0 << "  1=" << cnt1 << std::endl;
+                        std::cout << "[Fast1] CPU copy B -> GPU" << std::endl;
+                    }
+                }
+                else
+                {
+                    auto stride = tensorB.strides()[1];
+                    generateMXInput((hipDataType)HIP_R_4F_E2M1,
+                                    pristineB.cpuInput.valid.get(),
+                                    pristineMXScaleB.cpuInput.valid.get(),
+                                    rows, cols, stride,
+                                    problem.transB(),
+                                    preSwizzleB, preTileB,
+                                    problem.mxBlockB(), 1, false,
+                                    initModeToMXMethod(initB), -1.0f, 1.0f);
+                }
             }
         }
 

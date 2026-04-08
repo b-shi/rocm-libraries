@@ -35,6 +35,8 @@
 #include <Tensile/hip/HipUtils.hpp>
 
 #include <cstddef>
+#include <cmath>
+#include <iomanip>
 
 namespace TensileLite
 {
@@ -116,6 +118,13 @@ namespace TensileLite
                     m_referenceInputs = m_dataInit->prepareCPUInputs(problem);
                 }
 
+                if(m_dataInit->isFast1())
+                {
+                    if(m_dataInit->fast1Verbose())
+                        std::cout << "[Fast1] Skipping CPU reference GEMM"
+                                     " (exact result known for {-1,0,1} inputs)" << std::endl;
+                }
+                else
                 {
                     ScopedTimer timer("cpu_reference_gemm");
                     SolveCPU(problem, m_referenceInputs.get(), m_elementsToValidate);
@@ -157,6 +166,189 @@ namespace TensileLite
             m_executedSolution = true;
         }
 
+        // Fast1 reference validation for MX FP4.
+        // All rows of A share patA[k] and all cols of B share patB[k], so D[m,n,b] is the same
+        // scalar for every output element.  We compute that scalar via an integer dot product
+        // gated by the {0,1} block scales, then verify every GPU output matches it.
+        static bool validateFast1Gemm(ContractionProblemGemm const& problem,
+                                      const void*                        cpuD,
+                                      std::shared_ptr<DataInitialization> dataInit,
+                                      float alpha,
+                                      float beta,
+                                      bool  verbose)
+        {
+            if(!dataInit->hasFast1Patterns())
+            {
+                if(verbose)
+                    std::cout << "[Fast1] No patterns stored, skipping Fast1 validation"
+                              << std::endl;
+                return true;
+            }
+
+            const auto& patA      = dataInit->fast1IntPatA();
+            const auto& patB      = dataInit->fast1IntPatB();
+            const auto& scalePatA = dataInit->fast1ScalePatA();
+            const auto& scalePatB = dataInit->fast1ScalePatB();
+            size_t      mxBlockA  = dataInit->fast1MxBlockA();
+            size_t      mxBlockB  = dataInit->fast1MxBlockB();
+            size_t      K         = patA.size();
+            size_t      kBlocksA  = scalePatA.size();
+            size_t      kBlocksB  = scalePatB.size();
+
+            if(K == 0 || kBlocksA == 0 || kBlocksB == 0 || mxBlockA != mxBlockB)
+            {
+                if(verbose)
+                    std::cout << "[Fast1] Pattern sizes inconsistent, skipping validation"
+                              << std::endl;
+                return true;
+            }
+
+            // Integer dot product over K, skipping blocks where either scale is zero.
+            int64_t dotProduct = 0;
+            for(size_t kb = 0; kb < kBlocksA; kb++)
+            {
+                if(scalePatA[kb] == 0x00 || scalePatB[kb] == 0x00)
+                    continue;
+                size_t kStart = kb * mxBlockA;
+                size_t kEnd   = std::min(kStart + mxBlockA, K);
+                for(size_t k = kStart; k < kEnd; k++)
+                    dotProduct += static_cast<int64_t>(patA[k]) * static_cast<int64_t>(patB[k]);
+            }
+
+            // C is forced to zero, so beta term vanishes.  Ref = alpha * dotProduct for active (m,n), 0 elsewhere.
+            float expected = alpha * static_cast<float>(dotProduct);
+            const auto& activeRowsA = dataInit->fast1ActiveRowsA();
+            const auto& activeColsB = dataInit->fast1ActiveColsB();
+
+            size_t M          = problem.freeSizeA(0);
+            size_t N          = problem.freeSizeB(0);
+            size_t batchCount = problem.batchSize(0);
+            size_t totalElems = M * N * batchCount;
+
+            size_t activeM = 0, activeN = 0;
+            if(!activeRowsA.empty())
+            {
+                for(bool v : activeRowsA) if(v) activeM++;
+            }
+            else
+                activeM = M;
+            if(!activeColsB.empty())
+            {
+                for(bool v : activeColsB) if(v) activeN++;
+            }
+            else
+                activeN = N;
+
+            size_t nonZeroElems = (expected != 0.0f) ? activeM * activeN * batchCount : 0;
+            double density      = (totalElems > 0) ? static_cast<double>(nonZeroElems) / totalElems : 0.0;
+
+            if(verbose)
+                std::cout << "[Fast1] dot=" << dotProduct
+                          << "  alpha=" << alpha
+                          << "  expected=" << expected
+                          << "  density=" << (density * 100.0) << "%"
+                          << " (" << nonZeroElems << "/" << totalElems << ")"
+                          << std::endl;
+
+            size_t failures   = 0;
+            size_t checked    = 0;
+
+            auto const& dTensor  = problem.d();
+            auto        destType = dTensor.dataType();
+
+            // Tolerance = K * machine_epsilon(destType).
+            // For integer types epsilon is 0 (exact).
+            float typeEpsilon = 0.0f;
+            switch(destType)
+            {
+            case rocisa::DataType::Float:    typeEpsilon = std::numeric_limits<float>::epsilon(); break;
+            case rocisa::DataType::BFloat16: typeEpsilon = 1.0f / 128.0f;   break; // 2^-7
+            default:                         typeEpsilon = 0.0f;             break;
+            }
+            float tolerance = static_cast<float>(K) * typeEpsilon;
+
+            // Read element at flat index `idx` from the CPU D buffer as float,
+            // and also return the raw bits and their byte width for hex printing.
+            // Only Float and BFloat16 are supported dest types for FP4 GEMMs.
+            struct DElement { float value; uint32_t rawBits; int byteWidth; };
+            auto readD = [&](size_t idx) -> DElement {
+                switch(destType)
+                {
+                case rocisa::DataType::Float: {
+                    float v = static_cast<const float*>(cpuD)[idx];
+                    uint32_t bits; std::memcpy(&bits, &v, 4);
+                    return {v, bits, 4};
+                }
+                case rocisa::DataType::BFloat16: {
+                    BFloat16 v = static_cast<const BFloat16*>(cpuD)[idx];
+                    uint16_t bits; std::memcpy(&bits, &v, 2);
+                    return {float(v), bits, 2};
+                }
+                default:
+                    throw std::runtime_error(
+                        "[Fast1] Unsupported dest data type for Fast1 validation: "
+                        + TensileLite::ToString(destType));
+                }
+            };
+
+            for(size_t b = 0; b < batchCount && failures < 10; b++)
+            {
+                for(size_t n = 0; n < N && failures < 10; n++)
+                {
+                    for(size_t m = 0; m < M && failures < 10; m++)
+                    {
+                        bool  rowActive = activeRowsA.empty() || activeRowsA[m];
+                        bool  colActive = activeColsB.empty() || activeColsB[n];
+                        float ref       = (rowActive && colActive) ? expected : 0.0f;
+
+                        std::vector<int64_t> coord = {static_cast<int64_t>(m),
+                                                      static_cast<int64_t>(n),
+                                                      static_cast<int64_t>(b)};
+                        size_t   idx  = dTensor.index(coord);
+                        auto     elem = readD(idx);
+                        float    got  = elem.value;
+                        checked++;
+                        if(std::abs(got - ref) > tolerance)
+                        {
+                            if(failures == 0)
+                            {
+                                // Compute ref bits in the native dest type width
+                                int      hexDigits = elem.byteWidth * 2;
+                                uint32_t refBits   = 0;
+                                if(destType == rocisa::DataType::BFloat16)
+                                {
+                                    BFloat16 refNative(ref);
+                                    uint16_t b16; std::memcpy(&b16, &refNative, 2);
+                                    refBits = b16;
+                                }
+                                else
+                                    std::memcpy(&refBits, &ref, 4);
+
+                                std::cout << "[Fast1] MISMATCH at (m=" << m << ",n=" << n
+                                          << ",b=" << b << "): got=" << got
+                                          << "(0x" << std::hex << std::setfill('0')
+                                          << std::setw(hexDigits) << elem.rawBits << std::dec << ")"
+                                          << " expected=" << ref
+                                          << "(0x" << std::hex << std::setfill('0')
+                                          << std::setw(hexDigits) << refBits << std::dec << ")"
+                                          << " diff=" << std::abs(got - ref)
+                                          << " tol=" << tolerance
+                                          << " (rowActive=" << rowActive
+                                          << " colActive=" << colActive << ")" << std::endl;
+                            }
+                            failures++;
+                        }
+                    }
+                }
+            }
+
+            if(failures > 0)
+                std::cout << "[Fast1] Validation FAILED: " << failures << " mismatches in "
+                          << checked << " elements checked" << std::endl;
+
+            return failures == 0;
+        }
+
         bool ReferenceValidator::validateSolution(std::shared_ptr<ProblemInputs> inputs)
         {
             if(!m_enabled)
@@ -181,7 +373,26 @@ namespace TensileLite
                 {
                     auto reference = dynamic_cast<ContractionInputs const&>(*m_referenceInputs);
                     auto result    = dynamic_cast<ContractionInputs const&>(*inputs);
-                    rv             = validate(*problem, reference, result);
+                    if(m_dataInit->isFast1())
+                    {
+                        float  alpha    = std::get<float>(reference.alpha);
+                        float  beta     = std::get<float>(reference.beta);
+                        size_t dBytes   = problem->d().totalAllocatedBytes();
+                        allocateResultBuffer(dBytes);
+                        HIP_CHECK_EXC(hipMemcpy(m_cpuResultBuffer.get(),
+                                                result.d,
+                                                dBytes,
+                                                hipMemcpyDeviceToHost));
+                        rv = validateFast1Gemm(
+                            *problem, m_cpuResultBuffer.get(), m_dataInit, alpha, beta,
+                            m_dataInit->fast1Verbose());
+                        if(!rv)
+                            m_errorInSolution = true;
+                    }
+                    else
+                    {
+                        rv = validate(*problem, reference, result);
+                    }
                 }
                 else
                 {
