@@ -1808,10 +1808,11 @@ namespace TensileLite
                 {
                     if(problem.mxBlockA() > 0 && MiK % problem.mxBlockA() == 0)
                     {
-                        // scale tensor: scaleRows = sizes[0]/mxBlock, scaleCols = sizes[1]
-                        // preSwizzle requires both to be multiples of their tile dimensions
-                        size_t scaleRowsA = problem.a().sizes()[0] / problem.mxBlockA();
-                        size_t scaleColsA = problem.a().sizes()[1];
+                        // Scale tensor dimensions from setMXScaleA are already padded
+                        // (K/mxBlock to multiple of 8, M to multiple of 32)
+                        auto const& mxsaSizes = problem.mxsa().sizes();
+                        size_t scaleRowsA = mxsaSizes[0];
+                        size_t scaleColsA = mxsaSizes[1];
                         if(scaleRowsA % tileK == 0 && scaleColsA % swizzleTileMN == 0)
                         {
                             size_t subTileK = MiK / problem.mxBlockA();
@@ -1822,8 +1823,11 @@ namespace TensileLite
 
                     if(problem.mxBlockB() > 0 && MiK % problem.mxBlockB() == 0)
                     {
-                        size_t scaleRowsB = problem.b().sizes()[0] / problem.mxBlockB();
-                        size_t scaleColsB = problem.b().sizes()[1];
+                        // Scale tensor dimensions from setMXScaleB are already padded
+                        // (K/mxBlock to multiple of 8, N to multiple of 32)
+                        auto const& mxsbSizes = problem.mxsb().sizes();
+                        size_t scaleRowsB = mxsbSizes[0];
+                        size_t scaleColsB = mxsbSizes[1];
                         if(scaleRowsB % tileK == 0 && scaleColsB % swizzleTileMN == 0)
                         {
                             size_t subTileK = MiK / problem.mxBlockB();
@@ -1847,6 +1851,11 @@ namespace TensileLite
                     = m_vdata[ContractionProblemGemm::TENSOR::MXSA].pristine[problem.mxsa().dataType()];
 
                 auto initA = m_vdata[ContractionProblemGemm::TENSOR::A].init;
+
+                // Zero the scale buffer; padding beyond the valid region stays 0x00
+                std::memset(pristineMXScaleA.cpuInput.valid.get(),
+                            0x00,
+                            problem.mxsa().totalAllocatedElements());
                 generateMXInput((hipDataType)HIP_R_4F_E2M1,
                                 pristineA.cpuInput.valid.get(),
                                 pristineMXScaleA.cpuInput.valid.get(),
@@ -1877,6 +1886,11 @@ namespace TensileLite
                     = m_vdata[ContractionProblemGemm::TENSOR::MXSB].pristine[problem.mxsb().dataType()];
 
                 auto initB = m_vdata[ContractionProblemGemm::TENSOR::B].init;
+
+                // Zero the scale buffer; padding beyond the valid region stays 0x00
+                std::memset(pristineMXScaleB.cpuInput.valid.get(),
+                            0x00,
+                            problem.mxsb().totalAllocatedElements());
                 generateMXInput((hipDataType)HIP_R_4F_E2M1,
                                 pristineB.cpuInput.valid.get(),
                                 pristineMXScaleB.cpuInput.valid.get(),
