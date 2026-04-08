@@ -102,7 +102,32 @@ INSTANTIATE_TEST_SUITE_P(
         // K=32: ceil(32/32)=1 -> 8
         std::make_tuple(128u, 128u,  32u,  8u, 128u, 128u),
         // All unaligned: M=80->96, N=50->64, K=300->scaleK=16
-        std::make_tuple(80u,   50u, 300u, 16u,  96u,  64u)
+        std::make_tuple(80u,   50u, 300u, 16u,  96u,  64u),
+        // Non-multiple-of-32 M,N (multiples of 16): M=16->32, N=48->64
+        std::make_tuple(16u,   48u, 256u,  8u,  32u,  64u),
+        // M=48->64, N=16->32
+        std::make_tuple(48u,   16u, 256u,  8u,  64u,  32u),
+        // M=48->64, N=48->64 (both non-mult-of-32, mult-of-16)
+        std::make_tuple(48u,   48u, 256u,  8u,  64u,  64u),
+        // M=112->128, N=176->192 (larger mult-of-16 values)
+        std::make_tuple(112u, 176u, 256u,  8u, 128u, 192u),
+        // M=240->256, N=112->128 (just below 32-boundary)
+        std::make_tuple(240u, 112u, 512u, 16u, 256u, 128u),
+        // Odd M,N
+        std::make_tuple(17u,   33u, 256u,  8u,  32u,  64u),
+        std::make_tuple(33u,   17u, 256u,  8u,  64u,  32u),
+        std::make_tuple(63u,   63u, 256u,  8u,  64u,  64u),
+        std::make_tuple(97u,  129u, 256u,  8u, 128u, 160u),
+        std::make_tuple(3u,     5u, 256u,  8u,  32u,  32u),
+        // Even non-multiple-of-16: M=10->32, N=34->64
+        std::make_tuple(10u,   34u, 256u,  8u,  32u,  64u),
+        // Even non-multiple-of-16: M=50->64, N=100->128
+        std::make_tuple(50u,  100u, 256u,  8u,  64u, 128u),
+        // Even non-multiple-of-16: M=66->96, N=2->32
+        std::make_tuple(66u,    2u, 256u,  8u,  96u,  32u),
+        // Mixed odd M, even non-mult-of-16 N
+        std::make_tuple(7u,    26u, 256u,  8u,  32u,  32u),
+        std::make_tuple(99u,   50u, 256u,  8u, 128u,  64u)
     )
 );
 
