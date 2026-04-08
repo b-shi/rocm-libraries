@@ -77,6 +77,7 @@ class DataInitName(Enum):
   TrigIndCos = 24
   TrigIndAbsSin = 25
   TrigIndAbsCos = 26
+  Fast1 = 27
 
 class ClientLogLevel(Enum):
   Error = 0
@@ -705,6 +706,7 @@ def writeClientConfigIni(forBenchmark, problemSizes, biasTypeArgs, factorDimArgs
         param("library-update-comment",   globalParameters["LibraryUpdateComment"])
 
         param("use-user-args",            globalParameters["UseUserArgs"])
+        param("fast1-verbose",            globalParameters["Fast1Verbose"])
         param("rotating-buffer-size",     globalParameters["RotatingBufferSize"])
         param("rotating-buffer-mode",     globalParameters["RotatingMode"])
         if globalParameters["RocProfCounter"]:

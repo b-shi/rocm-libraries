@@ -88,6 +88,7 @@ namespace TensileLite
             TrigIndCos, // 24
             TrigIndAbsSin, // 25
             TrigIndAbsCos, // 26
+            Fast1, // 27 - random choice from {-1, 0, 1}
             Count
         };
 
@@ -532,6 +533,8 @@ namespace TensileLite
                 case InitMode::TrigIndAbsCos:
                 case InitMode::Count:
                     throw std::runtime_error("Invalid InitMode.");
+                case InitMode::Fast1:
+                    return getValue<T, InitMode::Fast1>();
                 }
             }
 
@@ -619,6 +622,9 @@ namespace TensileLite
                     break;
                 case InitMode::TrigIndAbsCos:
                     initArrayTrig<T, true, true>(array, elements);
+                    break;
+                case InitMode::Fast1:
+                    initArray<T, InitMode::Fast1>(array, elements);
                     break;
                 case InitMode::Count:
                     throw std::runtime_error("Invalid InitMode.");
@@ -708,6 +714,9 @@ namespace TensileLite
                     break;
                 case InitMode::RandomNegPosLimited:
                     initArray<T, InitMode::RandomNegPosLimited>(array, tensor);
+                    break;
+                case InitMode::Fast1:
+                    initArray<T, InitMode::Fast1>(array, tensor);
                     break;
                 case InitMode::Free:
                 case InitMode::Count:
@@ -844,6 +853,30 @@ namespace TensileLite
             {
                 return m_curBoundsCheck;
             }
+
+            // Returns true if A or B is initialised with Fast1 ({-1, 0, 1}).
+            bool isFast1() const
+            {
+                auto fast1 = [](const VectorDataInitProperties& v) {
+                    return v.init == InitMode::Fast1;
+                };
+                return m_vdata.size() > 1
+                       && (fast1(m_vdata[ContractionProblemGemm::TENSOR::A])
+                           || fast1(m_vdata[ContractionProblemGemm::TENSOR::B]));
+            }
+
+            // Fast1 reference patterns: all rows of A share patA[k], all cols of B share patB[k].
+            // Set during initializeMXDataForFP4 when Fast1 is active.
+            bool hasFast1Patterns() const { return !m_fast1IntPatA.empty(); }
+            bool fast1Verbose()     const { return m_fast1Verbose; }
+            const std::vector<int8_t>&  fast1IntPatA()     const { return m_fast1IntPatA; }
+            const std::vector<int8_t>&  fast1IntPatB()     const { return m_fast1IntPatB; }
+            const std::vector<uint8_t>& fast1ScalePatA()   const { return m_fast1ScalePatA; }
+            const std::vector<uint8_t>& fast1ScalePatB()   const { return m_fast1ScalePatB; }
+            const std::vector<bool>&    fast1ActiveRowsA() const { return m_fast1ActiveRowsA; }
+            const std::vector<bool>&    fast1ActiveColsB() const { return m_fast1ActiveColsB; }
+            size_t fast1MxBlockA() const { return m_fast1MxBlockA; }
+            size_t fast1MxBlockB() const { return m_fast1MxBlockB; }
 
             virtual bool needMoreBenchmarkRuns() const override
             {
@@ -1094,7 +1127,18 @@ namespace TensileLite
             ContractionSolution const*  m_currentSolution   = nullptr;
             ContractionProblemGemm const* m_currentGemmProblem = nullptr;
 
-            int m_mxScaleFormat = 0;
+            int  m_mxScaleFormat  = 0;
+            bool m_fast1Verbose   = false;
+
+            // Fast1 tiled reference patterns (set in initializeMXDataForFP4)
+            std::vector<int8_t>  m_fast1IntPatA;      // K integers {-1, 0, 1} for row pattern of A
+            std::vector<int8_t>  m_fast1IntPatB;      // K integers {-1, 0, 1} for col pattern of B
+            std::vector<uint8_t> m_fast1ScalePatA;    // K/mxBlockA bytes {0x00, 0x7F}
+            std::vector<uint8_t> m_fast1ScalePatB;    // K/mxBlockB bytes {0x00, 0x7F}
+            std::vector<bool>    m_fast1ActiveRowsA;  // true for rows of A that carry the pattern
+            std::vector<bool>    m_fast1ActiveColsB;  // true for cols of B that carry the pattern
+            size_t               m_fast1MxBlockA = 0;
+            size_t               m_fast1MxBlockB = 0;
         };
 
         template <>
@@ -3552,6 +3596,44 @@ namespace TensileLite
         {
             return MXScale(getValueWithUpperLowerBoundFP<float>());
         }
+
+        // Fast1: random choice from {-1, 0, 1} — only MX FP4 (Float4x2) is supported.
+        inline float getValueFast1Float()
+        {
+            static const float vals[3] = {-1.0f, 0.0f, 1.0f};
+            return vals[getThreadLocalRandInt() % 3];
+        }
+
+        // All non-FP4 types: fast-path error (problem-level check fires first).
+        template <> inline float       DataInitialization::getValue<float,       InitMode::Fast1>() { throw std::runtime_error("Fast1 only supported for MX FP4."); }
+        template <> inline double      DataInitialization::getValue<double,      InitMode::Fast1>() { throw std::runtime_error("Fast1 only supported for MX FP4."); }
+        template <> inline BFloat16    DataInitialization::getValue<BFloat16,    InitMode::Fast1>() { throw std::runtime_error("Fast1 only supported for MX FP4."); }
+        template <> inline Half        DataInitialization::getValue<Half,        InitMode::Fast1>() { throw std::runtime_error("Fast1 only supported for MX FP4."); }
+        template <> inline Float8      DataInitialization::getValue<Float8,      InitMode::Fast1>() { throw std::runtime_error("Fast1 only supported for MX FP4."); }
+        template <> inline BFloat8     DataInitialization::getValue<BFloat8,     InitMode::Fast1>() { throw std::runtime_error("Fast1 only supported for MX FP4."); }
+        template <> inline Float8_fnuz DataInitialization::getValue<Float8_fnuz, InitMode::Fast1>() { throw std::runtime_error("Fast1 only supported for MX FP4."); }
+        template <> inline BFloat8_fnuz DataInitialization::getValue<BFloat8_fnuz, InitMode::Fast1>() { throw std::runtime_error("Fast1 only supported for MX FP4."); }
+        template <> inline int32_t     DataInitialization::getValue<int32_t,     InitMode::Fast1>() { throw std::runtime_error("Fast1 only supported for MX FP4."); }
+        template <> inline int8_t      DataInitialization::getValue<int8_t,      InitMode::Fast1>() { throw std::runtime_error("Fast1 only supported for MX FP4."); }
+        template <> inline Int8x4      DataInitialization::getValue<Int8x4,      InitMode::Fast1>() { throw std::runtime_error("Fast1 only supported for MX FP4."); }
+        template <> inline std::complex<float>  DataInitialization::getValue<std::complex<float>,  InitMode::Fast1>() { throw std::runtime_error("Fast1 only supported for MX FP4."); }
+        template <> inline std::complex<double> DataInitialization::getValue<std::complex<double>, InitMode::Fast1>() { throw std::runtime_error("Fast1 only supported for MX FP4."); }
+        template <> inline MXScale     DataInitialization::getValue<MXScale,     InitMode::Fast1>() { throw std::runtime_error("Fast1 only supported for MX FP4."); }
+#ifndef _WIN32
+#ifdef TENSILE_USE_FP6
+        template <> inline Float6x32  DataInitialization::getValue<Float6x32,  InitMode::Fast1>() { throw std::runtime_error("Fast1 only supported for MX FP4."); }
+#endif
+#ifdef TENSILE_USE_BF6
+        template <> inline BFloat6x32 DataInitialization::getValue<BFloat6x32, InitMode::Fast1>() { throw std::runtime_error("Fast1 only supported for MX FP4."); }
+#endif
+#ifdef TENSILE_USE_FP4
+        template <>
+        inline Float4x2 DataInitialization::getValue<Float4x2, InitMode::Fast1>()
+        {
+            return Float4x2(getValueFast1Float(), getValueFast1Float());
+        }
+#endif
+#endif // !_WIN32
 
         template <>
         inline float DataInitialization::ConvertTo<float>(size_t i)
