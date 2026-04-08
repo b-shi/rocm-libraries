@@ -79,6 +79,15 @@ extern "C" __global__ void flush_icache()
                          :);
 }
 
+// Convert element count to byte count, accounting for sub-byte packing.
+// FP4 (4-bit) packs 2 elements per byte; all other types use realDataTypeSize.
+size_t elementsToBytes(size_t numElements, hipDataType dtype)
+{
+    if(static_cast<int>(dtype) == HIP_R_4F_E2M1_EXT)
+        return numElements / 2;
+    return numElements * realDataTypeSize(dtype);
+}
+
 bool isSwizzleSupported(hipDataType datatype)
 {
     switch(datatype)
@@ -1930,8 +1939,8 @@ void testing_matmul_with_bias(const Arguments& arg,
             // preTile for A: {tileK, tileM} - swap from preTileSizeForScaleA which returns {tileM, tileK}
             auto preTileATmp = preTileSizeForScaleA(arg.scaleA);
             auto preTileA = (preTileATmp.size() == 2) ? std::vector<size_t>{preTileATmp[1], preTileATmp[0]} : std::vector<size_t>{};
-            // FP4: 2 elements per byte. Compute batch strides for data and scale buffers.
-            size_t dataBatchBytesA  = (num_batches[i] > 1) ? stride_a[i] / 2 : 0;
+            // Compute batch strides in bytes for data and scale buffers.
+            size_t dataBatchBytesA  = (num_batches[i] > 1) ? elementsToBytes(stride_a[i], TiA) : 0;
             size_t scaleBatchBytesA = (num_batches[i] > 1) ? size_scaleAVec[i] : 0;
             // Generate MX data for each batch and collect reference floats
             std::vector<float> refAAll;
@@ -2002,8 +2011,8 @@ void testing_matmul_with_bias(const Arguments& arg,
             //       unnecessary hipMemCpy when CPU verification is not needed.
             // preTile for B: {tileK, tileN}
             auto preTileB = preTileSizeForScaleB(arg.scaleB);
-            // FP4: 2 elements per byte. Compute batch strides for data and scale buffers.
-            size_t dataBatchBytesB  = (num_batches[i] > 1) ? stride_b[i] / 2 : 0;
+            // Compute batch strides in bytes for data and scale buffers.
+            size_t dataBatchBytesB  = (num_batches[i] > 1) ? elementsToBytes(stride_b[i], TiB) : 0;
             size_t scaleBatchBytesB = (num_batches[i] > 1) ? size_scaleBVec[i] : 0;
             // Generate MX data for each batch and collect reference floats
             std::vector<float> refBAll;
