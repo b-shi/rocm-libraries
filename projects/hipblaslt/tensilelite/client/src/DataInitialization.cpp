@@ -1871,30 +1871,6 @@ namespace TensileLite
                                 initModeToMXMethod(initA),
                                 -1.0f,
                                 1.0f);
-
-                {
-                    // Overwrite scale buffer with user-specified init mode
-                    auto mxsaInit = m_vdata[ContractionProblemGemm::TENSOR::MXSA].init;
-                    initArray(problem.mxsa().dataType(),
-                              mxsaInit,
-                              pristineMXScaleA.cpuInput.valid.get(),
-                              problem.mxsa());
-
-                    // Re-apply pre-swizzle to the overwritten scale buffer
-                    if(preSwizzleA.size() == 3)
-                    {
-                        auto const& mxsaSizes = problem.mxsa().sizes();
-                        size_t scaleRows = mxsaSizes[0];
-                        size_t scaleCols = mxsaSizes[1];
-                        size_t scaleSize = problem.mxsa().totalAllocatedElements();
-                        auto*  scalePtr
-                            = static_cast<uint8_t*>(pristineMXScaleA.cpuInput.valid.get());
-                        std::vector<uint8_t> scaleVec(scalePtr, scalePtr + scaleSize);
-                        scaleVec
-                            = DGen::preSwizzleScalesGFX950(scaleVec, {scaleCols, scaleRows});
-                        std::memcpy(scalePtr, scaleVec.data(), scaleVec.size());
-                    }
-                }
             }
 
             if(isMXFP4Tensor(problem.b(), problem.mxBlockB()))
@@ -1930,30 +1906,6 @@ namespace TensileLite
                                 initModeToMXMethod(initB),
                                 -1.0f,
                                 1.0f);
-
-                {
-                    // Overwrite scale buffer with user-specified init mode
-                    auto mxsbInit = m_vdata[ContractionProblemGemm::TENSOR::MXSB].init;
-                    initArray(problem.mxsb().dataType(),
-                              mxsbInit,
-                              pristineMXScaleB.cpuInput.valid.get(),
-                              problem.mxsb());
-
-                    // Re-apply pre-swizzle to the overwritten scale buffer
-                    if(preSwizzleB.size() == 3)
-                    {
-                        auto const& mxsbSizes = problem.mxsb().sizes();
-                        size_t scaleRows = mxsbSizes[0];
-                        size_t scaleCols = mxsbSizes[1];
-                        size_t scaleSize = problem.mxsb().totalAllocatedElements();
-                        auto*  scalePtr
-                            = static_cast<uint8_t*>(pristineMXScaleB.cpuInput.valid.get());
-                        std::vector<uint8_t> scaleVec(scalePtr, scalePtr + scaleSize);
-                        scaleVec
-                            = DGen::preSwizzleScalesGFX950(scaleVec, {scaleCols, scaleRows});
-                        std::memcpy(scalePtr, scaleVec.data(), scaleVec.size());
-                    }
-                }
             }
         }
 
