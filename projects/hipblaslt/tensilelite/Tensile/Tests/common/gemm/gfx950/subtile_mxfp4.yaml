@@ -30,141 +30,6 @@ GlobalParameters:
 
 BenchmarkProblems:
   ########################################
-  # BF16 TN — no bias, DU = 2*MI_K = 64
-  #
-  # Full wave tile coverage:
-  #   - Symmetric (2x2, 4x4, 8x8 wavetile)
-  #   - Asymmetric (6x4, 2x6, 8x6 etc.)
-  #   - Different wave groups (1x1, 2x2, 4x1, 1x4)
-  #   - Odd wave tile sizes (3x4, 6x2, 3x2, 2x3, 2x9, 9x2)
-  #
-  # Problem sizes: K is always a multiple of DU=64.
-  # Covers full-tile (M,N mult of macro tile) and edge cases
-  # (M,N mult of 32 but NOT of macro tile).
-  ########################################
-  -
-    - # ProblemType
-      OperationType: GEMM
-      DataType: b
-      DestDataType: b
-      ComputeDataType: s
-      HighPrecisionAccumulate: True
-      TransposeA: 1
-      TransposeB: 0
-      UseBeta: True
-      Batched: True
-      ActivationFuncCall: True
-
-    - InitialSolutionParameters:
-      BenchmarkCommonParameters:
-        - KernelLanguage: ["Assembly"]
-      ForkParameters:
-        - MatrixInstruction:
-          # 1x1 wave group
-          - [16, 16, 32, 1,  1, 2, 2,  1, 1]  # MT 32x32
-          - [16, 16, 32, 1,  1, 4, 2,  1, 1]  # MT 64x32
-          # 2x2 wave group — symmetric
-          - [16, 16, 32, 1,  1, 1, 1,  2, 2]  # MT 32x32
-          - [16, 16, 32, 1,  1, 4, 4,  2, 2]  # MT 128x128
-          - [16, 16, 32, 1,  1, 8, 8,  2, 2]  # MT 256x256
-          # 2x2 wave group — asymmetric
-          - [16, 16, 32, 1,  1, 3, 4,  2, 2]  # MT 96x128  (odd M wavetile)
-          - [16, 16, 32, 1,  1, 8, 6,  2, 2]  # MT 256x192 (odd N wavetile)
-          - [16, 16, 32, 1,  1, 6, 2,  2, 2]  # MT 192x64  (odd M wavetile)
-          - [16, 16, 32, 1,  1, 2, 6,  2, 2]  # MT 64x192  (odd N wavetile)
-          - [16, 16, 32, 1,  1, 6, 4,  2, 2]  # MT 192x128 (odd M wavetile)
-          # 4x1 wave group
-          - [16, 16, 32, 1,  1, 2, 2,  4, 1]  # MT 128x32
-          - [16, 16, 32, 1,  1, 2, 6,  4, 1]  # MT 128x96  (odd N wavetile)
-          - [16, 16, 32, 1,  1, 6, 4,  4, 1]  # MT 384x64  (odd M wavetile)
-          # 1x4 wave group
-          - [16, 16, 32, 1,  1, 2, 6,  1, 4]  # MT 32x384  (odd N wavetile)
-          - [16, 16, 32, 1,  1, 6, 4,  1, 4]  # MT 96x256  (odd M wavetile)
-          # Odd wave tile combinations
-          - [16, 16, 32, 1,  1, 3, 2,  2, 2]  # MT 96x64   (3x2 wavetile)
-          - [16, 16, 32, 1,  1, 2, 3,  2, 2]  # MT 64x96   (2x3 wavetile)
-          - [16, 16, 32, 1,  1, 2, 9,  4, 1]  # MT 128x144 (very asymmetric N)
-          - [16, 16, 32, 1,  1, 9, 2,  1, 4]  # MT 144x128 (very asymmetric M)
-        - PrefetchGlobalRead: [0]
-        - PrefetchLocalRead: [0]
-        - DepthU: [64]                  # 2*MI_K = 2*32
-        - ScheduleIterAlg: [3]
-        - DirectToLds: [1]
-        - StreamK: [0, 3]
-        - StaggerU: [0]
-        - UseSubtileImpl: [1]
-      BenchmarkJoinParameters:
-      BenchmarkFinalParameters:
-        - ProblemSizes:
-          # Full-tile sizes (K = 1×DU .. 4×DU)
-          - Exact: [128, 128, 1,  64]   # K = 1*DU (minimum)
-          - Exact: [128, 128, 1, 128]   # K = 2*DU
-          - Exact: [256, 256, 1, 192]   # K = 3*DU
-          - Exact: [256, 256, 1, 256]   # K = 4*DU
-          # Mult-of-32 edges: M,N not multiples of macro tile
-          - Exact: [96,  96,  1, 128]   # 3*32, edge for MT >= 128
-          - Exact: [160, 160, 1, 128]   # 5*32, edge for MT >= 192
-          - Exact: [224, 224, 1, 128]   # 7*32, edge for MT >= 256
-          # Asymmetric M vs N
-          - Exact: [96,  256, 1, 128]   # M edge, N full tile
-          - Exact: [256,  96, 1, 128]   # M full tile, N edge
-          # Small targeted ranges: odd M,N not aligned to 32 (no BF16 alignment restriction)
-          # Range format: [start, step, stop]; values: start, start+step, ...
-          - Range: [[17, 32, 113], [17, 32, 113], [1], [128]]  # 17,49,81,113 — offset by 1 from 32-boundary
-          - Range: [[33, 64, 161], [33, 64, 161], [1], [128]]  # 33,97,161 — just above 32/64 multiples
-
-  ########################################
-  # BF16 TN — no bias, large DU (DU = 128, 192)
-  #
-  # Tests deeper unroll depths with a representative subset of wave tile configs.
-  # K is restricted to multiples of LCM(128, 192) = 384, ensuring it is a
-  # valid multiple of every DU value in the fork (no tail loop needed).
-  ########################################
-  -
-    - # ProblemType
-      OperationType: GEMM
-      DataType: b
-      DestDataType: b
-      ComputeDataType: s
-      HighPrecisionAccumulate: True
-      TransposeA: 1
-      TransposeB: 0
-      UseBeta: True
-      Batched: True
-      ActivationFuncCall: True
-
-    - InitialSolutionParameters:
-      BenchmarkCommonParameters:
-        - KernelLanguage: ["Assembly"]
-      ForkParameters:
-        - MatrixInstruction:
-          - [16, 16, 32, 1,  1, 4, 4,  2, 2]  # MT 128x128
-          - [16, 16, 32, 1,  1, 8, 8,  2, 2]  # MT 256x256
-          - [16, 16, 32, 1,  1, 6, 4,  2, 2]  # MT 192x128 (asymmetric)
-          - [16, 16, 32, 1,  1, 2, 6,  4, 1]  # MT 128x96  (4x1 wave group)
-        - PrefetchGlobalRead: [0]
-        - PrefetchLocalRead: [0]
-        - DepthU: [128, 192]            # > 2*MI_K; K must be mult of LCM(128,192)=384
-        - ScheduleIterAlg: [3]
-        - DirectToLds: [1]
-        - StreamK: [0, 3]
-        - StaggerU: [0]
-        - UseSubtileImpl: [1]
-      BenchmarkJoinParameters:
-      BenchmarkFinalParameters:
-        - ProblemSizes:
-          # Full tiles, K = multiples of LCM(128, 192) = 384
-          - Exact: [128, 128, 1, 384]
-          - Exact: [256, 256, 1, 384]
-          # Mult-of-32 edges: M,N not multiples of macro tile
-          - Exact: [96,  96,  1, 384]   # 3*32, edge for MT >= 128
-          - Exact: [160, 160, 1, 384]   # 5*32, edge for MT >= 192
-          - Exact: [224, 224, 1, 384]   # 7*32, edge for MT >= 256
-          # Targeted ranges for odd M,N (BF16: no alignment restriction)
-          - Range: [[17, 32, 113], [17, 32, 113], [1], [384]]  # 17,49,81,113
-          - Range: [[33, 64, 161], [33, 64, 161], [1], [384]]  # 33,97,161
-
-  ########################################
   # FP4 TN — no bias, DU = 2*MI_K = 256
   #
   # Same wave tile coverage as BF16 (minus BF16-specific odd additions).
@@ -316,60 +181,8 @@ BenchmarkProblems:
           - Exact: [97,  129, 1,  512]   # both odd, just above 96/128
 
   ########################################
-  # BSS TN — BF16 input, F32 output, DU = 2*MI_K = 64
-  # Reduced wavetile coverage; same problem size coverage as BF16 main group.
-  ########################################
-  -
-    - # ProblemType
-      OperationType: GEMM
-      DataType: b
-      DestDataType: s
-      ComputeDataType: s
-      HighPrecisionAccumulate: True
-      TransposeA: 1
-      TransposeB: 0
-      UseBeta: True
-      Batched: True
-      ActivationFuncCall: True
-
-    - InitialSolutionParameters:
-      BenchmarkCommonParameters:
-        - KernelLanguage: ["Assembly"]
-      ForkParameters:
-        - MatrixInstruction:
-          - [16, 16, 32, 1,  1, 2, 2,  1, 1]  # MT 32x32  (1x1 WG)
-          - [16, 16, 32, 1,  1, 4, 4,  2, 2]  # MT 128x128
-          - [16, 16, 32, 1,  1, 8, 8,  2, 2]  # MT 256x256
-          - [16, 16, 32, 1,  1, 3, 4,  2, 2]  # MT 96x128  (odd M wavetile)
-          - [16, 16, 32, 1,  1, 6, 4,  2, 2]  # MT 192x128 (asymmetric)
-          - [16, 16, 32, 1,  1, 2, 6,  4, 1]  # MT 128x96  (4x1 WG)
-        - PrefetchGlobalRead: [0]
-        - PrefetchLocalRead: [0]
-        - DepthU: [64]                  # 2*MI_K = 2*32
-        - ScheduleIterAlg: [3]
-        - DirectToLds: [1]
-        - StreamK: [0, 3]
-        - StaggerU: [0]
-        - UseSubtileImpl: [1]
-      BenchmarkJoinParameters:
-      BenchmarkFinalParameters:
-        - ProblemSizes:
-          # Full-tile sizes
-          - Exact: [128, 128, 1, 128]
-          - Exact: [256, 256, 1, 256]
-          # Mult-of-32 edges
-          - Exact: [96,  96,  1, 128]
-          - Exact: [160, 160, 1, 128]
-          - Exact: [224, 224, 1, 128]
-          # Asymmetric
-          - Exact: [96,  256, 1, 128]
-          - Exact: [256,  96, 1, 128]
-          # Odd M,N (no alignment restriction for BF16/BSS)
-          - Range: [[17, 32, 113], [17, 32, 113], [1], [128]]
-          - Range: [[33, 64, 161], [33, 64, 161], [1], [128]]
-
-  ########################################
   # F4SS TN — MX FP4 input, F32 output, DU = 2*MI_K = 256
+  #
   # Reduced wavetile coverage; same problem size coverage as FP4 main group.
   ########################################
   -
@@ -429,50 +242,8 @@ BenchmarkProblems:
           - Exact: [63,   63, 1, 256]   # both odd, just below 64
 
   ########################################
-  # BF16 TN — with bias (float32 bias vector)
-  # Reduced to 2 configs and StreamK=0 to keep scope small
-  ########################################
-  -
-    - # ProblemType
-      OperationType: GEMM
-      DataType: b
-      DestDataType: b
-      ComputeDataType: s
-      HighPrecisionAccumulate: True
-      TransposeA: 1
-      TransposeB: 0
-      UseBeta: True
-      Batched: True
-      Activation: True
-      ActivationType: hipblaslt_all
-      UseBias: 1
-      BiasDataTypeList: [s]
-
-    - InitialSolutionParameters:
-      BenchmarkCommonParameters:
-        - KernelLanguage: ["Assembly"]
-      ForkParameters:
-        - MatrixInstruction:
-          - [16, 16, 32, 1,  1, 4, 4,  2, 2]  # MT 128x128
-          - [16, 16, 32, 1,  1, 8, 8,  2, 2]  # MT 256x256
-        - PrefetchGlobalRead: [0]
-        - PrefetchLocalRead: [0]
-        - DepthU: [64]
-        - ScheduleIterAlg: [3]
-        - DirectToLds: [1]
-        - StreamK: [0]
-        - StaggerU: [0]
-        - UseSubtileImpl: [1]
-      BenchmarkJoinParameters:
-      BenchmarkFinalParameters:
-        - ProblemSizes:
-          - Exact: [128, 128, 1, 128]
-        - BiasTypeArgs: ['s']
-        - ActivationArgs:
-          - [Enum: none]
-
-  ########################################
   # FP4 TN — with bias (float32 bias vector)
+  #
   # Reduced to 2 configs and StreamK=0 to keep scope small
   ########################################
   -
@@ -515,3 +286,181 @@ BenchmarkProblems:
         - BiasTypeArgs: ['s']
         - ActivationArgs:
           - [Enum: none]
+
+  ########################################
+  # FP4 TN — PGR=2, PLR=1 (scheduler path)
+  #
+  # The PGR=2 scheduler takes a different code path than PGR=0.
+  # Rectangular MIWTs exercise loadRatioGR != 1.0.
+  # K=768 tests K > DU (K-loop with SRD advance).
+  ########################################
+  -
+    - # ProblemType
+      OperationType: GEMM
+      DataType: F4
+      DestDataType: b
+      ComputeDataType: s
+      HighPrecisionAccumulate: True
+      MXBlockA: 32
+      MXBlockB: 32
+      TransposeA: 1
+      TransposeB: 0
+      UseBeta: True
+      Batched: True
+      ActivationFuncCall: True
+
+    - InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+          # 2x2 wave group — symmetric
+          - [16, 16, 128, 1,  1, 2, 2,  2, 2]  # MT 64x64
+          - [16, 16, 128, 1,  1, 4, 4,  2, 2]  # MT 128x128
+          - [16, 16, 128, 1,  1, 8, 8,  2, 2]  # MT 256x256
+          # 2x2 wave group — asymmetric
+          - [16, 16, 128, 1,  1, 2, 4,  2, 2]  # MT 64x128
+          - [16, 16, 128, 1,  1, 4, 2,  2, 2]  # MT 128x64
+          - [16, 16, 128, 1,  1, 2, 6,  2, 2]  # MT 64x192
+          - [16, 16, 128, 1,  1, 6, 2,  2, 2]  # MT 192x64
+          - [16, 16, 128, 1,  1, 4, 8,  2, 2]  # MT 128x256
+          - [16, 16, 128, 1,  1, 8, 4,  2, 2]  # MT 256x128
+          - [16, 16, 128, 1,  1, 6, 4,  2, 2]  # MT 192x128
+          - [16, 16, 128, 1,  1, 4, 6,  2, 2]  # MT 128x192
+          - [16, 16, 128, 1,  1, 6, 8,  2, 2]  # MT 192x256
+          - [16, 16, 128, 1,  1, 8, 6,  2, 2]  # MT 256x192
+        - PrefetchGlobalRead: [2]
+        - PrefetchLocalRead: [1]
+        - DepthU: [256]
+        - ScheduleIterAlg: [3]
+        - DirectToLds: [1]
+        - StreamK: [0]
+        - StaggerU: [0]
+        - UseSubtileImpl: [1]
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: [128, 128, 1, 256]   # K = 1*DU
+          - Exact: [256, 256, 1, 256]   # K = 1*DU, larger tile
+          - Exact: [256, 256, 1, 768]   # K = 3*DU (tests K-loop)
+          - Exact: [192, 192, 1, 256]   # Edge for MT=128,256
+          - Exact: [192, 256, 1, 768]   # Asymmetric edge, K > DU
+
+  ########################################
+  # FP4 TN — expanded MIWT coverage (PGR=0)
+  #
+  # Additional rectangular MIWTs and large tiles.
+  # K=768 tests K > DU with PGR=0.
+  ########################################
+  -
+    - # ProblemType
+      OperationType: GEMM
+      DataType: F4
+      DestDataType: b
+      ComputeDataType: s
+      HighPrecisionAccumulate: True
+      MXBlockA: 32
+      MXBlockB: 32
+      TransposeA: 1
+      TransposeB: 0
+      UseBeta: True
+      Batched: True
+      ActivationFuncCall: True
+
+    - InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+          # Rectangular MIWTs not in the main PGR=0 FP4 group
+          - [16, 16, 128, 1,  1, 2, 4,  2, 2]  # MT 64x128
+          - [16, 16, 128, 1,  1, 4, 2,  2, 2]  # MT 128x64
+          - [16, 16, 128, 1,  1, 2, 8,  2, 2]  # MT 64x256
+          - [16, 16, 128, 1,  1, 8, 2,  2, 2]  # MT 256x64
+          - [16, 16, 128, 1,  1, 4, 8,  2, 2]  # MT 128x256
+          - [16, 16, 128, 1,  1, 8, 4,  2, 2]  # MT 256x128
+          - [16, 16, 128, 1,  1, 4, 6,  2, 2]  # MT 128x192
+          - [16, 16, 128, 1,  1, 6, 6,  2, 2]  # MT 192x192
+          # Large tiles (> 256 in one dim)
+          - [16, 16, 128, 1,  1, 2, 10, 2, 2]  # MT 64x320
+          - [16, 16, 128, 1,  1, 10, 2, 2, 2]  # MT 320x64
+          - [16, 16, 128, 1,  1, 2, 12, 2, 2]  # MT 64x384
+          - [16, 16, 128, 1,  1, 12, 2, 2, 2]  # MT 384x64
+          - [16, 16, 128, 1,  1, 4, 10, 2, 2]  # MT 128x320
+          - [16, 16, 128, 1,  1, 10, 4, 2, 2]  # MT 320x128
+          - [16, 16, 128, 1,  1, 4, 12, 2, 2]  # MT 128x384
+          - [16, 16, 128, 1,  1, 12, 4, 2, 2]  # MT 384x128
+          # More WG 4x1 configs
+          - [16, 16, 128, 1,  1, 2, 4,  4, 1]  # MT 128x64
+          - [16, 16, 128, 1,  1, 2, 8,  4, 1]  # MT 128x128
+          - [16, 16, 128, 1,  1, 4, 4,  4, 1]  # MT 256x64
+          - [16, 16, 128, 1,  1, 4, 8,  4, 1]  # MT 256x128
+          # More WG 1x4 configs
+          - [16, 16, 128, 1,  1, 4, 2,  1, 4]  # MT 64x128
+          - [16, 16, 128, 1,  1, 8, 2,  1, 4]  # MT 128x128
+          - [16, 16, 128, 1,  1, 4, 4,  1, 4]  # MT 64x256
+          - [16, 16, 128, 1,  1, 8, 4,  1, 4]  # MT 128x256
+        - PrefetchGlobalRead: [0]
+        - PrefetchLocalRead: [0]
+        - DepthU: [256]
+        - ScheduleIterAlg: [3]
+        - DirectToLds: [1]
+        - StreamK: [0]
+        - StaggerU: [0]
+        - UseSubtileImpl: [1]
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: [128, 128, 1, 256]   # K = 1*DU
+          - Exact: [256, 256, 1, 256]   # K = 1*DU, larger
+          - Exact: [256, 256, 1, 768]   # K = 3*DU (K-loop)
+          - Exact: [192, 192, 1, 256]   # Edge
+          - Exact: [384, 384, 1, 256]   # Large tile edge
+
+  ##########################
+  # Current known failures #
+  ##########################
+  #
+  # PGR=2 WG 4x1/1x4, K > DU: the PGR=2 scheduler emits duplicate
+  # buffer_loads for subtiles that share a globalReadMap when
+  # loadRatioGR != 1.0 (skewed WG). At K > DepthU the K-loop
+  # SRD advance compounds the error.
+  # Uncomment to re-test after fix.
+  #
+  # -
+  #   - OperationType: GEMM
+  #     DataType: F4
+  #     DestDataType: b
+  #     ComputeDataType: s
+  #     HighPrecisionAccumulate: True
+  #     MXBlockA: 32
+  #     MXBlockB: 32
+  #     TransposeA: 1
+  #     TransposeB: 0
+  #     UseBeta: True
+  #     Batched: True
+  #     ActivationFuncCall: True
+  #
+  #   - InitialSolutionParameters:
+  #     BenchmarkCommonParameters:
+  #       - KernelLanguage: ["Assembly"]
+  #     ForkParameters:
+  #       - MatrixInstruction:
+  #         - [16, 16, 128, 1,  1, 2, 2,  4, 1]  # MT 128x32
+  #         - [16, 16, 128, 1,  1, 2, 4,  4, 1]  # MT 128x64
+  #         - [16, 16, 128, 1,  1, 4, 4,  4, 1]  # MT 256x64
+  #         - [16, 16, 128, 1,  1, 2, 2,  1, 4]  # MT 32x128
+  #         - [16, 16, 128, 1,  1, 4, 2,  1, 4]  # MT 64x128
+  #         - [16, 16, 128, 1,  1, 4, 4,  1, 4]  # MT 64x256
+  #       - PrefetchGlobalRead: [2]
+  #       - PrefetchLocalRead: [1]
+  #       - DepthU: [256]
+  #       - ScheduleIterAlg: [3]
+  #       - DirectToLds: [1]
+  #       - StreamK: [0]
+  #       - StaggerU: [0]
+  #       - UseSubtileImpl: [1]
+  #     BenchmarkJoinParameters:
+  #     BenchmarkFinalParameters:
+  #       - ProblemSizes:
+  #         - Exact: [256, 256, 1, 768]   # K = 3*DU (triggers failure)
