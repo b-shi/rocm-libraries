@@ -1804,7 +1804,17 @@ class SubtileBasedScheduler:
 
         mfmaIdx, pathOrders = SubtileBasedScheduler._extractPathsFromBeforeDeps(emittedModules)
         mfmas = [x for x in emittedModules[mfmaIdx].instructions if isMFMA(x)]
-        assert len(mfmas) >= 2, "instructionSchedule expects at least two MFMA instructions"
+
+        # Single MFMA: no slots to interleave into — emit MFMA then all paths.
+        if len(mfmas) < 2:
+            result = Module()
+            for m in mfmas:
+                result.add(m)
+            for order in pathOrders:
+                for mid in order:
+                    for inst in emittedModules[mid].instructions:
+                        result.add(inst)
+            return result
 
         paths = _classifyPaths(pathOrders, emittedModules)
         rules = _SchedulingRules(totalSlots=(len(mfmas) - 1) * 2)
