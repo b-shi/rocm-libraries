@@ -3960,18 +3960,15 @@ class KernelWriterAssembly(KernelWriter):
     module = Module("computeLoadSrd")
     use64bShadowLimit = self.states.use64bShadowLimitMX if tc in ["MXSA", "MXSB"] else self.states.use64bShadowLimit
     isMX = tc in ("MXSA", "MXSB")
-    useFixedSrd2 = False # True means use fixed Srd+2 value. No need to calculate tensor2dSize, ShadowLimit
+    # UseSubtileImpl uses a tile-boundary fixed Srd+2 for both MX scale and data A/B.
+    # This avoids 32-bit overflow when computing the full tensor2dSize (N*K or M*K > 2^32).
+    useFixedSrd2 = bool(kernel.get("UseSubtileImpl"))
     if isMX:
       tcab = "A" if tc == "MXSA" else "B"
       mxBlock = kernel["ProblemType"]["MXBlock%s"%tcab]
       mxSwizzleSize0 = 32 # M,N direction
       mxSwizzleSize1 = 256 # K direction
       mxSwizzleBlockSize = mxSwizzleSize0 * mxSwizzleSize1 // mxBlock
-      # UseSubtileImpl uses swizzled (pre-shuffled) scale layout; a simpler fixed
-      # tile-boundary limit replaces the full tensor2dSize computation.
-      # Non-subtile MX kernels use the standard tensor2dSize path (same as rebase).
-      if kernel.get("UseSubtileImpl"):
-        useFixedSrd2 = True
     allocateTensor2dSize = use64bShadowLimit and not isMX
     numDim = len(indices)
     with self.allocTmpSgpr(2 + 2 + (0 if allocateTensor2dSize else 2)) as tmpSgprInfo:
@@ -4048,20 +4045,50 @@ class KernelWriterAssembly(KernelWriter):
           module.add(SMovB32(dst=sgpr(tileStart+1), src=0))
         strideF = self.strideRef(tc, tP['tileIdx'])
         if not self.isConstUnitStride(strideF):
-          if isMX and kernel.get("UseSubtileImpl"):
-            # UseSubtileImpl MX swizzled (pre-shuffle) case: SRD+2 limit uses tile-boundary formula
+          if kernel.get("UseSubtileImpl") and useFixedSrd2:
+            # Tile-boundary SRD+2 for UseSubtileImpl (unified for MX scale and data A/B).
+            # Avoids 32-bit overflow from computing full tensor2dSize when N*K or M*K > 2^32.
+            #
+            # MX scale:  tileStart is in block units (roundUp(MT/mxSwizzleSize0)).
+            #   numLine = min(roundUp(size/mxSwizzleSize0) - tileStart_blk, roundUp(MT/mxSwizzleSize0)) - 1
+            #   Srd+2   = numLine * stride_bytes + mxSwizzleBlockSize*(DepthU/mxSwizzleSize1)
+            #
+            # Data A/B:  tileStart is in element units (WG * MT).
+            #   numLine = min(size - WG*MT, MT) - 1
+            #   Srd+2   = (numLine * stride_elements + DepthU) * bpe
+            #
+            # Key: numLine/numElems <= MT (compile-time), so the multiply stays in 32 bits.
+            if isMX:
+              mt_units    = mt  # roundUp(MT/mxSwizzleSize0), compile-time
+              extra_bytes = mxSwizzleBlockSize * (kernel["DepthU"] // mxSwizzleSize1)
+            else:
+              mt_units    = kernel[tP["mt"]]  # MT0 or MT1, compile-time
+              extra_bytes = kernel["DepthU"]  # one K step in elements
+
             for i in range(0, numDim):
               idx = indices[i]
               if idx == kernel["ProblemType"]["Index0"] or idx == kernel["ProblemType"]["Index1"]:
                 size = self.sizeRef(idx)
-                module.add(SAddU32(dst=sgpr(stmp+0), src0=size, src1=(mxSwizzleSize0 - 1), comment="size + %u - 1"%mxSwizzleSize0))
-                module.add(SLShiftRightB32(dst=sgpr(stmp+0), src=sgpr(stmp+0), shiftHex=log2(mxSwizzleSize0), comment="roundup(size/%u)"%mxSwizzleSize0))
-                module.add(SSubU32(dst=sgpr(stmp+0), src0=sgpr(stmp+0), src1=sgpr(tileStart+0), comment="numBlkToEnd = roundUp(size/%u) - (WorkGroup[01] * roundup(MT/%u))"%(mxSwizzleSize0,mxSwizzleSize0)))
-                module.add(SMinU32(dst=sgpr(stmp+0), src0=sgpr(stmp+0), src1=mt, comment="min (numBlkToEnd, roundup(MT/%u))"%(mxSwizzleSize0)))
-                module.add(SSubU32(dst=sgpr(stmp+0), src0=sgpr(stmp+0), src1=1, comment="numLine = min (numBlkToEnd, roundup(MT/%u)) - 1"%(mxSwizzleSize0)))
+                if isMX:
+                  # tileStart already in block units (WG * roundUp(MT/mxSwizzleSize0))
+                  module.add(SAddU32(dst=sgpr(stmp+0), src0=size, src1=(mxSwizzleSize0 - 1), comment="size + %u - 1"%mxSwizzleSize0))
+                  module.add(SLShiftRightB32(dst=sgpr(stmp+0), src=sgpr(stmp+0), shiftHex=log2(mxSwizzleSize0), comment="roundup(size/%u)"%mxSwizzleSize0))
+                  module.add(SSubU32(dst=sgpr(stmp+0), src0=sgpr(stmp+0), src1=sgpr(tileStart+0), comment="numBlkToEnd = roundUp(size/%u) - tileStart_blk"%mxSwizzleSize0))
+                  module.add(SMinU32(dst=sgpr(stmp+0), src0=sgpr(stmp+0), src1=mt_units, comment="min (numBlkToEnd, roundup(MT/%u))"%mxSwizzleSize0))
+                  module.add(SSubU32(dst=sgpr(stmp+0), src0=sgpr(stmp+0), src1=1, comment="numLine = min - 1 (0-based index)"))
+                else:
+                  # tileStart in element units (WG * MT); no block rounding needed
+                  module.add(SSubU32(dst=sgpr(stmp+0), src0=size, src1=sgpr(tileStart+0), comment="numToEnd = size - WG*MT"))
+                  module.add(SMinU32(dst=sgpr(stmp+0), src0=sgpr(stmp+0), src1=mt_units, comment="min(numToEnd, MT)"))
+                  module.add(SSubU32(dst=sgpr(stmp+0), src0=sgpr(stmp+0), src1=1, comment="numLine = min - 1 (0-based index)"))
                 module.addModuleAsFlatItems(self.s_mul_u64_u32(sgpr(stmp+0), sgpr(stmp+1), sgpr(stmp+0), \
-                          strideF, comment="scaled by stride"))
-                module.add(SAddU32(dst=sgpr("Srd%s+2"%tc), src0=sgpr(stmp+0), src1=mxSwizzleBlockSize * (kernel["DepthU"]//mxSwizzleSize1), comment="buffer_load limit for %s"%tc))
+                          strideF, comment="numLine * stride"))
+                if isMX:
+                  module.add(SAddU32(dst=sgpr("Srd%s+2"%tc), src0=sgpr(stmp+0), src1=extra_bytes, comment="buffer_load limit for %s"%tc))
+                else:
+                  # (numLine * stride + DepthU) * bpe  — mirrors scale path structure
+                  module.add(SAddU32(dst=sgpr(stmp+0), src0=sgpr(stmp+0), src1=extra_bytes, comment="+ DepthU (one K step)"))
+                  module.add(scalarMultiplyBpe(sgpr("Srd%s+2"%tc), sgpr(stmp+0), tP["bpeGR"], comment="buffer_load limit for %s (tile-boundary, avoids 32-bit overflow)"%tc))
           module.addModuleAsFlatItems(self.s_mul_u64_u32(sgpr(tileStart), sgpr(tileStart+1), sgpr(tileStart+0), \
                     strideF, comment="tlu=0, scaled tile-offset by stride"))
 
@@ -4084,9 +4111,8 @@ class KernelWriterAssembly(KernelWriter):
         module.add(SMovB64(dst=sgpr(tileStart, 2), src=0, comment="set default tileStart"))
 
       #Calculate tensor 2d size
-      # For UseSubtileImpl MX kernels, useFixedSrd2=True so tensor2dSize is not needed.
-      # For non-subtile MX kernels and all non-MX kernels, always initialize tensor2dSize.
-      if not isMX or not kernel.get("UseSubtileImpl"):
+      # For UseSubtileImpl kernels (MX and non-MX), useFixedSrd2=True so tensor2dSize is not needed.
+      if not useFixedSrd2:
         if use64bShadowLimit or ((not use64bShadowLimit) and tensor2dSize0 % 2 == 0):
           module.add(SMovB64(dst=sgpr(tensor2dSize0, 2), src=0x1, comment="Init tensor size"))
         else:

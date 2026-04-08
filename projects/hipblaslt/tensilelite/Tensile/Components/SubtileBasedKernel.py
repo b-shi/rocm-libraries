@@ -1524,9 +1524,6 @@ def globalReadPtrUpdates(tc, writer, kernel):
   module.add(SAddU32(dst=sgpr("Srd%s"%tc), src0=sgpr("Srd%s"%tc), src1=inc))
   module.add(SAddCU32(dst=sgpr("Srd%s+1"%tc), src0=sgpr("Srd%s+1"%tc), src1=0))
 
-  # TODOBS: commented out for now, need to re-enable
-  module.add(SSubU32(dst=sgpr("Srd%s+2"%tc), src0=sgpr("Srd%s+2"%tc), src1=inc))
-
   return module
 
 ##################################################
