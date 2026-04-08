@@ -1274,8 +1274,11 @@ def emitSingleBufferLoad(tileInfo, kernel, sId0, sId1):
 
   # When loadRatioGR > 1, multiple subtiles share one global read.
   # Only emit the load for the first subtile of each group.
-  if sId0 != int(grBaseId * tileInfo.loadRatioGR):
-    return module
+  if tileInfo.loadRatioGR > 1:
+    linearId = tileInfo.getLocalSubtileLinearId(sId0, sId1)
+    firstInGroup = int(grBaseId * tileInfo.loadRatioGR)
+    if linearId != firstInGroup:
+      return module
 
   tc = tileInfo.tc
   isGlc = bool(kernel["NonTemporal%s"%tc] & 0x1)
