@@ -375,9 +375,12 @@ class _SlotPlacer:
                 lo = hi
             return lo
 
-    def place(self, pos: int, item: Tuple[int, object]):
+    def place(self, pos: int, item: Tuple[int, object], reverse: bool = False):
         mid = item[0]
-        self._placed[pos].append(item)
+        if reverse:
+            self._placed[pos].insert(0, item)
+        else:
+            self._placed[pos].append(item)
         if self._firstPos[mid] is None or pos < self._firstPos[mid]:
             self._firstPos[mid] = pos
         if self._lastPos[mid] is None or pos > self._lastPos[mid]:
@@ -401,7 +404,7 @@ class _SlotPlacer:
             pos = self.findSlot(mid, inst, limit, reverse=reverse)
             if pos is None:
                 pos = self._forceSlot(mid, limit, reverse)
-            self.place(pos, item)
+            self.place(pos, item, reverse=reverse)
             limit = (pos - 1) if reverse else (pos + 1)
 
     # ── Assembly ──
