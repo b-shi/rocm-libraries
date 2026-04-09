@@ -1813,10 +1813,12 @@ def mainLoop(writer, kernel):
     module.addComment0("MAINLOOP")
     numPartitions = len(scheduler.partitions)
 
-    # With scale double buffering, the scale set rotates per partition inside _emitLoop.
-    # After one iteration (N partitions), the set flips if N is odd → need 2x unrolling.
-    # If N is even, the set returns to starting position → no unrolling needed.
-    needsScaleUnroll = scheduler.hasScale and (numPartitions % 2 == 1)
+    # With scale double buffering, the scale set rotates inside _emitLoop:
+    # once per partition end + once per subtileK boundary = numSubtileK flips per partition.
+    # After one iteration (N partitions), total flips = N * numSubtileK.
+    # If odd → need 2x unrolling. If even → sets return to start, no unrolling needed.
+    scaleFlipsPerIter = numPartitions * scheduler.numSubtileK
+    needsScaleUnroll = scheduler.hasScale and (scaleFlipsPerIter % 2 == 1)
 
     if needsScaleUnroll:
       # 2x unrolled mainloop for odd partition count.
@@ -1858,7 +1860,7 @@ def mainLoop(writer, kernel):
     module.add(Label("SkipToNGLL", ""))
     if scheduler.hasScale:
       endLabel = Label("SkipToEnd", "")
-      nllSet = 1 if numPartitions % 2 == 1 else 0
+      nllSet = 1 if scaleFlipsPerIter % 2 == 1 else 0
 
       # Even path (or only path when no unrolling): mainloop ended at scaleSet=0.
       module.add(scheduler._emitLoop(writer, kernel, "NGLL", scheduler.ngllSteps,
@@ -1875,7 +1877,7 @@ def mainLoop(writer, kernel):
         module.add(scheduler._emitLoop(writer, kernel, "NGLL_odd", scheduler.ngllSteps,
                                        scaleSet=1))
         module.addComment0("NLL (odd)")
-        nllSetOdd = 0 if numPartitions % 2 == 1 else 1
+        nllSetOdd = 0 if scaleFlipsPerIter % 2 == 1 else 1
         module.add(scheduler._emitLoop(writer, kernel, "NLL_odd", scheduler.nllSteps, scaleSet=nllSetOdd))
 
       # NLLEarly: reached when counterL<=1 (preloop skip, no NGLL).
