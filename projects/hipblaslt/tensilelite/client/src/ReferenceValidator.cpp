@@ -167,9 +167,13 @@ namespace TensileLite
         }
 
         // Fast1 reference validation for MX FP4.
-        // All rows of A share patA[k] and all cols of B share patB[k], so D[m,n,b] is the same
-        // scalar for every output element.  We compute that scalar via an integer dot product
-        // gated by the {0,1} block scales, then verify every GPU output matches it.
+        //
+        // Idea: instead of a full O(M*N*K) CPU GEMM reference, Fast1 exploits the structured init:
+        //   - All active rows of A share a single K-element pattern patA[k] in {-1, 0, 1}.
+        //   - All active cols of B share a single K-element pattern patB[k] in {-1, 0, 1}.
+        //   - Scale blocks are either 0 (suppress) or max (pass-through).
+        // This means every active output D[m,n] equals the same scalar alpha * dot(patA, patB),
+        // and inactive outputs are 0.  The reference reduces to one O(K) integer dot product.
         static bool validateFast1Gemm(ContractionProblemGemm const& problem,
                                       const void*                        cpuD,
                                       std::shared_ptr<DataInitialization> dataInit,

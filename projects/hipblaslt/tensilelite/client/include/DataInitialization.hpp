@@ -519,6 +519,8 @@ namespace TensileLite
                     return getValue<T, InitMode::RandomNegPosLimited>();
                 case InitMode::Free:
                     return convertDoubleTo<T>(value);
+                case InitMode::Fast1:
+                    return getValue<T, InitMode::Fast1>();
                 case InitMode::SerialIdx:
                 case InitMode::SerialDim0:
                 case InitMode::SerialDim1:
@@ -533,8 +535,6 @@ namespace TensileLite
                 case InitMode::TrigIndAbsCos:
                 case InitMode::Count:
                     throw std::runtime_error("Invalid InitMode.");
-                case InitMode::Fast1:
-                    return getValue<T, InitMode::Fast1>();
                 }
             }
 
@@ -3597,7 +3597,8 @@ namespace TensileLite
             return MXScale(getValueWithUpperLowerBoundFP<float>());
         }
 
-        // Fast1: random choice from {-1, 0, 1} — only MX FP4 (Float4x2) is supported.
+        // Fast1: random choice from {-1, 0, 1} — only MX FP4 is supported.
+        // Overwrites A/B/MXSA/MXSB init options to all use Fast1
         inline float getValueFast1Float()
         {
             static const float vals[3] = {-1.0f, 0.0f, 1.0f};
