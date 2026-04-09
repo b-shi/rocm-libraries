@@ -25,11 +25,12 @@ def _mock_dtype(num_bytes=2):
     mock.numBytes.return_value = num_bytes
     return mock
 
-def create_kernel(MT0=256, MT1=256, fp4=False):
+def create_kernel(MT0=256, MT1=256, fp4=False, depthU=None):
     mxblock = 32 if fp4 else 0
     bpe = 0.5 if fp4 else 2
     matrixInstK = 128 if fp4 else 32
-    depthU = 256 if fp4 else 64
+    if depthU is None:
+        depthU = 256 if fp4 else 64
     dtype = _mock_dtype(bpe)
     problemType = {
         "DataTypeA": dtype,
@@ -704,10 +705,11 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--fp4", action="store_true", help="Enable FP4 path with MX scales")
+    parser.add_argument("--du", type=int, default=None, help="DepthU override (default: 256 for fp4, 64 otherwise)")
     args = parser.parse_args()
 
     MT0=MT1=64
-    kernel = create_kernel(MT0, MT1, fp4=args.fp4)
+    kernel = create_kernel(MT0, MT1, fp4=args.fp4, depthU=args.du)
     tiA = TileInfo('A', kernel)
     tiB = TileInfo('B', kernel)
     print("TileInfo A:", tiA)
