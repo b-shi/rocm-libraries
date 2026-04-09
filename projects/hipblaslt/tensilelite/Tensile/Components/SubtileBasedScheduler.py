@@ -1,4 +1,35 @@
-import dataclasses
+"""Subtile-based mainloop scheduler.
+
+The scheduler builds an instruction schedule for the preloop, mainloop, NGLL & NLL. The GEMM is split
+into Partitions, again split into subIterK steps.
+
+Naming conventions:
+  - Partition:  A rectangle of subtiles (partitionSizeA x partitionSizeB)
+                processed together in one mainloop step. 
+  - subIterK:   K-dimension sub-iteration within a partition. Each subtile's
+                data is split along K into numSubIterK chunks (hardcoded to 2).
+  - MT iteration (macrotile iteration): Which macrotile's data is being
+                referenced. "n" = current iteration, "n+1" = next iteration, "n+2" = two ahead.
+
+Scheduling pipeline:
+  1. _buildPreloop     — Emit initial GR + LR to init the pipeline (preloop).
+  2. _buildSubIterK    — For each partition and subIterK, build MFMA and LR
+                         modules with VGPR tile assignments.
+  3. _insertGROps      — Split GR loads across subIterK=0/1 within each partition.
+  4. _annotateDependencies — Wire up before/after dependency edges between modules
+                         (WAIT_GR, SYNC, LR_INC, GR_INC, WAIT_LR).
+  5. _buildNGLL        — Derive the No-Global-Load-Loop from mainloop
+                         (remove GR(n+2) and GR_INC).
+  6. _buildNLL         — Derive the No-Load-Loop from mainloop
+                         (remove all GR, LR(n+1), and associated sync ops).
+
+Emission pipeline (called by the kernel writer):
+  7. _buildEmittedModules — Convert AnnotatedModules into EmittedModules with
+                            actual GPU instructions and before-link chains.
+  8. instructionSchedule  — Interleave non-MFMA instructions between MFMAs
+                            using a slot-based placer with pluggable rules.
+"""
+
 from enum import Enum, auto
 from dataclasses import dataclass, field
 import math
@@ -11,7 +42,7 @@ from Tensile.Components.SubtileBasedKernel import globalReadPtrUpdates, globalRe
 from Tensile.Components.SubtileBasedKernel import globalReadDoScaleSubtile, globalReadScalePtrUpdates
 from rocisa.code import Module, Label
 from rocisa.instruction import SWaitCnt, SBarrier, SCmpEQU32, SCmpLeU32, SCBranchSCC1, MFMAInstruction, \
-    MXMFMAInstruction, GlobalReadInstruction, LocalReadInstruction, DSLoadB32
+    MXMFMAInstruction, LocalReadInstruction, GlobalReadInstruction, DSLoadB32, CommonInstruction
 from rocisa.container import sgpr, vgpr, DSModifiers
 
 
@@ -22,12 +53,10 @@ class PrefetchMode(Enum):
 
 
 class VGPRTileReUseStrategy(Enum):
-    NONE = auto()
-    ACROSS_SUBGROUP = auto()
-    WITHIN_SUBGROUP = auto()
+    ACROSS_PARTITIONS = auto()
 
 
-class SubgroupOrdering(Enum):
+class PartitionOrdering(Enum):
     COLUMN_MAJOR = auto()
     SNAKE_COLUMN_MAJOR = auto()
 
@@ -37,8 +66,8 @@ class SchedulerConfig:
     partitionSizeA: int
     partitionSizeB: int
     prefetchMode: PrefetchMode
-    reuseStrategy: VGPRTileReUseStrategy
-    ordering: SubgroupOrdering = SubgroupOrdering.COLUMN_MAJOR
+    reuseStrategy: VGPRTileReUseStrategy = VGPRTileReUseStrategy.ACROSS_PARTITIONS
+    ordering: PartitionOrdering = PartitionOrdering.COLUMN_MAJOR
 
 
 @dataclass
@@ -156,6 +185,7 @@ class GROp:
     subtileA: List[int]
     subtileB: List[int]
     lastForMT: bool = False  # True = last partition's GR for this MT → emit ptrUpdate+swap
+    firstForMT: bool = False # True = first partition's GR for this MT → emit scale loads
 
 
 @dataclass
@@ -165,6 +195,8 @@ class WaitGROp:
     subtileB: List[int]
     inflightLoadsA: Optional[int] = None
     inflightLoadsB: Optional[int] = None
+    inflightScaleLoadsA: int = 0
+    inflightScaleLoadsB: int = 0
 
 
 @dataclass
@@ -210,6 +242,35 @@ ScheduleOp = Union[MFMAOp, GROp, WaitGROp, WaitLROp, SyncOp, LROp, SkipOp, GR_IN
 
 
 @dataclass
+class DepEdge:
+    """A synchronization/housekeeping op or module reference that acts as a dependency edge.
+
+    Either op or module is set, not both:
+    - op: a sync/housekeeping instruction to emit (WAIT_GR, WAIT_LR, SYNC, etc.)
+    - module: a reference to another AnnotatedModule that must complete first (ordering constraint)
+    """
+    op: Union[WaitGROp, WaitLROp, SyncOp, GR_INCOp, LR_INCOp, None] = None
+    module: Optional['AnnotatedModule'] = None
+
+
+@dataclass
+class AnnotatedModule:
+    """A module with dependency edges."""
+    op: ScheduleOp
+    before: List[DepEdge] = field(default_factory=list)
+    after: List[DepEdge] = field(default_factory=list)
+
+
+@dataclass
+class EmittedModule:
+    """One emitted module with instructions and module-link deps."""
+    moduleId: int = -1
+    instructions: list = field(default_factory=list)
+    before: Optional[int] = None                     # moduleId that must run before this module
+    opType: str = ""
+
+
+@dataclass
 class PartitionGR:
     """Describes the GR (Global Read) issued by a partition during the mainloop."""
     mtIteration: str       # "n+1" or "n+2"
@@ -222,8 +283,7 @@ class PartitionGR:
 class SubIterKSchedule:
     """Ops for one subIterK iteration within a partition."""
     subIterK: int
-    ops: List[ScheduleOp] = field(default_factory=list)
-    conflict: Set[int] = field(default_factory=set)
+    modules: List[AnnotatedModule] = field(default_factory=list)
 
 
 @dataclass
@@ -231,6 +291,268 @@ class PartitionSchedule:
     """Schedule for one subtile partition — contains all subIterK iterations."""
     partitionId: int
     subIterKSteps: List[SubIterKSchedule] = field(default_factory=list)
+
+
+class _SlotPlacer:
+    """Generic slot placement engine for interleaving instructions between MFMAs.
+
+    Each interval (pair of adjacent MFMAs) has 2 placement slots.
+    Rules are injected via callbacks:
+      - validators: (placer, pos, inst) -> bool — reject invalid slots
+      - adjusters:  (placer, limit, inst) -> limit — shift search start
+      - onPlace:    (placer, pos, inst) -> None — update rule state after placement
+    """
+
+    def __init__(self, intervals: int, numModules: int,
+                 pathOrders: List[List[int]],
+                 validators=None, adjusters=None, onPlace=None):
+        self.totalSlots = intervals * 2
+        self._n = numModules
+        self._prevInPath: List[int] = [-1] * numModules
+        self._nextInPath: List[int] = [-1] * numModules
+        for order in pathOrders:
+            for a, b in zip(order, order[1:]):
+                self._prevInPath[b] = a
+                self._nextInPath[a] = b
+        self._validators = validators or []
+        self._adjusters = adjusters or []
+        self._onPlace = onPlace
+
+        self._placed: List[List[Tuple[int, object]]] = [[] for _ in range(self.totalSlots)]
+        self._firstPos: List[Optional[int]] = [None] * numModules
+        self._lastPos: List[Optional[int]] = [None] * numModules
+        self.leftovers: List[Tuple[int, object]] = []
+
+    # ── Placement ──
+
+    def _canPlace(self, pos: int, inst) -> bool:
+        if pos < 0 or pos >= self.totalSlots or len(self._placed[pos]) >= 2:
+            return False
+        return all(v(self, pos, inst) for v in self._validators)
+
+    def adjustLimit(self, limit: int, inst) -> int:
+        for adj in self._adjusters:
+            limit = adj(self, limit, inst)
+        return limit
+
+    def bounds(self, mid: int) -> Tuple[int, int]:
+        lo = 0
+        pred = self._prevInPath[mid]
+        if 0 <= pred < self._n and self._lastPos[pred] is not None:
+            lo = self._lastPos[pred] + 1
+        hi = self.totalSlots - 1
+        succ = self._nextInPath[mid]
+        if 0 <= succ < self._n and self._firstPos[succ] is not None:
+            hi = self._firstPos[succ] - 1
+        return lo, hi
+
+    def findSlot(self, mid: int, inst, limit: int, reverse: bool = False) -> Optional[int]:
+        lo, hi = self.bounds(mid)
+        if reverse:
+            hi = min(hi, limit)
+        else:
+            lo = max(lo, limit)
+        if hi < lo:
+            return None
+        for pos in (range(hi, lo - 1, -1) if reverse else range(lo, hi + 1)):
+            if self._canPlace(pos, inst):
+                return pos
+        return None
+
+    def _forceSlot(self, mid: int, limit: int, reverse: bool) -> int:
+        """Find the closest valid slot respecting dependencies, allowing >2 items per slot."""
+        lo, hi = self.bounds(mid)
+        if reverse:
+            hi = min(hi, limit)
+            lo = max(lo, 0)
+            if hi < lo:
+                hi = lo
+            return hi
+        else:
+            lo = max(lo, limit)
+            hi = min(hi, self.totalSlots - 1)
+            if lo > hi:
+                lo = hi
+            return lo
+
+    def place(self, pos: int, item: Tuple[int, object], reverse: bool = False):
+        mid = item[0]
+        if reverse:
+            self._placed[pos].insert(0, item)
+        else:
+            self._placed[pos].append(item)
+        if self._firstPos[mid] is None or pos < self._firstPos[mid]:
+            self._firstPos[mid] = pos
+        if self._lastPos[mid] is None or pos > self._lastPos[mid]:
+            self._lastPos[mid] = pos
+        if self._onPlace:
+            self._onPlace(self, pos, item[1])
+
+    def placePath(self, pathInsts: List[Tuple[int, object]], reverse: bool = False):
+        """Place a sequence of (moduleId, instruction) items into slots.
+
+        Walks pathInsts in order, applying adjusters (forward only) and
+        finding valid slots. When no empty slot is found, force-places at
+        the closest valid position respecting dependencies (allowing >2
+        items per slot).
+        """
+        limit = (self.totalSlots - 1) if reverse else 0
+        for idx, item in enumerate(pathInsts):
+            mid, inst = item
+            if not reverse:
+                limit = self.adjustLimit(limit, inst)
+            pos = self.findSlot(mid, inst, limit, reverse=reverse)
+            if pos is None:
+                pos = self._forceSlot(mid, limit, reverse)
+            self.place(pos, item, reverse=reverse)
+            limit = (pos - 1) if reverse else (pos + 1)
+
+    # ── Assembly ──
+
+    def assemble(self, mfmas) -> Module:
+        intervals = len(mfmas) - 1
+        result = Module()
+        result.add(mfmas[0])
+        for i in range(intervals):
+            for slot in (2 * i, 2 * i + 1):
+                for item in self._placed[slot]:
+                    result.add(item[1])
+            result.add(mfmas[i + 1])
+        for _, inst in self.leftovers:
+            result.add(inst)
+        return result
+
+
+# ── Scheduling rules ──
+
+# Hardcoded gap to hide ds_read latency. TODO: compute this more accurately.
+_MIN_MFMA_GAP_DS_READ_TO_WAIT = 4
+
+_isDsRead = lambda x: isinstance(x, LocalReadInstruction)
+_isBufferLoad = lambda x: isinstance(x, GlobalReadInstruction)
+_isWaitCnt = lambda x: isinstance(x, SWaitCnt)
+_isM0Update = lambda x: isinstance(x, CommonInstruction) and hasattr(x, 'dst') and hasattr(x.dst, 'regType') and x.dst.regType == 'm'
+
+
+class _SchedulingRules:
+    """Scheduling rules for slot placement: validators, adjusters, and placement hooks.
+
+    Owns all rule state (ds_read/waitcnt tracking, buffer-load spreading).
+    Bound methods are passed as callbacks to _SlotPlacer.
+    """
+
+    def __init__(self, totalSlots: int):
+        # Cross-path state
+        self.lastDsReadPos = -1
+        self.earliestWaitCntPos = totalSlots
+        # Per-path state
+        self._resetPath()
+
+    def _resetPath(self):
+        self.firstBufLoadPos: Optional[int] = None
+        self.bufLoadIdx = 0
+        self.bufLoadMaxSlot = 0
+        self.numBufLoads = 0
+
+    # ── Validators: (placer, pos, inst) -> bool ──
+
+    def oneDsReadPerInterval(self, placer, pos, inst):
+        """At most one ds_read per interval (pair of slots) to avoid same SIMD pair stalls as we have a single codepath"""
+        if not _isDsRead(inst):
+            return True
+        peer = pos ^ 1
+        return not (0 <= peer < placer.totalSlots
+                    and any(_isDsRead(item[1]) for item in placer._placed[peer]))
+
+    def minGapDsReadBeforeWait(self, placer, pos, inst):
+        """Reject ds_read too close to an already-placed waitcnt ahead."""
+        if not _isDsRead(inst):
+            return True
+        gap = _MIN_MFMA_GAP_DS_READ_TO_WAIT * 2
+        return self.earliestWaitCntPos - pos >= gap
+
+    def minGapDsReadToWait(self, placer, pos, inst):
+        """Reject waitcnt too close to the last placed ds_read."""
+        if not _isWaitCnt(inst) or self.lastDsReadPos < 0:
+            return True
+        gap = _MIN_MFMA_GAP_DS_READ_TO_WAIT * 2
+        return pos - self.lastDsReadPos >= gap
+
+    def noM0WithBufferLoad(self, placer, pos, inst):
+        """Avoid placing M0 updates and buffer_loads in the same MFMA interval."""
+        if not _isM0Update(inst) and not _isBufferLoad(inst):
+            return True
+        peer = pos ^ 1
+        slots = [pos]
+        if 0 <= peer < placer.totalSlots:
+            slots.append(peer)
+        if _isM0Update(inst):
+            return not any(_isBufferLoad(item[1]) for s in slots for item in placer._placed[s])
+        return not any(_isM0Update(item[1]) for s in slots for item in placer._placed[s])
+
+    # ── Adjusters: (placer, limit, inst) -> limit ──
+
+    def spreadBufferLoads(self, placer, limit, inst):
+        """Spread buffer_load instructions evenly across available range."""
+        if not _isBufferLoad(inst) or self.bufLoadMaxSlot <= 0:
+            return limit
+        if self.firstBufLoadPos is not None:
+            stride = max(1, (self.bufLoadMaxSlot - self.firstBufLoadPos)
+                         // self.numBufLoads)
+            limit = max(limit, self.firstBufLoadPos
+                        + self.bufLoadIdx * stride)
+        self.bufLoadIdx += 1
+        return limit
+
+    # ── Placement hook: (placer, pos, inst) -> None ──
+
+    def trackPlacement(self, placer, pos, inst):
+        """Update rule state after a successful placement."""
+        if _isDsRead(inst):
+            self.lastDsReadPos = max(self.lastDsReadPos, pos)
+        if _isWaitCnt(inst):
+            self.earliestWaitCntPos = min(self.earliestWaitCntPos, pos)
+        if _isBufferLoad(inst) and self.firstBufLoadPos is None:
+            self.firstBufLoadPos = pos
+
+    # ── Per-path setup ──
+
+    def resetPath(self):
+        self._resetPath()
+
+    def setupBufLoadSpreading(self, placer, pathInsts, order):
+        """Compute buffer-load spreading bounds for a forward path.
+
+        Reserves tail slots for non-buffer-load instructions in modules that
+        follow the last GR module (e.g. GR_INC SRD updates, LDS buffer swaps).
+        """
+        self.numBufLoads = sum(1 for _, inst in pathInsts if _isBufferLoad(inst))
+        if self.numBufLoads > 1:
+            _, rawMax = placer.bounds(pathInsts[-1][0])
+            grModuleIds = {mid for mid, inst in pathInsts if _isBufferLoad(inst)}
+            lastGrIdx = max(order.index(m) for m in grModuleIds if m in order)
+            tailModuleIds = set(order[lastGrIdx + 1:])
+            numTailInsts = sum(1 for mid, _ in pathInsts if mid in tailModuleIds)
+            # this is an approximation as we don't know exactly how many slots will be use by modules after the GR yet (in this codepath)
+            self.bufLoadMaxSlot = max(0, rawMax - numTailInsts)
+
+
+def _classifyPaths(pathOrders, emittedModules):
+    """Classify paths by wait_gr presence, sorted: wait_gr first, then by index."""
+    paths = []
+    for order in pathOrders:
+        hasWaitGR = any(emittedModules[i].opType == "wait_gr" for i in order)
+        paths.append((order, hasWaitGR))
+    paths.sort(key=lambda p: (0 if p[1] else 1, p[0][0] if p[0] else 10**9))
+    return paths
+
+
+def _flattenPath(order, emittedModules, reverse=False):
+    """Flatten a path of module indices into (moduleId, instruction) pairs."""
+    pathInsts = [(mid, inst) for mid in order for inst in emittedModules[mid].instructions]
+    if reverse:
+        pathInsts.reverse()
+    return pathInsts
 
 
 class SubtileBasedScheduler:
@@ -241,6 +563,9 @@ class SubtileBasedScheduler:
         self.scaleTileInfoA = scaleTileInfoA
         self.scaleTileInfoB = scaleTileInfoB
         self.hasScale = scaleTileInfoA is not None and scaleTileInfoB is not None
+        # Number of scale loads per MT (one load covers the entire MT)
+        self.scaleLoadsPerMT_A = 1 if self.hasScale else 0
+        self.scaleLoadsPerMT_B = 1 if self.hasScale else 0
         self.config = config
 
         self.MTA = tileInfoA.localSubtileGrid[0]
@@ -264,8 +589,6 @@ class SubtileBasedScheduler:
 
         self.partitions: List[Partition] = self._buildPartitions()
         self.allocator = VGPRTileAllocator()
-        self.hasDuplicatedReads: bool = False
-        self.needsUnrolling: bool = False
 
         # Scale VGPR tile IDs are deterministic: gid for A, numScaleGroupsA + gid for B.
         self.numScaleGroupsA = math.ceil(self.MTA / 2) if self.hasScale else 0
@@ -291,11 +614,11 @@ class SubtileBasedScheduler:
 
     def _generateOrder(self) -> List[Tuple[int, int]]:
         order = []
-        if self.config.ordering == SubgroupOrdering.COLUMN_MAJOR:
+        if self.config.ordering == PartitionOrdering.COLUMN_MAJOR:
             for col in range(self.numPartitionsB):
                 for row in range(self.numPartitionsA):
                     order.append((row, col))
-        elif self.config.ordering == SubgroupOrdering.SNAKE_COLUMN_MAJOR:
+        elif self.config.ordering == PartitionOrdering.SNAKE_COLUMN_MAJOR:
             for col in range(self.numPartitionsB):
                 if col % 2 == 0:
                     for row in range(self.numPartitionsA):
@@ -322,6 +645,8 @@ class SubtileBasedScheduler:
 
     def _computePartitionGRs(self, preloadedMTn1_A: Set[int], preloadedMTn1_B: Set[int]) -> Dict[int, PartitionGR]:
         """Compute each partition's GR target (mtIteration, targetPartition, subtiles).
+        Current behavior is : load MT n+1, partition + 1.
+        TODO. Change this to allow better GR spreading accross partition when using multi-partitions config
 
         Args:
             preloadedMTn1_A/B: MT n+1 subtiles already loaded by the preloop's GR(MT 1).
@@ -412,10 +737,15 @@ class SubtileBasedScheduler:
                 preloopOps.append(GROp(mtIteration="0",
                                        subtileA=grA, subtileB=grB,
                                        lastForMT=False))
+        # Mark the first MT 0 GR as firstForMT
+        for i in range(len(preloopOps)):
+            if isinstance(preloopOps[i], GROp):
+                preloopOps[i].firstForMT = True
+                break
         # Mark the last MT 0 GR as lastForMT
         for i in range(len(preloopOps) - 1, -1, -1):
             if isinstance(preloopOps[i], GROp):
-                preloopOps[i] = dataclasses.replace(preloopOps[i], lastForMT=True)
+                preloopOps[i].lastForMT = True
                 break
         preloopOps.append(GR_INCOp())
         preloopOps.append(WaitGROp(mtIteration="0",
@@ -431,17 +761,139 @@ class SubtileBasedScheduler:
         mt1Complete = (set(preloadMT1_A) == set(allA) and set(preloadMT1_B) == set(allB))
         preloopOps.append(GROp(mtIteration="1",
                                subtileA=preloadMT1_A, subtileB=preloadMT1_B,
-                               lastForMT=mt1Complete))
+                               firstForMT=True, lastForMT=mt1Complete))
         if mt1Complete:
             preloopOps.append(GR_INCOp())
         preloopOps.append(SkipOp(compare="LE", value=2, target="NGLL"))
         preloopSik = SubIterKSchedule(subIterK=0)
-        preloopSik.ops = preloopOps
+        preloopSik.modules = [AnnotatedModule(op=op) for op in preloopOps]
         self.preloopSteps: List[PartitionSchedule] = [
             PartitionSchedule(partitionId=0, subIterKSteps=[preloopSik])]
 
         return set(preloadMT1_A), set(preloadMT1_B)
 
+    def _buildSubIterK(self, partition, pi, sik, numPartitions):
+        """Build MFMA + LR modules for one subIterK step within a partition."""
+        # MFMA: map subtile indices to VGPR tile IDs
+        vgprTileMapA = {tA: self.allocator.getVGPRTileId('A', tA, sik)
+                        for tA in partition.tileAIndices}
+        vgprTileMapB = {tB: self.allocator.getVGPRTileId('B', tB, sik)
+                        for tB in partition.tileBIndices}
+
+        # MFMA scale maps
+        scaleMapA, scaleMapB = {}, {}
+        if self.hasScale:
+            for tA in partition.tileAIndices:
+                gid, vid = self.scaleVid('A', tA)
+                scaleMapA.setdefault(gid, vid)
+            for tB in partition.tileBIndices:
+                gid, vid = self.scaleVid('B', tB)
+                scaleMapB.setdefault(gid, vid)
+
+        # LR: load targets determined by prefetch mode
+        loadATiles, loadBTiles, loadSubIterK = self._getLoadTargets(pi, sik, numPartitions)
+        isWrapAround = self._isWrapAroundLoad(pi, sik, numPartitions)
+
+        lrLoadA = {tA: v for tA in (loadATiles or [])
+                   if (v := self._loadTile('A', tA, loadSubIterK, isWrapAround)) is not None}
+        lrLoadB = {tB: v for tB in (loadBTiles or [])
+                   if (v := self._loadTile('B', tB, loadSubIterK, isWrapAround)) is not None}
+
+        # Scale VGPRs for loaded tiles (only for subIterK==0 loads)
+        lrScaleA, lrScaleB = {}, {}
+        if self.hasScale and loadSubIterK == 0:
+            for tA in (loadATiles or []):
+                gid, vid = self.scaleVid('A', tA)
+                lrScaleA.setdefault(gid, vid)
+            for tB in (loadBTiles or []):
+                gid, vid = self.scaleVid('B', tB)
+                lrScaleB.setdefault(gid, vid)
+
+        # Conflict detection: MFMA reads and LR writes must not share VGPR tiles
+        mfmaIds = set(vgprTileMapA.values()) | set(vgprTileMapB.values())
+        loadIds = set(lrLoadA.values()) | set(lrLoadB.values())
+        overlap = mfmaIds & loadIds
+        if overlap:
+            # Fail for now. We could support this by duplicating the loop and use different VGPR tiles.
+            raise RuntimeError(
+                f"VGPR tile conflict in partition {partition.partitionId} subIterK={sik}: "
+                f"MFMA and LR share tile IDs {overlap}")
+
+        # Build modules
+        mfmas = [(a, b) for a in sorted(vgprTileMapA) for b in sorted(vgprTileMapB)]
+        mtLoad = "n+1" if isWrapAround else "n"
+        siks = SubIterKSchedule(subIterK=sik)
+        siks.modules.append(AnnotatedModule(op=MFMAOp(
+            mtIteration="n", subIterK=sik, subtiles=mfmas,
+            vgprTileMapA=vgprTileMapA, vgprTileMapB=vgprTileMapB,
+            scaleMapA=scaleMapA, scaleMapB=scaleMapB)))
+        siks.modules.append(AnnotatedModule(op=LROp(
+            mtIteration=mtLoad, subIterK=loadSubIterK,
+            lrLoadA=lrLoadA, lrLoadB=lrLoadB,
+            lrScaleA=lrScaleA, lrScaleB=lrScaleB)))
+
+        return siks
+
+    def _isLastGRForMT(self, pi, gr, numPartitions):
+        """Check if this partition's GR is the last one that completes a full MT load."""
+        if gr.mtIteration == "n+1":
+            return not any(
+                (self.partitionGRs[fpi].subtileA or self.partitionGRs[fpi].subtileB)
+                and self.partitionGRs[fpi].mtIteration == "n+1"
+                for fpi in range(pi + 1, numPartitions))
+        if gr.mtIteration == "n+2":
+            hasN1 = any(
+                (self.partitionGRs[p].subtileA or self.partitionGRs[p].subtileB)
+                and self.partitionGRs[p].mtIteration == "n+1"
+                for p in range(numPartitions))
+            if hasN1:
+                return False
+            return not any(
+                (self.partitionGRs[fpi].subtileA or self.partitionGRs[fpi].subtileB)
+                and self.partitionGRs[fpi].mtIteration == "n+2"
+                for fpi in range(pi + 1, numPartitions))
+        return False
+
+    def _isFirstGRForMT(self, pi, gr, numPartitions):
+        """Check if this partition's GR is the first one for its MT iteration."""
+        if gr.mtIteration in ("n+1", "n+2"):
+            return not any(
+                (self.partitionGRs[fpi].subtileA or self.partitionGRs[fpi].subtileB)
+                and self.partitionGRs[fpi].mtIteration == gr.mtIteration
+                for fpi in range(0, pi))
+        return False
+
+    def _insertGROps(self, pss, pi, gr, numPartitions):
+        """Insert GR ops for a partition, splitting across subIterK=0 and subIterK=1."""
+        if not gr.subtileA and not gr.subtileB:
+            return
+
+        totalGR_A = sorted(gr.subtileA)
+        totalGR_B = sorted(gr.subtileB)
+        splitA = (len(totalGR_A) + 1) // 2
+        splitB = (len(totalGR_B) + 1) // 2
+        gr0_A, gr1_A = totalGR_A[:splitA], totalGR_A[splitA:]
+        gr0_B, gr1_B = totalGR_B[:splitB], totalGR_B[splitB:]
+        isLast = self._isLastGRForMT(pi, gr, numPartitions)
+        isFirst = self._isFirstGRForMT(pi, gr, numPartitions)
+        hasSik1 = bool(gr1_A or gr1_B)
+        # handle case where gr1 is empty.
+        if gr0_A or gr0_B:
+            pss.subIterKSteps[0].modules.append(AnnotatedModule(op=GROp(
+                mtIteration=gr.mtIteration,
+                subtileA=gr0_A, subtileB=gr0_B,
+                firstForMT=isFirst,
+                lastForMT=isLast and not hasSik1)))
+        if hasSik1:
+            pss.subIterKSteps[1].modules.append(AnnotatedModule(op=GROp(
+                mtIteration=gr.mtIteration,
+                subtileA=gr1_A, subtileB=gr1_B, lastForMT=isLast)))
+
+    # Generate the schedule
+    # 1- build subIterK steps
+    # 2- insert GR ops 
+    # 3- annotate dependencies (WAIT and INC Ops)
+    # 4- build NGLL & NLL using mainloop schedule
     def _runSchedule(self):
         if self.config.prefetchMode == PrefetchMode.NO:
             raise NotImplementedError("PrefetchMode.NO is not yet supported")
@@ -454,177 +906,24 @@ class SubtileBasedScheduler:
 
         for pi, partition in enumerate(self.partitions):
             pss = PartitionSchedule(partitionId=partition.partitionId)
-            gr = self.partitionGRs[pi]
-            subIterK0LoadAKeys: Set[int] = set()
-            subIterK0LoadBKeys: Set[int] = set()
 
             for sik in range(self.numSubIterK):
-                # USE: current group's tiles at current subIterK
-                # MFMA: map subtile indices to VGPR tile IDs
-                vgprTileMapA = {}
-                vgprTileMapB = {}
-                for tA in partition.tileAIndices:
-                    vgprTileMapA[tA] = self.allocator.getVGPRTileId('A', tA, sik)
-                for tB in partition.tileBIndices:
-                    vgprTileMapB[tB] = self.allocator.getVGPRTileId('B', tB, sik)
+                pss.subIterKSteps.append(
+                    self._buildSubIterK(partition, pi, sik, numPartitions))
 
-                # MFMA scale maps: look up already-allocated scale VGPR tile IDs
-                scaleMapA = {}
-                scaleMapB = {}
-                if self.hasScale:
-                    for tA in partition.tileAIndices:
-                        gid, vid = self.scaleVid('A', tA)
-                        scaleMapA.setdefault(gid, vid)
-                    for tB in partition.tileBIndices:
-                        gid, vid = self.scaleVid('B', tB)
-                        scaleMapB.setdefault(gid, vid)
-
-                # LOAD: determined by prefetch mode
-                loadATiles, loadBTiles, loadSubIterK = self._getLoadTargets(pi, sik, numPartitions)
-                isWrapAround = self._isWrapAroundLoad(pi, sik, numPartitions)
-                curA = set(partition.tileAIndices)
-                curB = set(partition.tileBIndices)
-                if sik == 0:
-                    self._pendingRemap = []
-
-                lrLoadA = {}
-                lrLoadB = {}
-                if loadATiles is not None:
-                    for tA in loadATiles:
-                        vid = self._loadTile('A', tA, loadSubIterK, isWrapAround, curA)
-                        if vid is not None:
-                            lrLoadA[tA] = vid
-
-                if loadBTiles is not None:
-                    for tB in loadBTiles:
-                        vid = self._loadTile('B', tB, loadSubIterK, isWrapAround, curB)
-                        if vid is not None:
-                            lrLoadB[tB] = vid
-
-                # Allocate scale VGPRs for loaded tiles (only when loading subIterK==0 data,
-                # since scale data is constant across subIterK within one MT iteration).
-                # Use loadSubIterK (not sik) because wrap-around loads target subIterK 0
-                # even though the current partition's sik may be > 0.
-                lrScaleA = {}
-                lrScaleB = {}
-                if self.hasScale and loadSubIterK == 0:
-                    if loadATiles is not None:
-                        for tA in loadATiles:
-                            gid, vid = self.scaleVid('A', tA)
-                            lrScaleA.setdefault(gid, vid)
-                    if loadBTiles is not None:
-                        for tB in loadBTiles:
-                            gid, vid = self.scaleVid('B', tB)
-                            lrScaleB.setdefault(gid, vid)
-
-                # Check MFMA and LOAD VGPRTile IDs don't overlap
-                mfmaIds = set(vgprTileMapA.values()) | set(vgprTileMapB.values())
-                loadIds = set(lrLoadA.values()) | set(lrLoadB.values())
-                overlap = mfmaIds & loadIds
-                conflict = set()
-                if overlap:
-                    conflict = overlap
-                    self.needsUnrolling = True
-
-                # Build SubIterKSchedule with MFMA and LR ops
-                siks = SubIterKSchedule(subIterK=sik)
-                mfmas = [(a, b) for a in sorted(vgprTileMapA.keys()) for b in sorted(vgprTileMapB.keys())]
-                mtLoad = "n+1" if isWrapAround else "n"
-                siks.ops.append(MFMAOp(mtIteration="n", subIterK=sik,
-                                      subtiles=mfmas,
-                                      vgprTileMapA=vgprTileMapA, vgprTileMapB=vgprTileMapB,
-                                      scaleMapA=scaleMapA, scaleMapB=scaleMapB))
-                siks.ops.append(LROp(mtIteration=mtLoad, subIterK=loadSubIterK,
-                                    lrLoadA=lrLoadA, lrLoadB=lrLoadB,
-                                    lrScaleA=lrScaleA, lrScaleB=lrScaleB))
-                siks.conflict = conflict
-                pss.subIterKSteps.append(siks)
-
-                # save subtiles for subIterK=0 to check where to insert GR(n+2)
-                if sik == 0:
-                    subIterK0LoadAKeys = set(lrLoadA.keys())
-                    subIterK0LoadBKeys = set(lrLoadB.keys())
-
-                # WITHIN_SUBGROUP: release current subIterK's MFMA tiles for K-dim reuse
-                if self.config.reuseStrategy == VGPRTileReUseStrategy.WITHIN_SUBGROUP:
-                    for tA in vgprTileMapA:
-                        if self.allocator.isAllocated('A', tA, sik):
-                            self.allocator.release('A', tA, sik)
-                    for tB in vgprTileMapB:
-                        if self.allocator.isAllocated('B', tB, sik):
-                            self.allocator.release('B', tB, sik)
-
-            # Insert GROps split across subIterK=0 and subIterK=1
-            if gr.subtileA or gr.subtileB:
-                totalGR_A = sorted(gr.subtileA)
-                totalGR_B = sorted(gr.subtileB)
-                splitA = (len(totalGR_A) + 1) // 2
-                splitB = (len(totalGR_B) + 1) // 2
-                gr0_A, gr1_A = totalGR_A[:splitA], totalGR_A[splitA:]
-                gr0_B, gr1_B = totalGR_B[:splitB], totalGR_B[splitB:]
-
-                # lastForMT: true for the last GR that completes a full MT load
-                # within this loop iteration. One GR_INC per loop iteration.
-                # - For n+1 GRs: true when no more n+1 GRs follow.
-                # - For n+2 GRs: true only when there are no n+1 GRs at all
-                #   (1 partition case where n+2 loads all subtiles in one shot).
-                #   Otherwise n+2 is partial and continues in the next iteration.
-                isLastForThisMT = False
-                if gr.mtIteration == "n+1":
-                    isLastForThisMT = True
-                    for fpi in range(pi + 1, numPartitions):
-                        fgr = self.partitionGRs[fpi]
-                        if (fgr.subtileA or fgr.subtileB) and fgr.mtIteration == "n+1":
-                            isLastForThisMT = False
-                            break
-                elif gr.mtIteration == "n+2":
-                    # n+2 gets GR_INC only if no n+1 GRs exist (single partition)
-                    hasN1 = any((self.partitionGRs[p].subtileA or self.partitionGRs[p].subtileB)
-                                and self.partitionGRs[p].mtIteration == "n+1"
-                                for p in range(numPartitions))
-                    if not hasN1:
-                        # Check this is the last n+2 GR
-                        isLastForThisMT = True
-                        for fpi in range(pi + 1, numPartitions):
-                            fgr = self.partitionGRs[fpi]
-                            if (fgr.subtileA or fgr.subtileB) and fgr.mtIteration == "n+2":
-                                isLastForThisMT = False
-                                break
-
-                if gr0_A or gr0_B:
-                    pss.subIterKSteps[0].ops.append(GROp(
-                        mtIteration=gr.mtIteration,
-                        subtileA=gr0_A, subtileB=gr0_B,
-                        lastForMT=False))
-                if gr1_A or gr1_B:
-                    pss.subIterKSteps[1].ops.append(GROp(
-                        mtIteration=gr.mtIteration,
-                        subtileA=gr1_A, subtileB=gr1_B,
-                        lastForMT=isLastForThisMT))
-                elif isLastForThisMT:
-                    # All GRs fit in subIterK=0, mark that one as last
-                    pss.subIterKSteps[0].ops[-1] = dataclasses.replace(
-                        pss.subIterKSteps[0].ops[-1], lastForMT=True)
-
+            # split GR ops across subIterK steps and determine lastForMT
+            self._insertGROps(pss, pi, self.partitionGRs[pi], numPartitions)
             self.mainloopSteps.append(pss)
 
-            # Release after partition based on strategy
-            if self.config.reuseStrategy == VGPRTileReUseStrategy.WITHIN_SUBGROUP:
-                for tc, tileIdx, subIterK, shadowKey in self._pendingRemap:
-                    vid = self.allocator._allocMap(tc).pop((shadowKey, subIterK))
-                    self.allocator._allocMap(tc)[(tileIdx, subIterK)] = vid
-                self._pendingRemap = []
-            elif self.config.reuseStrategy == VGPRTileReUseStrategy.ACROSS_SUBGROUP:
+            if self.config.reuseStrategy == VGPRTileReUseStrategy.ACROSS_PARTITIONS:
                 self._releaseUnusedAfterPartition(pi)
 
-        self._insertWaitsAndSync(numPartitions)
+        self._annotateDependencies(numPartitions)
         self.ngllSteps = self._buildNGLL()
         self.nllSteps = self._buildNLL()
-        self._checkDuplicatedReads()
 
     def _loadTile(self, tc: str, tileIdx: int, loadSubIterK: int,
-                  isWrapAround: bool,
-                  currentPartitionTiles: Set[int]) -> Optional[int]:
+                  isWrapAround: bool) -> Optional[int]:
         """Determine the VGPRTile ID for a load. Returns None if no load needed."""
         allocated = self.allocator.isAllocated(tc, tileIdx, loadSubIterK)
 
@@ -633,21 +932,9 @@ class SubtileBasedScheduler:
             return self.allocator.getVGPRTileId(tc, tileIdx, loadSubIterK)
 
         if not allocated:
-            # Fresh allocation
             return self.allocator.allocate(tc, tileIdx, loadSubIterK)
 
-        if self.config.reuseStrategy == VGPRTileReUseStrategy.WITHIN_SUBGROUP \
-                and tileIdx in currentPartitionTiles:
-            # Tile is allocated by the current partition but will be released after it.
-            # Must allocate a new VGPR for the next partition's data.
-            # Use a shadow key to avoid overwriting the current allocation.
-            shadowKey = -(tileIdx + 1)  # negative to avoid collision
-            vid = self.allocator.allocate(tc, shadowKey, loadSubIterK)
-            # Store the real tileIdx mapping for later fixup
-            self._pendingRemap.append((tc, tileIdx, loadSubIterK, shadowKey))
-            return vid
-
-        # NONE / ACROSS_SUBGROUP: tile stays alive, reuse in place
+        # Tile stays alive, reuse in place
         return None
 
     def _isWrapAroundLoad(self, partitionIdx: int, subIterK: int, numPartitions: int) -> bool:
@@ -689,7 +976,7 @@ class SubtileBasedScheduler:
     # ── Reuse strategies ─────────────────────────────────────
 
     def _releaseUnusedAfterPartition(self, partitionIdx: int):
-        """ACROSS_SUBGROUP: release tiles not appearing in any future partition.
+        """ACROSS_PARTITIONS: release tiles not appearing in any future partition.
         Partition 0's tiles are always considered "future" because the wrap-around
         LR at the end of the loop loads back into partition 0's vgprTile IDs."""
         currentPartition = self.partitions[partitionIdx]
@@ -709,200 +996,212 @@ class SubtileBasedScheduler:
             if tB not in futureB:
                 self.allocator.releaseAllForTile('B', tB)
 
-    def _releasePartitionTiles(self, partition: Partition):
-        """WITHIN_SUBGROUP: release all tiles (all subIterK) of this partition."""
-        for tA in partition.tileAIndices:
-            self.allocator.releaseAllForTile('A', tA)
-        for tB in partition.tileBIndices:
-            self.allocator.releaseAllForTile('B', tB)
-
-    def _insertWaitsAndSync(self, numPartitions: int):
-        """Pass 2: Insert WAIT_LR, WAIT_GR, SyncOp and reorder ops.
-
-        After pass 1, each subIterK has: [MFMAOp, LROp, GROp?]
-
-        This pass produces the final ordering per subIterK:
-          subIterK=0 (LR for MT n, GR n+2 collides):
-            MFMAs → LR → WAIT_LR → SyncOp → GR(n+2)
-          subIterK=1 (LR for MT n+1, WAIT_GR needed):
-            MFMAs → GR(n+2) → WAIT_GR → SyncOp → LR(n+1) → WAIT_LR
-        """
-        # ── Pass 3 prep: build GR events for inflight counting ──
-        # Each entry: (opIndex, mtIteration, subtileA_set, subtileB_set)
-        # Also record the opIndex of each WAIT_GR candidate (subIterK==0 LR ops).
+    def _buildGREvents(self):
+        """Build GR events list from modules for inflight counting."""
         grEvents = []
         opIdx = 0
         for pss in self.mainloopSteps:
             for dus in pss.subIterKSteps:
-                for op in dus.ops:
-                    if isinstance(op, GROp):
-                        grEvents.append((opIdx, op.mtIteration,
-                                         set(op.subtileA), set(op.subtileB)))
+                for mod in dus.modules:
+                    if isinstance(mod.op, GROp):
+                        grEvents.append((opIdx, mod.op.mtIteration,
+                                         set(mod.op.subtileA), set(mod.op.subtileB),
+                                         mod.op.firstForMT))
                     opIdx += 1
+        return grEvents
 
-        def _parseMTOffset(mt: str) -> Optional[int]:
-            if mt == "n":
-                return 0
-            if mt.startswith("n+"):
-                return int(mt[2:])
-            return None
+    @staticmethod
+    def _parseMTOffset(mt: str) -> Optional[int]:
+        if mt == "n":
+            return 0
+        if mt.startswith("n+"):
+            return int(mt[2:])
+        return None
 
-        def _countInflightSubtileLoads(waitOpIndex, waitMT, waitSubtileA, waitSubtileB):
-            """Count inflight subtile loads by walking backwards through
-            the mainloop from the WAIT_GR position until we find the GR
-            that originally issued the waited subtiles.
+    def _countInflightSubtileLoads(self, grEvents, sikStart, sikEnd, waitMT, waitSubtileA, waitSubtileB):
+        """Count GR subtile loads still in flight before the current subIterK.
+        Excludes any loads within the current subIterK [sikStart, sikEnd).
+        Returns (inflightA, inflightB, scaleLoadsA, scaleLoadsB)."""
+        waitOffset = self._parseMTOffset(waitMT)
+        if waitOffset is None:
+            return 0, 0, 0, 0
 
-            Walk upward from the WAIT_GR. Every GR encountered increments
-            the inflight count. When we find a GR whose (shifted) MT and
-            subtile sets match the WAIT target, we stop (without counting it).
+        targetA, targetB = set(waitSubtileA), set(waitSubtileB)
+        before = [(mt, a, b, first) for (idx, mt, a, b, first) in grEvents if idx < sikStart]
+        after  = [(mt, a, b, first) for (idx, mt, a, b, first) in grEvents if idx >= sikEnd]
+        totalA, totalB, scaleA, scaleB = 0, 0, 0, 0
 
-            When wrapping from the start of the mainloop to the end
-            (previous iteration), MT iterations shift down by 1
-            (e.g. n+2 becomes n+1, n+1 becomes n).
-            """
-            waitOffset = _parseMTOffset(waitMT)
-            if waitOffset is None:
-                return 0, 0
+        for (grMT, grA, grB, firstForMT) in reversed(before):
+            grOffset = self._parseMTOffset(grMT)
+            if grOffset is None:
+                continue
+            if grOffset == waitOffset and grA == targetA and grB == targetB:
+                return totalA, totalB, scaleA, scaleB
+            totalA += len(grA)
+            totalB += len(grB)
+            if firstForMT and self.hasScale:
+                scaleA += self.scaleLoadsPerMT_A
+                scaleB += self.scaleLoadsPerMT_B
 
-            targetA = set(waitSubtileA)
-            targetB = set(waitSubtileB)
+        for (grMT, grA, grB, firstForMT) in reversed(after):
+            grOffset = self._parseMTOffset(grMT)
+            if grOffset is None:
+                continue
+            if grOffset - 1 == waitOffset and grA == targetA and grB == targetB:
+                return totalA, totalB, scaleA, scaleB
+            totalA += len(grA)
+            totalB += len(grB)
+            if firstForMT and self.hasScale:
+                scaleA += self.scaleLoadsPerMT_A
+                scaleB += self.scaleLoadsPerMT_B
 
-            # Split grEvents into before-wait and after-wait (for wrap)
-            before = [(mt, a, b) for (idx, mt, a, b) in grEvents if idx < waitOpIndex]
-            after  = [(mt, a, b) for (idx, mt, a, b) in grEvents if idx >= waitOpIndex]
+        return totalA, totalB, scaleA, scaleB
 
-            totalA = 0
-            totalB = 0
+    def _buildWaitGROp(self, lrOp, pendingA, pendingB, sikStart, sikEnd, grEvents):
+        """Determine if a WAIT_GR is needed before this LR. Returns (waitGROp, waitA, waitB)."""
+        if not lrOp or lrOp.subIterK != 0:
+            return None, set(), set()
 
-            # Walk backwards through events before the WAIT (no MT shift)
-            for (grMT, grA, grB) in reversed(before):
-                grOffset = _parseMTOffset(grMT)
-                if grOffset is None:
-                    continue
-                if grOffset == waitOffset and grA == targetA and grB == targetB:
-                    return totalA, totalB
-                totalA += len(grA)
-                totalB += len(grB)
+        waitA = set(lrOp.lrLoadA.keys()) & pendingA
+        waitB = set(lrOp.lrLoadB.keys()) & pendingB
+        if not waitA and not waitB:
+            return None, set(), set()
 
-            # Wrap: walk backwards from end of mainloop (shift MT by -1)
-            for (grMT, grA, grB) in reversed(after):
-                grOffset = _parseMTOffset(grMT)
-                if grOffset is None:
-                    continue
-                shiftedOffset = grOffset - 1
-                if shiftedOffset == waitOffset and grA == targetA and grB == targetB:
-                    return totalA, totalB
-                totalA += len(grA)
-                totalB += len(grB)
+        #TODO. fix _countInflightSubtileLoads . Not working well in 1x4,4x1 or multi-parition configs
+        inflightA, inflightB, scaleA, scaleB = self._countInflightSubtileLoads(
+            grEvents, sikStart, sikEnd, lrOp.mtIteration, sorted(waitA), sorted(waitB))
+        waitGROp = WaitGROp(
+            mtIteration=lrOp.mtIteration,
+            subtileA=sorted(waitA), subtileB=sorted(waitB),
+            inflightLoadsA=inflightA, inflightLoadsB=inflightB,
+            inflightScaleLoadsA=scaleA, inflightScaleLoadsB=scaleB)
+        pendingA -= waitA
+        pendingB -= waitB
+        return waitGROp, waitA, waitB
 
-            return totalA, totalB
+    @staticmethod
+    def _findMatchingGR(lrOp, priorGRMods, grMods, waitA, waitB):
+        """Find the GR module that the LR should depend on (matching MT iteration)."""
+        targetMT = lrOp.mtIteration
+        for g in reversed(priorGRMods + grMods):
+            if g.op.mtIteration != targetMT:
+                continue
+            gA, gB = set(g.op.subtileA), set(g.op.subtileB)
+            if (not waitA or waitA.issubset(gA)) and (not waitB or waitB.issubset(gB)):
+                return g
+        # Fallback: any GR with matching MT
+        return next((g for g in reversed(priorGRMods + grMods)
+                     if g.op.mtIteration == targetMT), None)
 
-        # ── Insert WAIT_LR, WAIT_GR, SyncOp, GR_INC, LR_INC and reorder ──
+    @staticmethod
+    def _annotateGRInc(grMods):
+        """Append GR_INC to the last GR module for this MT iteration."""
+        for grMod in grMods:
+            if grMod.op.lastForMT:
+                grMod.after.append(DepEdge(op=GR_INCOp()))
+
+    @staticmethod
+    def _annotateLRInc(lrMod, lrOp, lastLRmt):
+        """Prepend LR_INC if the LR's MT iteration changed."""
+        if lastLRmt is not None and lrOp.mtIteration != lastLRmt:
+            lrMod.before.append(DepEdge(op=LR_INCOp()))
+
+    def _annotateLRDependsOnGR(self, lrMod, lrOp, grMods, priorGRMods, waitGROp, waitA, waitB):
+        """LR depends on GR — GR must complete before LR can read from LDS."""
+        grMatch = self._findMatchingGR(lrOp, priorGRMods, grMods, waitA, waitB)
+        if grMatch is not None:
+            lrMod.before.append(DepEdge(module=grMatch))
+        lrMod.before.append(DepEdge(op=waitGROp))
+        lrMod.before.append(DepEdge(op=SyncOp(comment="Barrier: wait for GR data")))
+
+    @staticmethod
+    def _annotateGRDependsOnLR(lrMod, grMods):
+        """GR(n+2) depends on LR — LR must complete before GR writes to LDS. Limited due to LDS double-buffering."""
+        for grMod in grMods:
+            grMod.before.append(DepEdge(module=lrMod))
+            grMod.before.append(DepEdge(op=WaitLROp()))
+            grMod.before.append(DepEdge(op=SyncOp(comment="Barrier: all waves done with LR before GR(n+2) writes")))
+
+    def _annotateDependencies(self, numPartitions: int):
+        """Annotate each AnnotatedModule with before/after dependency edges."""
+        grEvents = self._buildGREvents()
         pendingA = set()
         pendingB = set()
         lastLRmt = None
         opIdx = 0
+        priorGRMods: List[AnnotatedModule] = []
+
         for pss in self.mainloopSteps:
             gr = self.partitionGRs[pss.partitionId]
+            # PendingA/B are subtiles issues not been waited on yet.
             pendingA |= gr.subtileA
             pendingB |= gr.subtileB
 
             for dus in pss.subIterKSteps:
-                numOrigOps = len(dus.ops)
-                # Extract ops by type from pass 1
-                mfmaOps = [op for op in dus.ops if isinstance(op, MFMAOp)]
-                lrOps = [op for op in dus.ops if isinstance(op, LROp)]
-                grOps = [op for op in dus.ops if isinstance(op, GROp)]
-                otherOps = [op for op in dus.ops
-                            if not isinstance(op, (MFMAOp, LROp, GROp))]
+                lrMods = [m for m in dus.modules if isinstance(m.op, LROp)]
+                grMods = [m for m in dus.modules if isinstance(m.op, GROp)]
+                lrMod = lrMods[0] if lrMods else None
+                lrOp = lrMod.op if lrMod else None
+                hasGRn2 = any(m.op.mtIteration == "n+2" for m in grMods)
 
-                lrOp = lrOps[0] if lrOps else None
-                hasGRn2 = any(g.mtIteration == "n+2" for g in grOps)
+                # build WAIT_GR is the LROp needs subtile that are still pending.
+                waitGROp, waitA, waitB = self._buildWaitGROp(
+                    lrOp, pendingA, pendingB, opIdx, opIdx + len(dus.modules), grEvents)
 
-                # Determine if WAIT_GR is needed before this LR
-                waitGROp = None
-                if lrOp and lrOp.subIterK == 0:
-                    waitA = set(lrOp.lrLoadA.keys()) & pendingA
-                    waitB = set(lrOp.lrLoadB.keys()) & pendingB
-                    if waitA or waitB:
-                        # WAIT_GR position: after all original ops in this subIterK step
-                        waitOpIdx = opIdx + numOrigOps
-                        inflightCountA, inflightCountB = _countInflightSubtileLoads(
-                            waitOpIdx, lrOp.mtIteration, sorted(waitA), sorted(waitB))
-                        waitGROp = WaitGROp(
-                            mtIteration=lrOp.mtIteration,
-                            subtileA=sorted(waitA), subtileB=sorted(waitB),
-                            inflightLoadsA=inflightCountA, inflightLoadsB=inflightCountB)
-                        pendingA -= waitA
-                        pendingB -= waitB
+                self._annotateGRInc(grMods)
 
-                # Rebuild ops in correct order
-                newOps = []
-                newOps.extend(mfmaOps)
-                newOps.extend(otherOps)
+                if waitGROp and lrMod:
+                    self._annotateLRDependsOnGR(
+                        lrMod, lrOp, grMods, priorGRMods, waitGROp, waitA, waitB)
+                elif hasGRn2 and lrMod:
+                    self._annotateGRDependsOnLR(lrMod, grMods)
 
-                if waitGROp:
-                    # subIterK=1 pattern: MFMAs → GR(n+2) → GR_INC? → WAIT_GR → SyncOp → LR_INC? → LR → WAIT_LR
-                    newOps.extend(grOps)
-                    if any(g.lastForMT for g in grOps):
-                        newOps.append(GR_INCOp())
-                    newOps.append(waitGROp)
-                    newOps.append(SyncOp(comment="Barrier: wait for GR data"))
-                    if lrOp:
-                        if lastLRmt is not None and lrOp.mtIteration != lastLRmt:
-                            newOps.append(LR_INCOp())
-                        lastLRmt = lrOp.mtIteration
-                        newOps.append(lrOp)
-                        newOps.append(WaitLROp())
-                elif hasGRn2 and lrOp:
-                    # subIterK=0 pattern: MFMAs → LR_INC? → LR → WAIT_LR → SyncOp → GR(n+2) → GR_INC?
-                    if lastLRmt is not None and lrOp.mtIteration != lastLRmt:
-                        newOps.append(LR_INCOp())
+                if lrMod:
+                    self._annotateLRInc(lrMod, lrOp, lastLRmt)
+                    lrMod.after.append(DepEdge(op=WaitLROp()))
+
+                if lrOp:
                     lastLRmt = lrOp.mtIteration
-                    newOps.append(lrOp)
-                    newOps.append(WaitLROp())
-                    newOps.append(SyncOp(comment="Barrier: all waves done with LR before GR(n+2) writes"))
-                    newOps.extend(grOps)
-                    if any(g.lastForMT for g in grOps):
-                        newOps.append(GR_INCOp())
-                else:
-                    # No special dependency: MFMAs → LR_INC? → LR → GR → GR_INC? → WAIT_LR
-                    if lrOp:
-                        if lastLRmt is not None and lrOp.mtIteration != lastLRmt:
-                            newOps.append(LR_INCOp())
-                        lastLRmt = lrOp.mtIteration
-                        newOps.append(lrOp)
-                    newOps.extend(grOps)
-                    if grOps and any(g.lastForMT for g in grOps):
-                        newOps.append(GR_INCOp())
-                    if lrOp:
-                        newOps.append(WaitLROp())
-
-                opIdx += numOrigOps
-                dus.ops = newOps
+                priorGRMods.extend(grMods)
+                opIdx += len(dus.modules)
 
 
+    @staticmethod
+    def _filterDepEdges(edges: List[DepEdge], remove_types: tuple) -> List[DepEdge]:
+        """Filter dependency edges, removing ops of specified types."""
+        return [e for e in edges if not isinstance(e.op, remove_types)]
+
+    # TODO. Re-test with multi-partitions
     def _buildNGLL(self) -> List[PartitionSchedule]:
-        """NGLL (Non Global Load Loop): mainloop without GR(n+2) and GR_INC."""
+        """NGLL (No Global Load Loop): mainloop without GR(n+2) and GR_INC."""
         ngll = []
         for pss in self.mainloopSteps:
             newPss = PartitionSchedule(partitionId=pss.partitionId)
             for dus in pss.subIterKSteps:
-                newDus = SubIterKSchedule(subIterK=dus.subIterK, conflict=dus.conflict)
-                for op in dus.ops:
-                    if isinstance(op, GROp) and op.mtIteration == "n+2":
+                newDus = SubIterKSchedule(subIterK=dus.subIterK)
+                for mod in dus.modules:
+                    if isinstance(mod.op, GROp) and mod.op.mtIteration == "n+2":
                         continue
-                    if isinstance(op, GR_INCOp):
-                        continue
-                    if isinstance(op, WaitGROp):
-                        op = WaitGROp(mtIteration=op.mtIteration,
-                                    subtileA=op.subtileA, subtileB=op.subtileB,
-                                    inflightLoadsA=0, inflightLoadsB=0)
-                    newDus.ops.append(op)
+                    newBefore = []
+                    for e in mod.before:
+                        if e.module and isinstance(e.module.op, GROp) and e.module.op.mtIteration == "n+2":
+                            continue
+                        if e.op and isinstance(e.op, WaitGROp):
+                            # TODO. Check counts here. 
+                            newBefore.append(DepEdge(op=WaitGROp(
+                                mtIteration=e.op.mtIteration,
+                                subtileA=e.op.subtileA, subtileB=e.op.subtileB,
+                                inflightLoadsA=0, inflightLoadsB=0)))
+                        else:
+                            newBefore.append(e)
+                    newAfter = self._filterDepEdges(mod.after, (GR_INCOp,))
+                    newDus.modules.append(AnnotatedModule(
+                        op=mod.op, before=newBefore, after=newAfter))
                 newPss.subIterKSteps.append(newDus)
             ngll.append(newPss)
         return ngll
 
+    # TODO. Re-test with multi-partitions
     def _buildNLL(self) -> List[PartitionSchedule]:
         """NLL (No Load Loop): mainloop without GR, GR_INC, LR_INC, LR(n+1),
         WaitGR(n+1) and their associated SyncOps. Keeps WaitGR(n) and its SYNC."""
@@ -910,83 +1209,75 @@ class SubtileBasedScheduler:
         for pss in self.mainloopSteps:
             newPss = PartitionSchedule(partitionId=pss.partitionId)
             for dus in pss.subIterKSteps:
-                newDus = SubIterKSchedule(subIterK=dus.subIterK, conflict=dus.conflict)
-                ops = dus.ops
-                for i, op in enumerate(ops):
-                    if isinstance(op, (GROp, GR_INCOp, LR_INCOp)):
+                newDus = SubIterKSchedule(subIterK=dus.subIterK)
+                # Track which modules are being removed (for filtering module refs)
+                removedMods = set()
+                for mod in dus.modules:
+                    if isinstance(mod.op, GROp):
+                        removedMods.add(id(mod))
+                    elif isinstance(mod.op, LROp) and mod.op.mtIteration == "n+1":
+                        removedMods.add(id(mod))
+
+                for mod in dus.modules:
+                    if id(mod) in removedMods:
                         continue
-                    if isinstance(op, LROp) and op.mtIteration == "n+1":
-                        continue
-                    if isinstance(op, WaitGROp):
-                        if op.mtIteration == "n+1":
+                    # Filter deps: remove module refs to removed modules, GR_INC, LR_INC,
+                    # WaitGR(n+1) and its paired SYNC
+                    newBefore = []
+                    for e in mod.before:
+                        if e.module and id(e.module) in removedMods:
                             continue
-                        op = WaitGROp(mtIteration=op.mtIteration,
-                                    subtileA=op.subtileA, subtileB=op.subtileB,
-                                    inflightLoadsA=0, inflightLoadsB=0)
-                    if isinstance(op, SyncOp):
-                        # Skip SyncOps associated with removed ops:
-                        # - SyncOp followed by a GROp (barrier before GR writes)
-                        # - SyncOp preceded by a WaitGROp(n+1) (barrier after GR wait)
-                        nextOp = ops[i + 1] if i + 1 < len(ops) else None
-                        prevOp = ops[i - 1] if i > 0 else None
-                        if isinstance(nextOp, GROp):
+                        if e.op and isinstance(e.op, (GR_INCOp, LR_INCOp)):
                             continue
-                        if isinstance(prevOp, WaitGROp) and prevOp.mtIteration == "n+1":
+                        if e.op and isinstance(e.op, WaitGROp) and e.op.mtIteration == "n+1":
                             continue
-                    newDus.ops.append(op)
-                # Remove orphaned WAIT_LR when no LR remains in this subIterK
-                hasLR = any(isinstance(op, LROp) for op in newDus.ops)
+                        if e.op and isinstance(e.op, SyncOp):
+                            # Skip SYNC if paired with a removed WaitGR(n+1)
+                            idx = mod.before.index(e)
+                            prevEdge = mod.before[idx - 1] if idx > 0 else None
+                            if prevEdge and prevEdge.op and isinstance(prevEdge.op, WaitGROp) and prevEdge.op.mtIteration == "n+1":
+                                continue
+                        if e.op and isinstance(e.op, WaitGROp):
+                            newBefore.append(DepEdge(op=WaitGROp(
+                                mtIteration=e.op.mtIteration,
+                                subtileA=e.op.subtileA, subtileB=e.op.subtileB,
+                                inflightLoadsA=0, inflightLoadsB=0)))
+                        else:
+                            newBefore.append(e)
+                    newAfter = self._filterDepEdges(mod.after, (GR_INCOp,))
+                    newDus.modules.append(AnnotatedModule(
+                        op=mod.op, before=newBefore, after=newAfter))
+                # Remove WaitLROp from after when no LR exists in this subIterK
+                # (the WaitLROp was for the removed LR(n+1))
+                hasLR = any(isinstance(m.op, LROp) for m in newDus.modules)
                 if not hasLR:
-                    newDus.ops = [op for op in newDus.ops if not isinstance(op, WaitLROp)]
+                    for m in newDus.modules:
+                        m.after = self._filterDepEdges(m.after, (WaitLROp,))
                 newPss.subIterKSteps.append(newDus)
             nll.append(newPss)
         return nll
 
-    def _checkDuplicatedReads(self):
-        """Detect if any (subtile, subIterK) pair is loaded more than once."""
-        seenA: Dict[AllocKey, int] = {}
-        seenB: Dict[AllocKey, int] = {}
-        # Count preloop LR loads
-        for pss in self.preloopSteps:
-            for dus in pss.subIterKSteps:
-                for op in dus.ops:
-                    if isinstance(op, LROp):
-                        for tA in op.lrLoadA:
-                            key = (tA, op.subIterK)
-                            seenA[key] = seenA.get(key, 0) + 1
-                        for tB in op.lrLoadB:
-                            key = (tB, op.subIterK)
-                            seenB[key] = seenB.get(key, 0) + 1
-        # Count mainloop LR loads (skip wrap-around which reuses existing allocations)
-        for pss in self.mainloopSteps:
-            for dus in pss.subIterKSteps:
-                for op in dus.ops:
-                    if isinstance(op, LROp) and op.mtIteration != "n+1":
-                        for tA in op.lrLoadA:
-                            key = (tA, op.subIterK)
-                            seenA[key] = seenA.get(key, 0) + 1
-                        for tB in op.lrLoadB:
-                            key = (tB, op.subIterK)
-                            seenB[key] = seenB.get(key, 0) + 1
-        self.hasDuplicatedReads = (
-            any(c > 1 for c in seenA.values()) or
-            any(c > 1 for c in seenB.values())
-        )
 
     # ── Debug ────────────────────────────────────────────────
 
     @staticmethod
-    def _printOp(op: ScheduleOp, indent: str = ""):
+    def _printOp(op: ScheduleOp, indent: str = "",
+                 showVgpr: bool = False, showSubtiles: bool = False):
         if isinstance(op, MFMAOp):
             print(f"{indent}MFMAs (MT {op.mtIteration}, subIterK {op.subIterK}):")
-            print(f"{indent}  - {op.subtiles}")
-            print(f"{indent}  - USING  A: {op.vgprTileMapA}  B: {op.vgprTileMapB}")
-            if op.scaleMapA or op.scaleMapB:
-                print(f"{indent}  - SCALE  A: {op.scaleMapA}  B: {op.scaleMapB}")
+            if showSubtiles:
+                print(f"{indent}  - {op.subtiles}")
+            if showVgpr:
+                print(f"{indent}  - USING  A: {op.vgprTileMapA}  B: {op.vgprTileMapB}")
+                if op.scaleMapA or op.scaleMapB:
+                    print(f"{indent}  - SCALE  A: {op.scaleMapA}  B: {op.scaleMapB}")
         elif isinstance(op, GROp):
             print(f"{indent}GR (MT {op.mtIteration}):  A: {op.subtileA}  B: {op.subtileB}")
         elif isinstance(op, WaitGROp):
-            inflight = f" — inflight SubtileLoads A={op.inflightLoadsA} B={op.inflightLoadsB}" if op.inflightLoadsA is not None else ""
+            if op.inflightLoadsA is not None:
+                inflight = f" — inflight SubtileLoads A={op.inflightLoadsA} B={op.inflightLoadsB} scaleA={op.inflightScaleLoadsA} scaleB={op.inflightScaleLoadsB}"
+            else:
+                inflight = ""
             print(f"{indent}WAIT_GR (MT {op.mtIteration}) A: {op.subtileA}  B: {op.subtileB}{inflight}")
         elif isinstance(op, WaitLROp):
             print(f"{indent}WAIT_LR")
@@ -994,10 +1285,13 @@ class SubtileBasedScheduler:
             print(f"{indent}SYNC")
         elif isinstance(op, LROp):
             sikLabel = f", subIterK {op.subIterK}" if op.subIterK >= 0 else ""
-            scaleStr = ""
-            if op.lrScaleA or op.lrScaleB:
-                scaleStr = f"  scaleA: {op.lrScaleA}  scaleB: {op.lrScaleB}"
-            print(f"{indent}LR (MT {op.mtIteration}{sikLabel}) A: {op.lrLoadA}  B: {op.lrLoadB}{scaleStr}")
+            aKeys = sorted(op.lrLoadA.keys())
+            bKeys = sorted(op.lrLoadB.keys())
+            print(f"{indent}LR (MT {op.mtIteration}{sikLabel}) A: {aKeys}  B: {bKeys}")
+            if showVgpr:
+                print(f"{indent}  - LOAD  A: {op.lrLoadA}  B: {op.lrLoadB}")
+                if op.lrScaleA or op.lrScaleB:
+                    print(f"{indent}  - SCALE  A: {op.lrScaleA}  B: {op.lrScaleB}")
         elif isinstance(op, SkipOp):
             print(f"{indent}SKIP_IF_{op.compare}({op.value}, {op.target})")
         elif isinstance(op, GR_INCOp):
@@ -1005,14 +1299,56 @@ class SubtileBasedScheduler:
         elif isinstance(op, LR_INCOp):
             print(f"{indent}LR_INC")
 
-    def printSchedule(self):
+    @staticmethod
+    def _depEdgeLabel(e: DepEdge) -> str:
+        if e.module:
+            op = e.module.op
+            if isinstance(op, LROp):
+                return f"LR(MT {op.mtIteration}, sik {op.subIterK})"
+            elif isinstance(op, GROp):
+                return f"GR(MT {op.mtIteration})"
+            return type(op).__name__
+        op = e.op
+        if isinstance(op, WaitGROp) and op.inflightLoadsA is not None:
+            return f"WaitGROp(A={op.inflightLoadsA} B={op.inflightLoadsB} SA={op.inflightScaleLoadsA} SB={op.inflightScaleLoadsB})"
+        return type(op).__name__
+
+    def _printModules(self, modules: List[AnnotatedModule], indent: str,
+                      showVgpr: bool = False, showDeps: bool = False,
+                      showSubtiles: bool = False):
+        for mod in modules:
+            self._printOp(mod.op, indent=indent, showVgpr=showVgpr,
+                          showSubtiles=showSubtiles)
+            if showDeps:
+                before_str = ", ".join(self._depEdgeLabel(e) for e in mod.before) if mod.before else "none"
+                after_str = ", ".join(self._depEdgeLabel(e) for e in mod.after) if mod.after else "none"
+                print(f"{indent}  before: [{before_str}]  after: [{after_str}]")
+
+    def _printLoopSteps(self, loopSteps: List[PartitionSchedule], indent: str,
+                        showVgpr: bool = False, showDeps: bool = False,
+                        showSubtiles: bool = False):
+        for partition in loopSteps:
+            print(f"{indent}Partition {partition.partitionId}:")
+            for dus in partition.subIterKSteps:
+                print(f"{indent}  subIterK={dus.subIterK}:")
+                self._printModules(dus.modules, indent=f"{indent}    ",
+                                   showVgpr=showVgpr, showDeps=showDeps,
+                                   showSubtiles=showSubtiles)
+
+    def printSchedule(self, showVgpr: bool = False, showDeps: bool = False,
+                      showSubtiles: bool = False):
+        """Print the schedule.
+
+        Args:
+            showVgpr: show VGPR tile assignments and scale maps.
+            showDeps: show before/after dependency edges on each module.
+            showSubtiles: show MFMA subtile coordinate lists.
+        """
         print(f"SubtileGridA={self.MTA}, SubtileGridB={self.MTB}")
         print(f"Partition grid: {self.numPartitionsA} x {self.numPartitionsB}")
         print(f"Partition size: {self.config.partitionSizeA} x {self.config.partitionSizeB}")
         print(f"Prefetch: {self.config.prefetchMode.name}")
         print(f"Reuse: {self.config.reuseStrategy.name}")
-        print(f"hasDuplicatedReads: {self.hasDuplicatedReads}")
-        print(f"needsUnrolling: {self.needsUnrolling}")
         print(f"totalVGPRTiles: {self.totalVGPRTiles} ({self.totalVGPRTiles * 4} VGPRs)")
         print(f"totalScaleVGPRTiles: {self.totalScaleVGPRTiles}")
         print(f"hasScale: {self.hasScale}")
@@ -1030,40 +1366,25 @@ class SubtileBasedScheduler:
             print("  " + "  ".join(f"{v:2d}" if v is not None else "  " for v in row))
         print()
 
+        opts = dict(showVgpr=showVgpr, showDeps=showDeps, showSubtiles=showSubtiles)
+
         print("PRELOOP:")
         for pss in self.preloopSteps:
             for dus in pss.subIterKSteps:
-                for op in dus.ops:
-                    self._printOp(op, indent="  ")
+                self._printModules(dus.modules, indent="  ",
+                                   showVgpr=showVgpr, showSubtiles=showSubtiles)
         print()
 
         print("MAINLOOP:")
-        for partition in self.mainloopSteps:
-            print(f"  Partition {partition.partitionId}:")
-            for dus in partition.subIterKSteps:
-                print(f"    subIterK={dus.subIterK}:")
-                for op in dus.ops:
-                    self._printOp(op, indent="      ")
-                if dus.conflict:
-                    print(f"      *** CONFLICT: USE/LOAD share VGPRTile IDs {dus.conflict} — needs unrolling ***")
+        self._printLoopSteps(self.mainloopSteps, indent="  ", **opts)
 
         print()
         print("NGLL (No Global Load Loop):")
-        for partition in self.ngllSteps:
-            print(f"  Partition {partition.partitionId}:")
-            for dus in partition.subIterKSteps:
-                print(f"    subIterK={dus.subIterK}:")
-                for op in dus.ops:
-                    self._printOp(op, indent="      ")
+        self._printLoopSteps(self.ngllSteps, indent="  ", **opts)
 
         print()
         print("NLL (No Load Loop):")
-        for partition in self.nllSteps:
-            print(f"  Partition {partition.partitionId}:")
-            for dus in partition.subIterKSteps:
-                print(f"    subIterK={dus.subIterK}:")
-                for op in dus.ops:
-                    self._printOp(op, indent="      ")
+        self._printLoopSteps(self.nllSteps, indent="  ", **opts)
 
     # Allocate totalVGPRTiles vpgrTile
     def allocVgprTiles(self, writer):
@@ -1171,229 +1492,362 @@ class SubtileBasedScheduler:
                                  ds=DSModifiers(offset=dsOffset),
                                  comment="scale%s[group%u]: load 4B from LDS" % (tc, scaleGroupIdx)))
 
-    def emitWaitGR(self, inflightLoadsA, inflightLoadsB, hasScale=False):
+    def emitWaitGR(self, inflightLoadsA, inflightLoadsB,
+                   inflightScaleLoadsA=0, inflightScaleLoadsB=0):
         """Emit SWaitCnt for GR (buffer_load) based on inflight GR counts.
-        WARNING: current algo won't work in all cases. TBD
 
         Args:
-            inflightLoadsA: Number of A GR loads still inflight.
-            inflightLoadsB: Number of B GR loads still inflight.
-            hasScale:       True when MX scale DTL loads are active (they complete
-                            at lgkmcnt/dscnt, so dscnt=0 is required after the barrier).
+            inflightLoadsA: Number of A subtile loads still inflight.
+            inflightLoadsB: Number of B subtile loads still inflight.
+            inflightScaleLoadsA: Number of scale A loads still inflight.
+            inflightScaleLoadsB: Number of scale B loads still inflight.
         """
         module = Module()
         grCnt = int(inflightLoadsA / self.tileInfoA.loadRatioGR) + \
-                int(inflightLoadsB / self.tileInfoB.loadRatioGR)
-        # Scale DTL loads (buffer_load lds=True) complete at lgkmcnt (dscnt).
-        # Wait for both vmcnt (data GR) and lgkmcnt (scale DTL) before barrier.
-        dscnt = 0 if hasScale else -1
-        module.add(SWaitCnt(dscnt=dscnt, vlcnt=grCnt, vscnt=-1,
-                            comment=f"Wait GR: A={inflightLoadsA} B={inflightLoadsB} => vlcnt={grCnt}" +
-                                    (" dscnt=0 (scale DTL)" if hasScale else "")))
+                int(inflightLoadsB / self.tileInfoB.loadRatioGR) + \
+                inflightScaleLoadsA + inflightScaleLoadsB
+        module.add(SWaitCnt(vlcnt=grCnt, vscnt=-1,
+                            comment=f"Wait GR: A={inflightLoadsA} B={inflightLoadsB} sA={inflightScaleLoadsA} sB={inflightScaleLoadsB} => vlcnt={grCnt}"))
         return module
 
     def emitGR(self, writer, kernel, op):
         """Emit GR (Global Read) buffer_load instructions for a single GROp."""
         module = Module()
-        # A and B data loads
+        # Scale DTL loads: emitted on the first GR of an MT to maximize overlap
+        if op.firstForMT and self.hasScale:
+            module.add(globalReadDoScaleSubtile('MXSA', writer, kernel))
+            module.add(globalReadDoScaleSubtile('MXSB', writer, kernel))
+        # A and B data loads — emitSingleBufferLoad skips redundant loads internally
         for subtileList, tileInfo in [(op.subtileA, self.tileInfoA),
                                       (op.subtileB, self.tileInfoB)]:
             for sId0 in subtileList:
                 module.add(emitSingleBufferLoad(tileInfo, kernel, sId0, 0))
-        # Scale DTL loads: only on the last GR of an MT (scale covers all subtiles)
-        if op.lastForMT and kernel["ProblemType"].get("MXBlockA", 0) and kernel["ProblemType"].get("MXBlockB", 0):
-            module.add(globalReadDoScaleSubtile('MXSA', writer, kernel))
-            module.add(globalReadDoScaleSubtile('MXSB', writer, kernel))
         return module
+
+    def _emitOp(self, writer, kernel, op, dtileInfo, scaleSet=0, scaleLRSet=0):
+        """Emit a single ScheduleOp into a list of instructions."""
+        module = Module()
+        if isinstance(op, GROp):
+            module.add(self.emitGR(writer, kernel, op))
+        elif isinstance(op, GR_INCOp):
+            module.add(globalReadPtrUpdates('A', writer, kernel))
+            module.add(globalReadPtrUpdates('B', writer, kernel))
+            module.add(globalReadLDSBufferSwap('A', writer, kernel))
+            module.add(globalReadLDSBufferSwap('B', writer, kernel))
+            if self.hasScale:
+                module.add(globalReadLDSBufferSwap('MXSA', writer, kernel))
+                module.add(globalReadLDSBufferSwap('MXSB', writer, kernel))
+                module.add(globalReadScalePtrUpdates('MXSA', writer, kernel))
+                module.add(globalReadScalePtrUpdates('MXSB', writer, kernel))
+        elif isinstance(op, MFMAOp):
+            module.add(self.emitMFMA(writer, kernel, op, dtileInfo, scaleSet=scaleSet))
+        elif isinstance(op, WaitGROp):
+            module.add(self.emitWaitGR(op.inflightLoadsA, op.inflightLoadsB,
+                                         op.inflightScaleLoadsA, op.inflightScaleLoadsB))
+        elif isinstance(op, WaitLROp):
+            module.add(SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for LR to complete"))
+        elif isinstance(op, SyncOp):
+            module.add(SBarrier(comment=op.comment))
+        elif isinstance(op, LR_INCOp):
+            module.add(localReadLDSBufferSwap('A', writer, kernel))
+            module.add(localReadLDSBufferSwap('B', writer, kernel))
+            if self.hasScale:
+                module.add(localReadLDSBufferSwap('MXSA', writer, kernel))
+                module.add(localReadLDSBufferSwap('MXSB', writer, kernel))
+        elif isinstance(op, LROp):
+            module.add(self.emitLR(writer, kernel, op, scaleSet=scaleLRSet))
+        elif isinstance(op, SkipOp):
+            skipLabel = Label(f"SkipTo{op.target}", "")
+            cmpMap = {"EQ": SCmpEQU32, "LE": SCmpLeU32}
+            module.add(cmpMap[op.compare](
+                src0=sgpr("LoopCounterL"), src1=op.value,
+                comment=f"LoopCounter {op.compare} {op.value}?"))
+            module.add(SCBranchSCC1(
+                labelName=skipLabel.getLabelName(),
+                comment=f"skip to {op.target}"))
+        return module.flatitems()
+
+    @staticmethod
+    def _opType(op):
+        if isinstance(op, MFMAOp):
+            return "mfma"
+        if isinstance(op, LROp):
+            return "lr"
+        if isinstance(op, GROp):
+            return "gr"
+        if isinstance(op, WaitGROp):
+            return "wait_gr"
+        if isinstance(op, WaitLROp):
+            return "wait_lr"
+        if isinstance(op, SyncOp):
+            return "sync"
+        if isinstance(op, GR_INCOp):
+            return "gr_inc"
+        if isinstance(op, LR_INCOp):
+            return "lr_inc"
+        if isinstance(op, SkipOp):
+            return "skip"
+        return "other"
+
+    def _buildEmittedModules(self, writer, kernel, modules, dtileInfo, scaleSet=0, scaleLRSet=0):
+        """Build EmittedModules with instructions + before module links."""
+        emitted: List[EmittedModule] = []
+        modToEmittedId: Dict[int, int] = {}
+        suppressAfterWaitLRForMod: Set[int] = set()
+
+        def addEmitted(op) -> Optional[int]:
+            insts = self._emitOp(writer, kernel, op, dtileInfo,
+                                scaleSet=scaleSet, scaleLRSet=scaleLRSet)
+            if not insts:
+                return None
+            emId = len(emitted)
+            emitted.append(EmittedModule(moduleId=emId, instructions=insts, opType=self._opType(op)))
+            return emId
+
+        def setBefore(moduleId: int, beforeId: Optional[int]) -> None:
+            if beforeId is None or beforeId == moduleId:
+                return
+            curBefore = emitted[moduleId].before
+            if curBefore is None:
+                emitted[moduleId].before = beforeId
+                return
+            assert curBefore == beforeId, \
+                f"EmittedModule {moduleId} has multiple before deps: {curBefore} and {beforeId}"
+
+        # Primary modules first (MFMA/LR/GR)
+        for mod in modules:
+            emId = addEmitted(mod.op)
+            if emId is not None:
+                modToEmittedId[id(mod)] = emId
+
+        # If another module has before=[module-ref-to-X, WaitLROp, ...],
+        # suppress standalone X.after WaitLROp emission to avoid duplicates.
+        for mod in modules:
+            hasWaitLRInBefore = any(isinstance(e.op, WaitLROp) for e in mod.before)
+            if not hasWaitLRInBefore:
+                continue
+            for e in mod.before:
+                if e.module is not None:
+                    suppressAfterWaitLRForMod.add(id(e.module))
+
+        # Dependency-op links for emitted debug/scheduling.
+        for mod in modules:
+            curId = modToEmittedId.get(id(mod))
+            if curId is None:
+                continue
+
+            # before ops: chain from module refs / deps, then before points to
+            # the last non-standalone dep.
+            prevId: Optional[int] = None
+            lastDepId: Optional[int] = None
+            for edge in mod.before:
+                if edge.module:
+                    prevId = modToEmittedId.get(id(edge.module), prevId)
+                    continue
+                if edge.op is None:
+                    continue
+                depId = addEmitted(edge.op)
+                if depId is None:
+                    continue
+                if isinstance(edge.op, WaitGROp):
+                    # Keep WAIT_GR standalone (no links), but allow later deps to
+                    # chain from it.
+                    prevId = depId
+                    continue
+                setBefore(depId, prevId)
+                prevId = depId
+                lastDepId = depId
+            if lastDepId is not None:
+                setBefore(curId, lastDepId)
+            elif prevId is not None:
+                # before had only module refs and/or standalone deps
+                setBefore(curId, prevId)
+
+            # after ops: append deps as standalone modules and chain them via
+            # before links so before-only path extraction can follow them.
+            depIds: List[int] = []
+            for edge in mod.after:
+                if edge.module:
+                    mId = modToEmittedId.get(id(edge.module))
+                    if mId is not None:
+                        depIds.append(mId)
+                    continue
+                if edge.op is None:
+                    continue
+                if isinstance(edge.op, WaitLROp) and id(mod) in suppressAfterWaitLRForMod:
+                    continue
+                depId = addEmitted(edge.op)
+                if depId is None:
+                    continue
+                depIds.append(depId)
+            prevAfterId = curId
+            for depId in depIds:
+                setBefore(depId, prevAfterId)
+                prevAfterId = depId
+
+        return emitted
 
     def _emitSubIterK(self, writer, kernel, pss, dus, scaleSet=0, scaleLRSet=0):
         """Emit a single subIterK step into a Module.
         scaleSet: which scale VGPR set MFMA reads from.
-        scaleLRSet: which scale VGPR set LR writes to."""
+        scaleLRSet: which scale VGPR set LR writes to.
+
+        If modules contain MFMAs, emits via instructionSchedule for
+        dependency-aware interleaving. Otherwise emits sequentially.
+        """
         dtileInfo = writer.states.d.tileInfo
         module = Module()
         module.addComment0(f"Partition {pss.partitionId}: subIterK={dus.subIterK}")
-        hasScale = (kernel["ProblemType"].get("MXBlockA", 0) and
-                    kernel["ProblemType"].get("MXBlockB", 0))
-        for op in dus.ops:
-            if isinstance(op, GROp):
-                module.add(self.emitGR(writer, kernel, op))
-            elif isinstance(op, GR_INCOp):
-                module.add(globalReadPtrUpdates('A', writer, kernel))
-                module.add(globalReadPtrUpdates('B', writer, kernel))
-                module.add(globalReadLDSBufferSwap('A', writer, kernel))
-                module.add(globalReadLDSBufferSwap('B', writer, kernel))
-                if hasScale:
-                    module.add(globalReadLDSBufferSwap('MXSA', writer, kernel))
-                    module.add(globalReadLDSBufferSwap('MXSB', writer, kernel))
-                    module.add(globalReadScalePtrUpdates('MXSA', writer, kernel))
-                    module.add(globalReadScalePtrUpdates('MXSB', writer, kernel))
-            elif isinstance(op, MFMAOp):
-                module.add(self.emitMFMA(writer, kernel, op, dtileInfo, scaleSet=scaleSet))
-            elif isinstance(op, WaitGROp):
-                module.add(self.emitWaitGR(op.inflightLoadsA, op.inflightLoadsB, hasScale))
-            elif isinstance(op, WaitLROp):
-                module.add(SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for LR to complete"))
-            elif isinstance(op, SyncOp):
-                module.add(SBarrier(comment=op.comment))
-            elif isinstance(op, LR_INCOp):
-                module.add(localReadLDSBufferSwap('A', writer, kernel))
-                module.add(localReadLDSBufferSwap('B', writer, kernel))
-                if hasScale:
-                    module.add(localReadLDSBufferSwap('MXSA', writer, kernel))
-                    module.add(localReadLDSBufferSwap('MXSB', writer, kernel))
-            elif isinstance(op, LROp):
-                module.add(self.emitLR(writer, kernel, op, scaleSet=scaleLRSet))
-            elif isinstance(op, SkipOp):
-                skipLabel = Label(f"SkipTo{op.target}", "")
-                cmpMap = {"EQ": SCmpEQU32, "LE": SCmpLeU32}
-                module.add(cmpMap[op.compare](
-                    src0=sgpr("LoopCounterL"), src1=op.value,
-                    comment=f"LoopCounter {op.compare} {op.value}?"))
-                module.add(SCBranchSCC1(
-                    labelName=skipLabel.getLabelName(),
-                    comment=f"skip to {op.target}"))
+
+        hasMFMA = any(isinstance(m.op, MFMAOp) for m in dus.modules)
+        if hasMFMA:
+            emitted = self._buildEmittedModules(writer, kernel, dus.modules, dtileInfo,
+                                                scaleSet=scaleSet, scaleLRSet=scaleLRSet)
+            merged = self.instructionSchedule(emitted)
+            module.add(merged)
+        else:
+            # Special case for preloop (MFMA free)
+            for m in dus.modules:
+                for inst in self._emitOp(writer, kernel, m.op, dtileInfo,
+                                         scaleSet=scaleSet, scaleLRSet=scaleLRSet):
+                    module.add(inst)
         return module
 
     @staticmethod
-    def instructionSchedule(module):
-        """Schedule MFMAs among other instructions within a subIterK module.
+    def _extractPathsFromBeforeDeps(emittedModules: List['EmittedModule']) -> Tuple[int, List[List[int]]]:
+        """Extract non-MFMA dependency paths using only EmittedModule.before links.
 
-        Rules (invariants preserved by this pass):
-          - MFMA instruction order is preserved
-          - Non-MFMA instruction order is preserved
-          - Insert 1 MFMA between each LR (ds_read) instruction
-          - Insert 3 MFMAs between the last LR and the WAIT_LR (SWaitCnt dscnt)
-          - Insert 1 MFMA between WAIT_LR and SYNC (SBarrier)
-          - No MFMAs between an m0 update and its buffer_load (they are a pair)
-          - Remaining MFMAs are spread evenly between buffer_load pairs
+        Returns:
+          (mfmaIdx, paths)
+          - mfmaIdx: index of the MFMA emitted module in emittedModules
+          - paths: list of non-MFMA module-index paths
         """
-        #return module
-        items = module.flatitems()
-        if not items:
-            return module
+        idToIdx = {em.moduleId: i for i, em in enumerate(emittedModules)}
+        n = len(emittedModules)
+
+        mfmaModuleIds = [i for i, em in enumerate(emittedModules) if em.opType == "mfma"]
+        assert len(mfmaModuleIds) == 1, "_extractPathsFromBeforeDeps expects exactly one MFMA emitted module"
+        mfmaIdx = mfmaModuleIds[0]
+        nonMfmaIds = [i for i in range(n) if i != mfmaIdx]
+        nonMfmaSet = set(nonMfmaIds)
+
+        # Each non-MFMA module has at most one predecessor, and each predecessor
+        # has at most one child, so paths are simple chains.
+        pred: List[int] = [-1 for _ in range(n)]
+        child: List[int] = [-1 for _ in range(n)]
+        for i in nonMfmaIds:
+            parent = -1
+            b = emittedModules[i].before
+            if b is not None:
+                bi = idToIdx.get(b)
+                if bi is not None and bi != i and bi in nonMfmaSet:
+                    parent = bi
+            pred[i] = parent
+            if parent != -1:
+                assert child[parent] == -1, \
+                    f"_extractPathsFromBeforeDeps expects unique child per predecessor, got {child[parent]} and {i} for {parent}"
+                child[parent] = i
+
+        def _findHead(mid: int) -> int:
+            cur = mid
+            seen = [False for _ in range(n)]
+            while pred[cur] != -1 and not seen[cur]:
+                seen[cur] = True
+                cur = pred[cur]
+            return cur
+
+        def _walkFromHead(head: int, used: List[bool]) -> List[int]:
+            order: List[int] = []
+            localSeen = [False for _ in range(n)]
+            cur = head
+            while cur != -1 and not used[cur] and not localSeen[cur]:
+                order.append(cur)
+                localSeen[cur] = True
+                cur = child[cur]
+            return order
+
+        used = [False for _ in range(n)]
+        paths: List[List[int]] = []
+        for mid in nonMfmaIds:
+            if used[mid]:
+                continue
+            head = _findHead(mid)
+            order = _walkFromHead(head, used)
+            assert order, f"_extractPathsFromBeforeDeps produced empty path for module {mid}"
+            for i in order:
+                used[i] = True
+            paths.append(order)
+
+        return mfmaIdx, paths
+
+    @staticmethod
+    def instructionSchedule(emittedModules: List['EmittedModule']):
+        """Interleave non-MFMA instructions between MFMAs using 2 slots/interval.
+
+        Rules:
+          - MFMA order is preserved.
+          - Between two adjacent MFMAs there are 2 placement slots.
+          - At most one ds_read (LocalReadInstruction) per interval.
+          - Before dependencies are respected at module order level.
+          - Minimm distance between ds_read and it waitcnt (hardcoded for now)
+          - Module-internal instruction order is preserved.
+          - LR path containing a WAIT_GR is packed from the end backwards. We want WAIT_GR to be done as late as possible.
+          - GR path is spread as much as possible across remaining valid slots. No backwards here as we want GRs to be done as early as possible.
+
+          TODO : To be tested on multi-partition setup.
+        """
+        if not emittedModules:
+            return Module()
 
         isMFMA = lambda x: isinstance(x, (MFMAInstruction, MXMFMAInstruction))
-        mfmas = [x for x in items if isMFMA(x)]
-        others = [x for x in items if not isMFMA(x)]
+        n = len(emittedModules)
 
-        if not mfmas or not others:
-            return module
+        mfmaIdx, pathOrders = SubtileBasedScheduler._extractPathsFromBeforeDeps(emittedModules)
+        mfmas = [x for x in emittedModules[mfmaIdx].instructions if isMFMA(x)]
 
-        # Group others into slots: each slot is a list of instructions that
-        # must stay together (e.g. m0 update + buffer_load pair).
-        # We'll insert MFMAs BETWEEN slots.
-        slots = []
-        i = 0
-        while i < len(others):
-            inst = others[i]
-            # Pair m0 update with its following buffer_load
-            if i + 1 < len(others) and isinstance(others[i + 1], GlobalReadInstruction):
-                slots.append(others[i:i+2])
-                i += 2
-            else:
-                slots.append([inst])
-                i += 1
+        # Single MFMA: no slots to interleave into — emit MFMA then all paths.
+        if len(mfmas) < 2:
+            result = Module()
+            for m in mfmas:
+                result.add(m)
+            for order in pathOrders:
+                for mid in order:
+                    for inst in emittedModules[mid].instructions:
+                        result.add(inst)
+            return result
 
-        # Classify each slot for MFMA insertion rules
-        LR_SLOT = 0       # ds_read (LocalReadInstruction)
-        WAITLR_SLOT = 1   # SWaitCnt with dscnt (WAIT_LR)
-        SYNC_SLOT = 2     # SBarrier (SYNC)
-        GR_SLOT = 3       # m0 + buffer_load pair or standalone buffer_load
-        OTHER_SLOT = 4    # everything else
+        paths = _classifyPaths(pathOrders, emittedModules)
+        rules = _SchedulingRules(totalSlots=(len(mfmas) - 1) * 2)
+        placer = _SlotPlacer(
+            len(mfmas) - 1, n, pathOrders,
+            validators=[rules.oneDsReadPerInterval, rules.minGapDsReadBeforeWait, rules.minGapDsReadToWait, rules.noM0WithBufferLoad],
+            adjusters=[rules.spreadBufferLoads],
+            onPlace=rules.trackPlacement)
 
-        def classify(slot):
-            first = slot[0]
-            # DSLoadB32 = scale LR (ds_read_b32): with double-buffered scale VGPRs,
-            # MFMA reads from one set while ds_read writes to another, so interleaving is safe.
-            if isinstance(first, DSLoadB32):
-                return LR_SLOT
-            if isinstance(first, LocalReadInstruction):
-                return LR_SLOT
-            if isinstance(first, SWaitCnt):
-                return WAITLR_SLOT
-            if isinstance(first, SBarrier):
-                return SYNC_SLOT
-            if isinstance(first, GlobalReadInstruction) or \
-               (len(slot) > 1 and isinstance(slot[-1], GlobalReadInstruction)):
-                return GR_SLOT
-            return OTHER_SLOT
+        for order, hasWaitGR in paths:
+            if not order:
+                continue
+            pathInsts = _flattenPath(order, emittedModules, reverse=hasWaitGR)
+            rules.resetPath()
+            if not hasWaitGR:
+                rules.setupBufLoadSpreading(placer, pathInsts, order)
+            placer.placePath(pathInsts, reverse=hasWaitGR)
 
-        slotTypes = [classify(s) for s in slots]
+        scheduled = placer.assemble(mfmas)
 
-        # Build MFMA budget: how many MFMAs to insert AFTER each slot.
-        # (mfmasAfter[i] = number of MFMAs inserted after slots[i])
-        numSlots = len(slots)
-        mfmasAfter = [0] * numSlots
+        # Post-pass: adjust vmcnt of any SWaitCnt to account for buffer_loads
+        # that the scheduler placed before it within this subIterK.
+        bufLoadCount = 0
+        for inst in scheduled.items():
+            if _isBufferLoad(inst):
+                bufLoadCount += 1
+            elif _isWaitCnt(inst) and inst.vlcnt >= 0:
+                inst.vlcnt += bufLoadCount
 
-        mi = 0  # next MFMA to assign
-
-        # Pass 1: assign fixed MFMAs per rules
-        for si in range(numSlots):
-            if mi >= len(mfmas):
-                break
-            st = slotTypes[si]
-            nextSt = slotTypes[si + 1] if si + 1 < numSlots else None
-
-            if st == LR_SLOT and nextSt == LR_SLOT:
-                # 1 MFMA between each LR
-                mfmasAfter[si] = min(1, len(mfmas) - mi)
-                mi += mfmasAfter[si]
-            elif st == LR_SLOT and nextSt == WAITLR_SLOT:
-                # 3 MFMAs between last LR and WAIT_LR
-                mfmasAfter[si] = min(3, len(mfmas) - mi)
-                mi += mfmasAfter[si]
-            elif st == LR_SLOT and nextSt != LR_SLOT and nextSt != WAITLR_SLOT:
-                # Last LR but no WAIT_LR follows — still insert 1
-                mfmasAfter[si] = min(1, len(mfmas) - mi)
-                mi += mfmasAfter[si]
-            elif st == WAITLR_SLOT and nextSt == SYNC_SLOT:
-                # 1 MFMA between WAIT_LR and SYNC
-                mfmasAfter[si] = min(1, len(mfmas) - mi)
-                mi += mfmasAfter[si]
-
-        # Pass 2: spread remaining MFMAs evenly between GR slots
-        grIndices = [si for si in range(numSlots) if slotTypes[si] == GR_SLOT]
-        remaining = len(mfmas) - mi
-        if remaining > 0 and grIndices:
-            base = remaining // len(grIndices)
-            extra = remaining % len(grIndices)
-            for gi, si in enumerate(grIndices):
-                count = base + (1 if gi < extra else 0)
-                mfmasAfter[si] += count
-                mi += count
-
-        # Assemble final output
-        result = Module()
-        mfmaIdx = 0
-
-        # Leading MFMAs: any unassigned MFMAs go before the first slot
-        leadingMfmas = len(mfmas) - mi
-        for _ in range(leadingMfmas):
-            result.add(mfmas[mfmaIdx])
-            mfmaIdx += 1
-
-        for si in range(numSlots):
-            for inst in slots[si]:
-                result.add(inst)
-            for _ in range(mfmasAfter[si]):
-                if mfmaIdx < len(mfmas):
-                    result.add(mfmas[mfmaIdx])
-                    mfmaIdx += 1
-
-        # Any remaining MFMAs at the end
-        while mfmaIdx < len(mfmas):
-            result.add(mfmas[mfmaIdx])
-            mfmaIdx += 1
-
-        return result
+        return scheduled
 
     def _emitLoop(self, writer, kernel, label, steps, scaleSet=0, scaleLRSet=None):
-        """Emit a loop module (mainloop, NGLL, or NLL).
-
-        Emits each subIterK step as a separate module, applies instruction
-        interleaving, then combines into the final loop module.
-        All waits (WAIT_LR, WAIT_GR, SyncOp) are explicit schedule ops.
+        """Emit a loop section (preloop, mainloop, NGLL, or NLL).
 
         scaleSet: which scale VGPR set MFMA reads from (starting set for first partition).
         scaleLRSet: which scale VGPR set LR writes to (defaults to 1-scaleSet if None).
@@ -1408,27 +1862,9 @@ class SubtileBasedScheduler:
             for dus in pss.subIterKSteps:
                 subModule = self._emitSubIterK(writer, kernel, pss, dus,
                                                scaleSet=scaleSet, scaleLRSet=scaleLRSet)
-                subModule = self.instructionSchedule(subModule)
                 module.add(subModule)
             if self.hasScale:
                 scaleSet, scaleLRSet = scaleLRSet, scaleSet
+        module.addComment0(f"{label} end")
         return module
 
-    def generateCode(self, writer, kernel):
-        self.allocVgprTiles(writer)
-
-        preloop  = self._emitLoop(writer, kernel, "PRELOOP", self.preloopSteps)
-        mainloop = self._emitLoop(writer, kernel, "MAINLOOP", self.mainloopSteps)
-
-        ngll = Module("NGLL")
-        ngll.add(Label("SkipToNGLL", ""))
-        ngll.add(self._emitLoop(writer, kernel, "NGLL", self.ngllSteps))
-
-        nll = Module("NLL")
-        nll.add(Label("SkipToNLL", ""))
-        nll.add(self._emitLoop(writer, kernel, "NLL", self.nllSteps))
-
-        for label, module in [("PRELOOP", preloop), ("MAINLOOP", mainloop),
-                              ("NGLL", ngll), ("NLL", nll)]:
-            print(f"\n{label}:")
-            print(module)
