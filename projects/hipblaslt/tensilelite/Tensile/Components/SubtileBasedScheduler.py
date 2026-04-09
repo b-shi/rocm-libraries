@@ -1519,9 +1519,8 @@ class SubtileBasedScheduler:
         # dsOffset stride per group = 2 * tileInfo.subtileSize (since [1,2] subtileSize
         # covers 1 subtile, and a group is 2 subtiles).
         groupStride = 2 * tileInfo.subtileSize
-        numMGroups = math.ceil(self.MTA / 2) if tc == 'MXSA' else math.ceil(self.MTB / 2)
         for scaleGroupIdx, scaleVgprTileId in lrScale.items():
-            dsOffset = groupStride * (scaleGroupIdx + subtileK * numMGroups)
+            dsOffset = groupStride * (scaleGroupIdx * self.numSubtileK + subtileK)
             vdst = scaleTiles[scaleVgprTileId]
             module.add(DSLoadB32(dst=vgpr(vdst),
                                  src=vgpr(tileInfo.sharedVgprLROffset[0]),
