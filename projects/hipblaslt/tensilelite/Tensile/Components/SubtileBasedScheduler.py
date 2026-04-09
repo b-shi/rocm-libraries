@@ -1043,7 +1043,7 @@ class SubtileBasedScheduler:
                     if isinstance(mod.op, GROp):
                         grEvents.append((opIdx, mod.op.mtIteration,
                                          set(mod.op.subtileA), set(mod.op.subtileB),
-                                         mod.op.firstForMT))
+                                         mod.op.lastForMT))
                     opIdx += 1
         return grEvents
 
@@ -1068,7 +1068,7 @@ class SubtileBasedScheduler:
         after  = [(mt, a, b, first) for (idx, mt, a, b, first) in grEvents if idx >= sikEnd]
         totalA, totalB, scaleA, scaleB = 0, 0, 0, 0
 
-        for (grMT, grA, grB, firstForMT) in reversed(before):
+        for (grMT, grA, grB, lastForMT) in reversed(before):
             grOffset = self._parseMTOffset(grMT)
             if grOffset is None:
                 continue
@@ -1076,11 +1076,11 @@ class SubtileBasedScheduler:
                 return totalA, totalB, scaleA, scaleB
             totalA += len(grA)
             totalB += len(grB)
-            if firstForMT and self.hasScale:
+            if lastForMT and self.hasScale:
                 scaleA += self.scaleLoadsPerMT_A
                 scaleB += self.scaleLoadsPerMT_B
 
-        for (grMT, grA, grB, firstForMT) in reversed(after):
+        for (grMT, grA, grB, lastForMT) in reversed(after):
             grOffset = self._parseMTOffset(grMT)
             if grOffset is None:
                 continue
@@ -1088,7 +1088,7 @@ class SubtileBasedScheduler:
                 return totalA, totalB, scaleA, scaleB
             totalA += len(grA)
             totalB += len(grB)
-            if firstForMT and self.hasScale:
+            if lastForMT and self.hasScale:
                 scaleA += self.scaleLoadsPerMT_A
                 scaleB += self.scaleLoadsPerMT_B
 
@@ -1556,8 +1556,10 @@ class SubtileBasedScheduler:
     def emitGR(self, writer, kernel, op):
         """Emit GR (Global Read) buffer_load instructions for a single GROp."""
         module = Module()
-        # Scale DTL loads: emitted on the first GR of an MT to maximize overlap
-        if op.firstForMT and self.hasScale:
+        # Scale DTL loads: emitted on the last GR of an MT so all scale LR from the
+        # current bank have completed before the DTL overwrites them (scale DTL
+        # covers all subtileK values in a single load).
+        if op.lastForMT and self.hasScale:
             module.add(globalReadDoScaleSubtile('MXSA', writer, kernel))
             module.add(globalReadDoScaleSubtile('MXSB', writer, kernel))
         # A and B data loads for this GR's subtileK layer
