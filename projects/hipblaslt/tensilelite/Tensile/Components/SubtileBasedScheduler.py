@@ -1888,13 +1888,21 @@ class SubtileBasedScheduler:
         scaleLRSet: which scale VGPR set LR writes to (defaults to 1-scaleSet if None).
             Both rotate per partition so each partition's MFMA reads the scales
             that the previous partition's LR loaded.
+            Additionally, when numSubtileK > 1, scaleSet/scaleLRSet swap at
+            subtileK boundaries so each subtileK's MFMAs read the scales that
+            the previous subtileK's LR loaded into the alternate set.
         """
         if scaleLRSet is None:
             scaleLRSet = 1 - scaleSet if self.hasScale else scaleSet
         module = Module(label)
         module.addComment0(f"{label} start")
         for pss in steps:
+            prevSubtileK = None
             for dus in pss.subIterKSteps:
+                if self.hasScale and prevSubtileK is not None \
+                        and dus.subtileK != prevSubtileK:
+                    scaleSet, scaleLRSet = scaleLRSet, scaleSet
+                prevSubtileK = dus.subtileK
                 subModule = self._emitSubIterK(writer, kernel, pss, dus,
                                                scaleSet=scaleSet, scaleLRSet=scaleLRSet)
                 module.add(subModule)
