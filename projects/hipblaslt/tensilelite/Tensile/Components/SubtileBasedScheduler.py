@@ -1299,15 +1299,15 @@ class SubtileBasedScheduler:
 
     @staticmethod
     def _printOp(op: ScheduleOp, indent: str = "",
-                 showVgpr: bool = False, showSubtiles: bool = False):
+                 showVgpr: bool = False, showSubtiles: bool = False,
+                 scaleSet: int = 0, scaleLRSet: int = 0):
         if isinstance(op, MFMAOp):
-            print(f"{indent}MFMAs (MT {op.mtIteration}, subtileK {op.subtileK}, subIterK {op.subIterK}):")
+            scaleLabel = f"  scaleSet={scaleSet}" if (op.scaleMapA or op.scaleMapB) else ""
+            print(f"{indent}MFMAs (MT {op.mtIteration}, subtileK {op.subtileK}, subIterK {op.subIterK}):{scaleLabel}")
             if showSubtiles:
                 print(f"{indent}  - {op.subtiles}")
             if showVgpr:
                 print(f"{indent}  - USING  A: {op.vgprTileMapA}  B: {op.vgprTileMapB}")
-                if op.scaleMapA or op.scaleMapB:
-                    print(f"{indent}  - SCALE  A: {op.scaleMapA}  B: {op.scaleMapB}")
         elif isinstance(op, GROp):
             print(f"{indent}GR (MT {op.mtIteration}, subtileK {op.subtileK}):  A: {op.subtileA}  B: {op.subtileB}")
         elif isinstance(op, WaitGROp):
@@ -1322,13 +1322,8 @@ class SubtileBasedScheduler:
             print(f"{indent}SYNC")
         elif isinstance(op, LROp):
             sikLabel = f", subtileK {op.subtileK}, subIterK {op.subIterK}" if op.subIterK >= 0 else ""
-            aKeys = sorted(op.lrLoadA.keys())
-            bKeys = sorted(op.lrLoadB.keys())
-            print(f"{indent}LR (MT {op.mtIteration}{sikLabel}) A: {aKeys}  B: {bKeys}")
-            if showVgpr:
-                print(f"{indent}  - LOAD  A: {op.lrLoadA}  B: {op.lrLoadB}")
-                if op.lrScaleA or op.lrScaleB:
-                    print(f"{indent}  - SCALE  A: {op.lrScaleA}  B: {op.lrScaleB}")
+            scaleLabel = f"  scaleSet={scaleLRSet}" if (op.lrScaleA or op.lrScaleB) else ""
+            print(f"{indent}LR (MT {op.mtIteration}{sikLabel}) A: {op.lrLoadA}  B: {op.lrLoadB}{scaleLabel}")
         elif isinstance(op, SkipOp):
             print(f"{indent}SKIP_IF_{op.compare}({op.value}, {op.target})")
         elif isinstance(op, GR_INCOp):
@@ -1341,7 +1336,7 @@ class SubtileBasedScheduler:
         if e.module:
             op = e.module.op
             if isinstance(op, LROp):
-                return f"LR(MT {op.mtIteration}, subtileK {op.subtileK}, sik {op.subIterK})"
+                return f"LR (MT {op.mtIteration}, subtileK {op.subtileK}, subIterK {op.subIterK})"
             elif isinstance(op, GROp):
                 return f"GR(MT {op.mtIteration}, subtileK {op.subtileK})"
             return type(op).__name__
@@ -1352,10 +1347,12 @@ class SubtileBasedScheduler:
 
     def _printModules(self, modules: List[AnnotatedModule], indent: str,
                       showVgpr: bool = False, showDeps: bool = False,
-                      showSubtiles: bool = False):
+                      showSubtiles: bool = False,
+                      scaleSet: int = 0, scaleLRSet: int = 0):
         for mod in modules:
             self._printOp(mod.op, indent=indent, showVgpr=showVgpr,
-                          showSubtiles=showSubtiles)
+                          showSubtiles=showSubtiles,
+                          scaleSet=scaleSet, scaleLRSet=scaleLRSet)
             if showDeps:
                 before_str = ", ".join(self._depEdgeLabel(e) for e in mod.before) if mod.before else "none"
                 after_str = ", ".join(self._depEdgeLabel(e) for e in mod.after) if mod.after else "none"
@@ -1363,14 +1360,25 @@ class SubtileBasedScheduler:
 
     def _printLoopSteps(self, loopSteps: List[PartitionSchedule], indent: str,
                         showVgpr: bool = False, showDeps: bool = False,
-                        showSubtiles: bool = False):
+                        showSubtiles: bool = False,
+                        scaleSet: int = 0, scaleLRSet: int = None):
+        if scaleLRSet is None:
+            scaleLRSet = 1 - scaleSet if self.hasScale else scaleSet
         for partition in loopSteps:
             print(f"{indent}Partition {partition.partitionId}:")
+            prevSubtileK = None
             for dus in partition.subIterKSteps:
+                if self.hasScale and prevSubtileK is not None \
+                        and dus.subtileK != prevSubtileK:
+                    scaleSet, scaleLRSet = scaleLRSet, scaleSet
+                prevSubtileK = dus.subtileK
                 print(f"{indent}  subtileK={dus.subtileK} subIterK={dus.subIterK}:")
                 self._printModules(dus.modules, indent=f"{indent}    ",
                                    showVgpr=showVgpr, showDeps=showDeps,
-                                   showSubtiles=showSubtiles)
+                                   showSubtiles=showSubtiles,
+                                   scaleSet=scaleSet, scaleLRSet=scaleLRSet)
+            if self.hasScale:
+                scaleSet, scaleLRSet = scaleLRSet, scaleSet
 
     def printSchedule(self, showVgpr: bool = False, showDeps: bool = False,
                       showSubtiles: bool = False):

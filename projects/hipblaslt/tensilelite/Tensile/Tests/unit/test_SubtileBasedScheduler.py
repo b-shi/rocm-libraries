@@ -753,7 +753,7 @@ if __name__ == "__main__":
     print("=== DEFAULT ===")
     s.printSchedule()
     print("\n=== VGPR + DEPS ===")
-    s.printSchedule(showVgpr=False, showDeps=True, showSubtiles=False)
+    s.printSchedule(showVgpr=True, showDeps=True, showSubtiles=False)
     s.printSchedule()
 
     s.allocVgprTiles(writer)
