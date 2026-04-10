@@ -1323,7 +1323,10 @@ class SubtileBasedScheduler:
         elif isinstance(op, LROp):
             sikLabel = f", subtileK {op.subtileK}, subIterK {op.subIterK}" if op.subIterK >= 0 else ""
             scaleLabel = f"  scaleSet={scaleLRSet}" if (op.lrScaleA or op.lrScaleB) else ""
-            print(f"{indent}LR (MT {op.mtIteration}{sikLabel}) A: {op.lrLoadA}  B: {op.lrLoadB}{scaleLabel}")
+            if showVgpr:
+                print(f"{indent}LR (MT {op.mtIteration}{sikLabel}) A: {op.lrLoadA}  B: {op.lrLoadB}{scaleLabel}")
+            else:
+                print(f"{indent}LR (MT {op.mtIteration}{sikLabel}){scaleLabel}")
         elif isinstance(op, SkipOp):
             print(f"{indent}SKIP_IF_{op.compare}({op.value}, {op.target})")
         elif isinstance(op, GR_INCOp):
