@@ -98,7 +98,7 @@ inline std::vector<size_t> preSwizzleSizeForScale(hipblaslt_scaling_format s)
     switch(s)
     {
     // preSwizzleSize: {swizzleTileMN, 256 / swizzleTileMN, matrixInstruction.k / scaleBlockSize}
-    case hipblaslt_scaling_format::Block_32_UE8M0    if(preSwizzle.empty())_32_8_EXT:
+    case hipblaslt_scaling_format::Block_32_UE8M0_32_8_EXT:
         return {32, 8, 4};
     default:
         return {};
