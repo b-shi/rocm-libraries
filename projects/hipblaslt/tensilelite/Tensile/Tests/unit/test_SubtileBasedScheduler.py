@@ -138,8 +138,7 @@ PRELOOP:
   GR_INC
   WAIT_GR (MT 0) A: [0, 1]  B: [0, 1] — inflight SubtileLoads A=0 B=0 scaleA=0 scaleB=0
   SYNC
-  LR (MT 0, subtileK 0, subIterK 0) A: [0, 1]  B: [0, 1]
-    - LOAD  A: {0: 0, 1: 1}  B: {0: 2, 1: 3}
+  LR (MT 0, subtileK 0, subIterK 0) A: {0: 0, 1: 1}  B: {0: 2, 1: 3}
   WAIT_LR
   SKIP_IF_LE(1, NLL)
   GR (MT 1, subtileK 0):  A: [0, 1]  B: [0, 1]
@@ -153,18 +152,16 @@ MAINLOOP:
         - [(0, 0), (0, 1), (1, 0), (1, 1)]
         - USING  A: {0: 0, 1: 1}  B: {0: 2, 1: 3}
         before: [none]  after: [none]
-      LR (MT n, subtileK 0, subIterK 1) A: [0, 1]  B: [0, 1]
-        - LOAD  A: {0: 4, 1: 5}  B: {0: 6, 1: 7}
+      LR (MT n, subtileK 0, subIterK 1) A: {0: 4, 1: 5}  B: {0: 6, 1: 7}
         before: [none]  after: [WaitLROp]
       GR (MT n+2, subtileK 0):  A: [0]  B: [0]
-        before: [LR(MT n, subtileK 0, sik 1), WaitLROp, SyncOp]  after: [none]
+        before: [LR (MT n, subtileK 0, subIterK 1), WaitLROp, SyncOp]  after: [none]
     subtileK=0 subIterK=1:
       MFMAs (MT n, subtileK 0, subIterK 1):
         - [(0, 0), (0, 1), (1, 0), (1, 1)]
         - USING  A: {0: 4, 1: 5}  B: {0: 6, 1: 7}
         before: [none]  after: [none]
-      LR (MT n+1, subtileK 0, subIterK 0) A: [0, 1]  B: [0, 1]
-        - LOAD  A: {0: 0, 1: 1}  B: {0: 2, 1: 3}
+      LR (MT n+1, subtileK 0, subIterK 0) A: {0: 0, 1: 1}  B: {0: 2, 1: 3}
         before: [WaitGROp(A=1 B=1 SA=0 SB=0), SyncOp, LR_INCOp]  after: [WaitLROp]
       GR (MT n+2, subtileK 0):  A: [1]  B: [1]
         before: [none]  after: [GR_INCOp]
@@ -200,24 +197,19 @@ def test_PGR2_64_64_1x1_fp4():
 MAINLOOP:
   Partition 0:
     subtileK=0 subIterK=0:
-      MFMAs (MT n, subtileK 0, subIterK 0):
+      MFMAs (MT n, subtileK 0, subIterK 0):  scaleSet=0
         - USING  A: {0: 0, 1: 1}  B: {0: 2, 1: 3}
-        - SCALE  A: {0: 0}  B: {0: 1}
         before: [none]  after: [none]
-      LR (MT n, subtileK 0, subIterK 1) A: [0, 1]  B: [0, 1]
-        - LOAD  A: {0: 4, 1: 5}  B: {0: 6, 1: 7}
+      LR (MT n, subtileK 0, subIterK 1) A: {0: 4, 1: 5}  B: {0: 6, 1: 7}
         before: [none]  after: [WaitLROp]
       GR (MT n+2, subtileK 0):  A: [0]  B: [0]
-        before: [LR(MT n, subtileK 0, sik 1), WaitLROp, SyncOp]  after: [none]
+        before: [LR (MT n, subtileK 0, subIterK 1), WaitLROp, SyncOp]  after: [none]
     subtileK=0 subIterK=1:
-      MFMAs (MT n, subtileK 0, subIterK 1):
+      MFMAs (MT n, subtileK 0, subIterK 1):  scaleSet=0
         - USING  A: {0: 4, 1: 5}  B: {0: 6, 1: 7}
-        - SCALE  A: {0: 0}  B: {0: 1}
         before: [none]  after: [none]
-      LR (MT n+1, subtileK 0, subIterK 0) A: [0, 1]  B: [0, 1]
-        - LOAD  A: {0: 0, 1: 1}  B: {0: 2, 1: 3}
-        - SCALE  A: {0: 0}  B: {0: 1}
-        before: [WaitGROp(A=1 B=1 SA=1 SB=1), SyncOp, LR_INCOp]  after: [WaitLROp]
+      LR (MT n+1, subtileK 0, subIterK 0) A: {0: 0, 1: 1}  B: {0: 2, 1: 3}  scaleSet=1
+        before: [WaitGROp(A=1 B=1 SA=0 SB=0), SyncOp, LR_INCOp]  after: [WaitLROp]
       GR (MT n+2, subtileK 0):  A: [1]  B: [1]
         before: [none]  after: [GR_INCOp]
 """
@@ -270,8 +262,7 @@ PRELOOP:
   GR_INC
   WAIT_GR (MT 0) A: [0, 1]  B: [0, 1] — inflight SubtileLoads A=0 B=0 scaleA=0 scaleB=0
   SYNC
-  LR (MT 0, subtileK 0, subIterK 0) A: [0]  B: [0]
-    - LOAD  A: {0: 0}  B: {0: 1}
+  LR (MT 0, subtileK 0, subIterK 0) A: {0: 0}  B: {0: 1}
   WAIT_LR
   SKIP_IF_LE(1, NLL)
   GR (MT 1, subtileK 0):  A: [0]  B: [0]
@@ -284,8 +275,7 @@ MAINLOOP:
         - [(0, 0)]
         - USING  A: {0: 0}  B: {0: 1}
         before: [none]  after: [none]
-      LR (MT n, subtileK 0, subIterK 1) A: [0]  B: [0]
-        - LOAD  A: {0: 2}  B: {0: 3}
+      LR (MT n, subtileK 0, subIterK 1) A: {0: 2}  B: {0: 3}
         before: [none]  after: [WaitLROp]
       GR (MT n+1, subtileK 0):  A: [1]  B: []
         before: [none]  after: [none]
@@ -294,8 +284,7 @@ MAINLOOP:
         - [(0, 0)]
         - USING  A: {0: 2}  B: {0: 3}
         before: [none]  after: [none]
-      LR (MT n, subtileK 0, subIterK 0) A: [1]  B: []
-        - LOAD  A: {1: 4}  B: {}
+      LR (MT n, subtileK 0, subIterK 0) A: {1: 4}  B: {}
         before: [WaitGROp(A=2 B=2 SA=0 SB=0), SyncOp]  after: [WaitLROp]
   Partition 1:
     subtileK=0 subIterK=0:
@@ -303,8 +292,7 @@ MAINLOOP:
         - [(1, 0)]
         - USING  A: {1: 4}  B: {0: 1}
         before: [none]  after: [none]
-      LR (MT n, subtileK 0, subIterK 1) A: [1]  B: []
-        - LOAD  A: {1: 5}  B: {}
+      LR (MT n, subtileK 0, subIterK 1) A: {1: 5}  B: {}
         before: [none]  after: [WaitLROp]
       GR (MT n+1, subtileK 0):  A: []  B: [1]
         before: [none]  after: [GR_INCOp]
@@ -313,8 +301,7 @@ MAINLOOP:
         - [(1, 0)]
         - USING  A: {1: 5}  B: {0: 3}
         before: [none]  after: [none]
-      LR (MT n, subtileK 0, subIterK 0) A: []  B: [1]
-        - LOAD  A: {}  B: {1: 6}
+      LR (MT n, subtileK 0, subIterK 0) A: {}  B: {1: 6}
         before: [WaitGROp(A=2 B=2 SA=0 SB=0), SyncOp]  after: [WaitLROp]
   Partition 2:
     subtileK=0 subIterK=0:
@@ -322,16 +309,14 @@ MAINLOOP:
         - [(0, 1)]
         - USING  A: {0: 0}  B: {1: 6}
         before: [none]  after: [none]
-      LR (MT n, subtileK 0, subIterK 1) A: []  B: [1]
-        - LOAD  A: {}  B: {1: 7}
+      LR (MT n, subtileK 0, subIterK 1) A: {}  B: {1: 7}
         before: [none]  after: [WaitLROp]
     subtileK=0 subIterK=1:
       MFMAs (MT n, subtileK 0, subIterK 1):
         - [(0, 1)]
         - USING  A: {0: 2}  B: {1: 7}
         before: [none]  after: [none]
-      LR (MT n, subtileK 0, subIterK 0) A: []  B: []
-        - LOAD  A: {}  B: {}
+      LR (MT n, subtileK 0, subIterK 0) A: {}  B: {}
         before: [none]  after: [WaitLROp]
   Partition 3:
     subtileK=0 subIterK=0:
@@ -339,18 +324,16 @@ MAINLOOP:
         - [(1, 1)]
         - USING  A: {1: 4}  B: {1: 6}
         before: [none]  after: [none]
-      LR (MT n, subtileK 0, subIterK 1) A: []  B: []
-        - LOAD  A: {}  B: {}
+      LR (MT n, subtileK 0, subIterK 1) A: {}  B: {}
         before: [none]  after: [WaitLROp]
       GR (MT n+2, subtileK 0):  A: [0]  B: [0]
-        before: [LR(MT n, subtileK 0, sik 1), WaitLROp, SyncOp]  after: [none]
+        before: [LR (MT n, subtileK 0, subIterK 1), WaitLROp, SyncOp]  after: [none]
     subtileK=0 subIterK=1:
       MFMAs (MT n, subtileK 0, subIterK 1):
         - [(1, 1)]
         - USING  A: {1: 5}  B: {1: 7}
         before: [none]  after: [none]
-      LR (MT n+1, subtileK 0, subIterK 0) A: [0]  B: [0]
-        - LOAD  A: {0: 0}  B: {0: 1}
+      LR (MT n+1, subtileK 0, subIterK 0) A: {0: 0}  B: {0: 1}
         before: [GR(MT n+1, subtileK 0), WaitGROp(A=2 B=2 SA=0 SB=0), SyncOp, LR_INCOp]  after: [WaitLROp]
 """
 
@@ -497,7 +480,7 @@ def test_PGR2_64_64_1x1_emitted_modules_links(verbose=False):
         (4, "sync", 1, 3),
         (5, "lr_inc", 6, 4),
         (6, "wait_lr", 1, 1),
-        (7, "gr_inc", 10, 2),
+        (7, "gr_inc", 8, 2),
     ]
 
     if verbose:
@@ -551,7 +534,7 @@ def test_PGR2_256_256_1x1_extract_paths_from_before_deps():
         (4, "sync", 1, 3),
         (5, "lr_inc", 6, 4),
         (6, "wait_lr", 1, 1),
-        (7, "gr_inc", 10, 2),
+        (7, "gr_inc", 8, 2),
     ]
 
     mfmaIdx0, pathOrders0 = SubtileBasedScheduler._extractPathsFromBeforeDeps(emitted0)
@@ -646,11 +629,11 @@ def test_PGR2_256_256_fp4_instruction_schedule_exact():
 
     # M=MFMA, L=LocalRead, G=GlobalRead(buffer_load), S=scalar ALU/wait/sync
     expected_sik0 = \
-        "MLMLMLMLMLMLMLMLMLMLMLMLMLMLMLMLMMMMSSMSSMGSMSMMMGMSMMMGMSMMMGMSMMMGM" \
-        "SMMMGMSMMMGMSMMMGMSMMMGMSMMMGMMMMMM"
+        "MLMLMLMLMLMLMLMLMLMLMLMLMLMLMLMLMMMMSSMSMGMSMMMMGMSMMMMGMSMMMMGMSMMMMGM" \
+        "SMMMMGMSMMMMGMSMMMMGMMMMMMM"
     expected_sik1 = \
-        "MSMGMSMMMMMGMSMMMMMGMSMMMMMGMSMMMMMGMSMMMSMSSMSGSMSSSMSSMSSMSLMLMGLM" \
-        "SLMLMLMLMLMGLSMSLSMSLSMSLSMSLSMSLSMSLSMSLSMSLSMSLSMSLMLMLMLMLMLMMMMSM"
+        "MSSMGSMSMMMMGMSMMMMGMSMMMMGMSMMMMGMSMMMMGMSMMSMSSMSGSMSSSMSSMSSMSLMGLMS" \
+        "LMLMLMLMGLMSLMLMLMLMGLSMSLSMSLSMSLSMSLSMSLSMSLSMSLSMSLSMSLMLMLMLMMMMSM"
 
     assert seq0 == expected_sik0, f"subIterK=0 mismatch:\n  got: {seq0}\n  exp: {expected_sik0}"
     assert seq1 == expected_sik1, f"subIterK=1 mismatch:\n  got: {seq1}\n  exp: {expected_sik1}"
