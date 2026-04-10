@@ -639,6 +639,135 @@ def test_PGR2_256_256_fp4_instruction_schedule_exact():
     assert seq1 == expected_sik1, f"subIterK=1 mismatch:\n  got: {seq1}\n  exp: {expected_sik1}"
 
 
+def test_PGR2_128_128_DU512_fp4_schedule():
+    """Exact schedule test for 128x128 DU512 fp4."""
+    kernel = create_kernel(128, 128, fp4=True, depthU=512)
+    tiA = TileInfo('A', kernel)
+    tiB = TileInfo('B', kernel)
+    scaleTiA = TileInfo('MXSA', kernel)
+    scaleTiB = TileInfo('MXSB', kernel)
+    lsgA = tiA.localSubtileGrid[0]
+    lsgB = tiB.localSubtileGrid[0]
+
+    cfg = SchedulerConfig(lsgA, lsgB, PrefetchMode.HALF_PREFETCH)
+    s = SubtileBasedScheduler(tiA, tiB, cfg,
+                              scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB)
+
+    assert s.totalVGPRTiles == 32
+    assert s.totalScaleVGPRTiles == 4
+    assert s.hasScale
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        s.printSchedule(showVgpr=True, showDeps=True, showSubtiles=True)
+    actual = buf.getvalue()
+
+    expected = """\
+SubtileGridA=4x2, SubtileGridB=4x2
+Partition grid: 1 x 1
+Partition size: 4 x 4
+Prefetch: HALF_PREFETCH
+Reuse: ACROSS_PARTITIONS
+totalVGPRTiles: 32 (128 VGPRs)
+totalScaleVGPRTiles: 4
+hasScale: True
+
+Ordering grid (COLUMN_MAJOR):
+   0
+
+PRELOOP:
+  GR (MT 0, subtileK 0):  A: [0, 1, 2, 3]  B: [0, 1, 2, 3]
+  GR (MT 0, subtileK 1):  A: [0, 1, 2, 3]  B: [0, 1, 2, 3]
+  GR_INC
+  WAIT_GR (MT 0) A: [0, 1, 2, 3]  B: [0, 1, 2, 3] — inflight SubtileLoads A=0 B=0 scaleA=0 scaleB=0
+  SYNC
+  LR (MT 0, subtileK 0, subIterK 0) A: {0: 0, 1: 1, 2: 2, 3: 3}  B: {0: 4, 1: 5, 2: 6, 3: 7}  scaleSet=0
+  WAIT_LR
+  SKIP_IF_LE(1, NLLEarly)
+  GR (MT 1, subtileK 0):  A: [0, 1, 2, 3]  B: [0, 1, 2, 3]
+  GR (MT 1, subtileK 1):  A: [0, 1, 2, 3]  B: [0, 1, 2, 3]
+  GR_INC
+  SKIP_IF_LE(2, NGLL)
+
+MAINLOOP:
+  Partition 0:
+    subtileK=0 subIterK=0:
+      MFMAs (MT n, subtileK 0, subIterK 0):  scaleSet=0
+        - [(0, 0), (0, 1), (0, 2), (0, 3), (1, 0), (1, 1), (1, 2), (1, 3), (2, 0), (2, 1), (2, 2), (2, 3), (3, 0), (3, 1), (3, 2), (3, 3)]
+        - USING  A: {0: 0, 1: 1, 2: 2, 3: 3}  B: {0: 4, 1: 5, 2: 6, 3: 7}
+        before: [none]  after: [none]
+      LR (MT n, subtileK 0, subIterK 1) A: {0: 8, 1: 9, 2: 10, 3: 11}  B: {0: 12, 1: 13, 2: 14, 3: 15}
+        before: [none]  after: [WaitLROp]
+      GR (MT n+2, subtileK 0):  A: [0, 1]  B: [0, 1]
+        before: [LR (MT n, subtileK 0, subIterK 1), WaitLROp, SyncOp]  after: [none]
+    subtileK=0 subIterK=1:
+      MFMAs (MT n, subtileK 0, subIterK 1):  scaleSet=0
+        - [(0, 0), (0, 1), (0, 2), (0, 3), (1, 0), (1, 1), (1, 2), (1, 3), (2, 0), (2, 1), (2, 2), (2, 3), (3, 0), (3, 1), (3, 2), (3, 3)]
+        - USING  A: {0: 8, 1: 9, 2: 10, 3: 11}  B: {0: 12, 1: 13, 2: 14, 3: 15}
+        before: [none]  after: [none]
+      LR (MT n, subtileK 1, subIterK 0) A: {0: 16, 1: 17, 2: 18, 3: 19}  B: {0: 20, 1: 21, 2: 22, 3: 23}  scaleSet=1
+        before: [none]  after: [WaitLROp]
+      GR (MT n+2, subtileK 0):  A: [2, 3]  B: [2, 3]
+        before: [LR (MT n, subtileK 1, subIterK 0), WaitLROp, SyncOp]  after: [none]
+    subtileK=1 subIterK=0:
+      MFMAs (MT n, subtileK 1, subIterK 0):  scaleSet=1
+        - [(0, 0), (0, 1), (0, 2), (0, 3), (1, 0), (1, 1), (1, 2), (1, 3), (2, 0), (2, 1), (2, 2), (2, 3), (3, 0), (3, 1), (3, 2), (3, 3)]
+        - USING  A: {0: 16, 1: 17, 2: 18, 3: 19}  B: {0: 20, 1: 21, 2: 22, 3: 23}
+        before: [none]  after: [none]
+      LR (MT n, subtileK 1, subIterK 1) A: {0: 24, 1: 25, 2: 26, 3: 27}  B: {0: 28, 1: 29, 2: 30, 3: 31}
+        before: [none]  after: [WaitLROp]
+      GR (MT n+2, subtileK 1):  A: [0, 1]  B: [0, 1]
+        before: [LR (MT n, subtileK 1, subIterK 1), WaitLROp, SyncOp]  after: [none]
+    subtileK=1 subIterK=1:
+      MFMAs (MT n, subtileK 1, subIterK 1):  scaleSet=1
+        - [(0, 0), (0, 1), (0, 2), (0, 3), (1, 0), (1, 1), (1, 2), (1, 3), (2, 0), (2, 1), (2, 2), (2, 3), (3, 0), (3, 1), (3, 2), (3, 3)]
+        - USING  A: {0: 24, 1: 25, 2: 26, 3: 27}  B: {0: 28, 1: 29, 2: 30, 3: 31}
+        before: [none]  after: [none]
+      LR (MT n+1, subtileK 0, subIterK 0) A: {0: 0, 1: 1, 2: 2, 3: 3}  B: {0: 4, 1: 5, 2: 6, 3: 7}  scaleSet=0
+        before: [WaitGROp(A=6 B=6 SA=0 SB=0), SyncOp, LR_INCOp]  after: [WaitLROp]
+      GR (MT n+2, subtileK 1):  A: [2, 3]  B: [2, 3]
+        before: [none]  after: [GR_INCOp]
+"""
+
+    assert expected in actual
+
+
+def test_PGR2_128_128_DU512_fp4_instruction_schedule_exact():
+    """Exact regression test for the mainloop instruction schedule (fp4 128x128 DU512)."""
+    kernel = create_kernel(128, 128, fp4=True, depthU=512)
+    tiA = TileInfo('A', kernel)
+    tiB = TileInfo('B', kernel)
+    scaleTiA = TileInfo('MXSA', kernel)
+    scaleTiB = TileInfo('MXSB', kernel)
+    lsgA = tiA.localSubtileGrid[0]
+    lsgB = tiB.localSubtileGrid[0]
+
+    cfg = SchedulerConfig(lsgA, lsgB, PrefetchMode.HALF_PREFETCH)
+    s = SubtileBasedScheduler(tiA, tiB, cfg,
+                              scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB)
+    writer = create_writer_with_tiles(kernel, tiA, tiB,
+                                      scaleTiA=scaleTiA, scaleTiB=scaleTiB)
+    s.allocVgprTiles(writer)
+    try:
+        seq0 = _get_scheduled_sequence(s, writer, kernel, 0)
+        seq1 = _get_scheduled_sequence(s, writer, kernel, 1)
+        seq2 = _get_scheduled_sequence(s, writer, kernel, 2)
+        seq3 = _get_scheduled_sequence(s, writer, kernel, 3)
+    finally:
+        s.deallocVgprTiles(writer)
+
+    # M=MFMA, L=LocalRead, G=GlobalRead(buffer_load), S=scalar ALU/wait/sync
+    expected_sik0 = "MLMLMLMLMLMLMLMLMMMMSSMSMGMSGSGSGM"
+    expected_sik1 = "MLMLMLMLMLMLMLMLMLMLMLMLSMSSMGMSGSGSGM"
+    expected_sik2 = "MLMLMLMLMLMLMLMLMMMMSSMSMGMSGSGSGM"
+    expected_sik3 = "MSSSSSSSSSSSSLLSMSLMGLSMSLMGLMSLMGLMSLMGLMSLMGLMSMGSMSSMSSSSSSSSSSSSSSSSM"
+
+    assert seq0 == expected_sik0, f"subIterK=0 mismatch:\n  got: {seq0}\n  exp: {expected_sik0}"
+    assert seq1 == expected_sik1, f"subIterK=1 mismatch:\n  got: {seq1}\n  exp: {expected_sik1}"
+    assert seq2 == expected_sik2, f"subIterK=2 mismatch:\n  got: {seq2}\n  exp: {expected_sik2}"
+    assert seq3 == expected_sik3, f"subIterK=3 mismatch:\n  got: {seq3}\n  exp: {expected_sik3}"
+
+
 def test_PGR2_256_256_fp4_vmcnt():
     """Verify vmcnt values in SWaitCnt instructions for 256x256 fp4 mainloop.
 
