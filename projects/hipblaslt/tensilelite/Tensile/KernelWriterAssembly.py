@@ -12875,125 +12875,107 @@ class KernelWriterAssembly(KernelWriter):
     return module
 
   ##############################################################################
-  # _emitSubtileMGuard
-  # Compute numValidMBlocks for UseSubtileImpl NonEdge path and store it in a
-  # freshly allocated SGPR (saved to self.states.subtileM32ValidBlocksSgpr).
+  # _emitSubtileGuards
+  # Compute both M and N OOB guard SGPRs for the UseSubtileImpl NonEdge path.
+  # Results are stored in self.states.subtileM32ValidBlocksSgpr and
+  # self.states.subtileN16ValidBlocksSgpr for use by _emitSubtileOobGuard.
   #
-  # Algorithm:
-  #   validM      = SizeI - WG0 * MT0          (rows remaining in this WG)
-  #   waveIdM     = (serial >> 6) & (numWavesM - 1)
-  #   waveBase    = waveIdM * waveGroupM        (first row owned by this wave)
-  #   remainder   = max(validM - waveBase, 0)  (rows left for this wave)
+  # waveId (serial >> 6) is read once and used for both dimensions:
+  #   waveIdM = waveId & (numWavesM - 1)          lower bits (M is innermost)
+  #   waveIdN = waveId >> log2(numWavesM)          upper bits (N is outermost)
+  #
+  # M algorithm:
+  #   validM          = SizeI - WG0 * MT0
+  #   waveBase        = waveIdM * waveGroupM
+  #   remainder       = max(validM - waveBase, 0)
   #   numValidMBlocks = min(ceil(remainder / mBlockSize), MIWaveTile[0])
+  #   mBlockSize = 32 for 16-bit dest, 16 for fp32 dest.
   #
-  # mBlockSize is 32 for 16-bit dest (8 values/dword × 4 dwords) or 16 for
-  # fp32 dest (4 values/dword × 4 dwords).
+  # N algorithm:
+  #   validN            = SizeJ - WG1 * MT1
+  #   waveBaseN         = waveIdN * waveGroupN      (skipped if numWavesN == 1)
+  #   validN_wave       = max(validN - waveBaseN, 0)
+  #   clamped           = min(validN_wave, waveGroupN)
+  #   numValid16NBlocks = clamped >> 4
   ##############################################################################
-  def _emitSubtileMGuard(self, kernel, edgeModule):
-    mBlockSize  = 16 if kernel["ProblemType"]["DestDataType"].isSingle() else 32
-    mBlockShift = int(log(mBlockSize, 2))
-    waveGroupM  = kernel["MIWaveTile"][0] * kernel["MatrixInstM"]
-    numWavesM   = kernel["MIWaveGroup"][0]
-    mt0         = kernel["MacroTile0"]
-
-    guardSgpr = self.sgprPool.checkOut(1, "subtileMValidBlocks")
-    tmpSgpr   = self.sgprPool.checkOut(1, "subtileWaveId")
-
-    edgeModule.addComment1("UseSubtileImpl NonEdge M-guard: compute numValidMBlocks (blockSize=%d) for this wave" % mBlockSize)
-    # validM = SizeI - WG0 * MT0
-    edgeModule.add(SMulI32(dst=sgpr(guardSgpr), src0=sgpr("WorkGroup0"), src1=mt0,
-                           comment="WG0 * MT0"))
-    edgeModule.add(SSubU32(dst=sgpr(guardSgpr), src0=sgpr("SizeI"), src1=sgpr(guardSgpr),
-                           comment="validM = SizeI - WG0*MT0"))
-    # waveIdM = (serial >> 6) & (numWavesM - 1); waveBase = waveIdM * waveGroupM
-    edgeModule.add(VReadfirstlaneB32(dst=sgpr(tmpSgpr), src=vgpr("Serial"),
-                                     comment="lane 0 serial of this wave"))
-    edgeModule.add(SLShiftRightB32(dst=sgpr(tmpSgpr), src=sgpr(tmpSgpr),
-                                   shiftHex=6, comment="waveId = serial >> 6"))
-    # MIWaveGroup[0] is always a power of 2, so AND is correct for modulo.
-    edgeModule.add(SAndB32(dst=sgpr(tmpSgpr), src0=sgpr(tmpSgpr), src1=numWavesM - 1,
-                           comment="waveIdM = waveId %% numWavesM(%d)" % numWavesM))
-    edgeModule.add(SMulI32(dst=sgpr(tmpSgpr), src0=sgpr(tmpSgpr), src1=waveGroupM,
-                           comment="waveBase = waveIdM * waveGroupM(%d)" % waveGroupM))
-    # remainder = max(validM - waveBase, 0)
-    # SSubU32 sets SCC=1 on borrow (waveBase > validM → OOB); SCSelectB32 maps that to 0.
-    edgeModule.add(SSubU32(dst=sgpr(guardSgpr), src0=sgpr(guardSgpr), src1=sgpr(tmpSgpr),
-                           comment="validM - waveBase; SCC=1 if waveBase > validM (OOB)"))
-    edgeModule.add(SCSelectB32(dst=sgpr(guardSgpr), src0=0, src1=sgpr(guardSgpr),
-                               comment="0 if OOB, else validM-waveBase"))
-    # numValidMBlocks = min(ceil(remainder / mBlockSize), MIWaveTile[0])
-    # Ceiling division: (remainder + mBlockSize - 1) >> mBlockShift.
-    edgeModule.add(SAddU32(dst=sgpr(guardSgpr), src0=sgpr(guardSgpr), src1=mBlockSize - 1,
-                           comment="ceil: remainder + (%d-1)" % mBlockSize))
-    edgeModule.add(SLShiftRightB32(dst=sgpr(guardSgpr), src=sgpr(guardSgpr), shiftHex=mBlockShift,
-                                   comment="numValidMBlocks = ceil(remainder / %d)" % mBlockSize))
-    # Clamp to MIWaveTile[0]: blockIdxM in store paths goes up to MIWaveTile[0]-1, so the
-    # guard comparison (numValidMBlocks > blockIdxM) is always false for blockIdxM >= MIWaveTile[0].
-    edgeModule.add(SMinU32(dst=sgpr(guardSgpr), src0=sgpr(guardSgpr), src1=kernel["MIWaveTile"][0],
-                           comment="clamp to maxBlocksPerWave=%d" % kernel["MIWaveTile"][0]))
-
-    self.sgprPool.checkIn(tmpSgpr)
-    self.states.subtileM32ValidBlocksSgpr = guardSgpr
-    self.states.subtileMBlockSize = mBlockSize
-
-  ##############################################################################
-  # _emitSubtileNGuard
-  # Compute numValid16NBlocks for UseSubtileImpl NonEdge path and store it in a
-  # freshly allocated SGPR (saved to self.states.subtileN16ValidBlocksSgpr).
-  #
-  # Algorithm:
-  #   validN         = SizeJ - WG1 * MT1
-  #   waveIdN        = (serial >> 6) >> log2(numWavesM)   (only if numWavesN > 1)
-  #   waveBaseN      = waveIdN * waveGroupN
-  #   validN_wave    = max(validN - waveBaseN, 0)          (skipped if numWavesN == 1)
-  #   clamped        = min(validN_wave, waveGroupN)
-  #   numValid16NBlocks = clamped >> 4                     (16-column blocks)
-  ##############################################################################
-  def _emitSubtileNGuard(self, kernel, edgeModule, numWavesM):
-    waveGroupN    = kernel["MIWaveTile"][1] * kernel["MatrixInstN"]
+  def _emitSubtileGuards(self, kernel, edgeModule):
+    numWavesM     = kernel["MIWaveGroup"][0]
     numWavesN     = kernel["MIWaveGroup"][1]
     log2numWavesM = int(log(numWavesM, 2))
-    mt1           = kernel["MacroTile1"]
+    mBlockSize    = 16 if kernel["ProblemType"]["DestDataType"].isSingle() else 32
+    mBlockShift   = int(log(mBlockSize, 2))
+    waveGroupM    = kernel["MIWaveTile"][0] * kernel["MatrixInstM"]
+    waveGroupN    = kernel["MIWaveTile"][1] * kernel["MatrixInstN"]
+    mt0, mt1      = kernel["MacroTile0"], kernel["MacroTile1"]
 
-    guardSgpr = self.sgprPool.checkOut(1, "subtileN16ValidBlocks")
-    tmpSgpr   = self.sgprPool.checkOut(1, "subtileNTmp")
+    mGuardSgpr = self.sgprPool.checkOut(1, "subtileMValidBlocks")
+    nGuardSgpr = self.sgprPool.checkOut(1, "subtileNValidBlocks")
+    tmpM       = self.sgprPool.checkOut(1, "subtileWaveIdM")
+    tmpN       = self.sgprPool.checkOut(1, "subtileWaveIdN")
 
-    edgeModule.addComment1("UseSubtileImpl NonEdge N-guard: compute numValid16NBlocks")
-    # validN = SizeJ - WG1 * MT1
-    edgeModule.add(SMulI32(dst=sgpr(guardSgpr), src0=sgpr("WorkGroup1"), src1=mt1,
-                           comment="WG1 * MT1"))
-    edgeModule.add(SSubU32(dst=sgpr(guardSgpr),
-                           src0=self.sizeRef(kernel["ProblemType"]["Index1"]),
-                           src1=sgpr(guardSgpr),
-                           comment="validN = SizeJ - WG1*MT1"))
+    edgeModule.addComment1("UseSubtileImpl NonEdge guards: numValidMBlocks (blockSize=%d) and numValid16NBlocks" % mBlockSize)
+
+    # Read waveId once; extract M (lower bits) and N (upper bits) before AND destroys waveId.
+    edgeModule.add(VReadfirstlaneB32(dst=sgpr(tmpM), src=vgpr("Serial"),
+                                     comment="lane 0 serial of this wave"))
+    edgeModule.add(SLShiftRightB32(dst=sgpr(tmpM), src=sgpr(tmpM),
+                                   shiftHex=6, comment="waveId = serial >> 6"))
     if numWavesN > 1:
-      # waveIdN = waveId >> log2(numWavesM); waveBaseN = waveIdN * waveGroupN
-      edgeModule.add(VReadfirstlaneB32(dst=sgpr(tmpSgpr), src=vgpr("Serial"),
-                                       comment="lane 0 serial of this wave"))
-      edgeModule.add(SLShiftRightB32(dst=sgpr(tmpSgpr), src=sgpr(tmpSgpr),
-                                     shiftHex=6, comment="waveId = serial >> 6"))
-      edgeModule.add(SLShiftRightB32(dst=sgpr(tmpSgpr), src=sgpr(tmpSgpr),
+      edgeModule.add(SLShiftRightB32(dst=sgpr(tmpN), src=sgpr(tmpM),
                                      shiftHex=log2numWavesM,
                                      comment="waveIdN = waveId >> log2(numWavesM=%d)" % numWavesM))
-      edgeModule.add(SMulI32(dst=sgpr(tmpSgpr), src0=sgpr(tmpSgpr), src1=waveGroupN,
-                             comment="waveBaseN = waveIdN * waveGroupN(%d)" % waveGroupN))
-      # validN_wave = max(validN - waveBaseN, 0)
-      edgeModule.add(SSubU32(dst=sgpr(guardSgpr), src0=sgpr(guardSgpr), src1=sgpr(tmpSgpr),
-                             comment="validN - waveBaseN; SCC=1 if OOB"))
-      edgeModule.add(SCSelectB32(dst=sgpr(guardSgpr), src0=0, src1=sgpr(guardSgpr),
-                                 comment="0 if OOB, else validN-waveBaseN"))
-    # clamped = min(validN_wave, waveGroupN)
-    # SSubU32 SCC=1 means borrow (validN_wave < waveGroupN) → keep validN_wave; else use waveGroupN.
-    edgeModule.add(SSubU32(dst=sgpr(tmpSgpr), src0=sgpr(guardSgpr), src1=waveGroupN,
-                           comment="validN_wave - waveGroupN; SCC=1 if validN_wave < waveGroupN"))
-    edgeModule.add(SCSelectB32(dst=sgpr(guardSgpr), src0=sgpr(guardSgpr), src1=waveGroupN,
-                               comment="min(validN_wave, waveGroupN)"))
-    # numValid16NBlocks = clamped >> 4  (16-column blocks)
-    edgeModule.add(SLShiftRightB32(dst=sgpr(guardSgpr), src=sgpr(guardSgpr), shiftHex=4,
-                                   comment="numValid16NBlocks = clamped >> 4"))
+    # MIWaveGroup[0] is always a power of 2, so AND is correct for modulo.
+    edgeModule.add(SAndB32(dst=sgpr(tmpM), src0=sgpr(tmpM), src1=numWavesM - 1,
+                           comment="waveIdM = waveId & (numWavesM-1=%d)" % (numWavesM - 1)))
 
-    self.sgprPool.checkIn(tmpSgpr)
-    self.states.subtileN16ValidBlocksSgpr = guardSgpr
+    # --- M guard ---
+    edgeModule.addComment0("M-guard: numValidMBlocks = min(ceil(max(validM-waveBase,0)/%d), MIWaveTile[0]=%d)" % (mBlockSize, kernel["MIWaveTile"][0]))
+    edgeModule.add(SMulI32(dst=sgpr(mGuardSgpr), src0=sgpr("WorkGroup0"), src1=mt0,
+                           comment="WG0 * MT0"))
+    edgeModule.add(SSubU32(dst=sgpr(mGuardSgpr), src0=sgpr("SizeI"), src1=sgpr(mGuardSgpr),
+                           comment="validM = SizeI - WG0*MT0"))
+    edgeModule.add(SMulI32(dst=sgpr(tmpM), src0=sgpr(tmpM), src1=waveGroupM,
+                           comment="waveBase = waveIdM * waveGroupM(%d)" % waveGroupM))
+    edgeModule.add(SSubU32(dst=sgpr(mGuardSgpr), src0=sgpr(mGuardSgpr), src1=sgpr(tmpM),
+                           comment="validM - waveBase; SCC=1 if OOB"))
+    edgeModule.add(SCSelectB32(dst=sgpr(mGuardSgpr), src0=0, src1=sgpr(mGuardSgpr),
+                               comment="remainder = 0 if OOB"))
+    edgeModule.add(SAddU32(dst=sgpr(mGuardSgpr), src0=sgpr(mGuardSgpr), src1=mBlockSize - 1,
+                           comment="ceil: remainder + (%d-1)" % mBlockSize))
+    edgeModule.add(SLShiftRightB32(dst=sgpr(mGuardSgpr), src=sgpr(mGuardSgpr), shiftHex=mBlockShift,
+                                   comment="numValidMBlocks = ceil(remainder / %d)" % mBlockSize))
+    # Clamp: guard comparison is (numValidMBlocks > blockIdxM); blockIdxM < MIWaveTile[0] always.
+    edgeModule.add(SMinU32(dst=sgpr(mGuardSgpr), src0=sgpr(mGuardSgpr), src1=kernel["MIWaveTile"][0],
+                           comment="clamp to MIWaveTile[0]=%d" % kernel["MIWaveTile"][0]))
+    self.sgprPool.checkIn(tmpM)
+
+    # --- N guard ---
+    edgeModule.addComment0("N-guard: numValid16NBlocks = min(max(validN-waveBaseN,0), waveGroupN=%d) >> 4" % waveGroupN)
+    edgeModule.add(SMulI32(dst=sgpr(nGuardSgpr), src0=sgpr("WorkGroup1"), src1=mt1,
+                           comment="WG1 * MT1"))
+    edgeModule.add(SSubU32(dst=sgpr(nGuardSgpr),
+                           src0=self.sizeRef(kernel["ProblemType"]["Index1"]),
+                           src1=sgpr(nGuardSgpr),
+                           comment="validN = SizeJ - WG1*MT1"))
+    if numWavesN > 1:
+      edgeModule.add(SMulI32(dst=sgpr(tmpN), src0=sgpr(tmpN), src1=waveGroupN,
+                             comment="waveBaseN = waveIdN * waveGroupN(%d)" % waveGroupN))
+      edgeModule.add(SSubU32(dst=sgpr(nGuardSgpr), src0=sgpr(nGuardSgpr), src1=sgpr(tmpN),
+                             comment="validN - waveBaseN; SCC=1 if OOB"))
+      edgeModule.add(SCSelectB32(dst=sgpr(nGuardSgpr), src0=0, src1=sgpr(nGuardSgpr),
+                                 comment="validN_wave = 0 if OOB"))
+    # clamped = min(validN_wave, waveGroupN); SCC=1 on borrow → keep validN_wave, else waveGroupN.
+    edgeModule.add(SSubU32(dst=sgpr(tmpN), src0=sgpr(nGuardSgpr), src1=waveGroupN,
+                           comment="validN_wave - waveGroupN; SCC=1 if validN_wave < waveGroupN"))
+    edgeModule.add(SCSelectB32(dst=sgpr(nGuardSgpr), src0=sgpr(nGuardSgpr), src1=waveGroupN,
+                               comment="min(validN_wave, waveGroupN)"))
+    edgeModule.add(SLShiftRightB32(dst=sgpr(nGuardSgpr), src=sgpr(nGuardSgpr), shiftHex=4,
+                                   comment="numValid16NBlocks = clamped >> 4"))
+    self.sgprPool.checkIn(tmpN)
+
+    self.states.subtileM32ValidBlocksSgpr = mGuardSgpr
+    self.states.subtileN16ValidBlocksSgpr = nGuardSgpr
+    self.states.subtileMBlockSize = mBlockSize
 
   ##############################################################################
   # checkIsEdge
@@ -14043,8 +14025,7 @@ class KernelWriterAssembly(KernelWriter):
       and kernel["_GlobalAccumulation"] not in ("MultipleBufferSingleKernel", "MultipleBuffer")
     )
     if isSubtileNonEdge:
-      self._emitSubtileMGuard(kernel, edgeModule)
-      self._emitSubtileNGuard(kernel, edgeModule, numWavesM=kernel["MIWaveGroup"][0])
+      self._emitSubtileGuards(kernel, edgeModule)
     else:
       self.states.subtileM32ValidBlocksSgpr = None
       self.states.subtileN16ValidBlocksSgpr = None
