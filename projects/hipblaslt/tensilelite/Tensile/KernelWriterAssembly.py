@@ -12659,18 +12659,35 @@ class KernelWriterAssembly(KernelWriter):
               #   Normal kernel: to Then/Else label, followed by edge store
               #   Adaptive kernel: to NonEdgeEnd label, followed by Size0 % vectorWidth check
               isEdgeTarget = writeLabels[beta][factorDim][vectorWidth]
-              # If module, checking Size1 % MT1 > 0
+              # When UseSubtileImpl is active (and not a multi-buffer GSU accumulation),
+              # use subtile-aligned edge check: remainder must be a multiple of the
+              # subtile block size (32 for M, 16 for N) rather than requiring a full tile.
+              useSubtileEdgeCheck = (
+                kernel.get("UseSubtileImpl")
+                and kernel["_GlobalAccumulation"] not in ("MultipleBufferSingleKernel", "MultipleBuffer")
+              )
+              # If module, checking Size1 % MT1 > 0  (or subtile alignment for N)
               isLongBranch = True if currentInstLength >= 16384 else False
               with self.allocTmpSgpr(4) as tmpSgprInfo:
-                checkIsEdge = edgeModule.add(self.checkIsEdge(kernel, tmpSgprInfo, \
-                  isEdgeTarget["Then"] if kernel["AdaptiveGemm"] == 0 else isEdgeTarget["NonEdgeEnd"], \
+                if useSubtileEdgeCheck:
+                  checkIsEdge = edgeModule.add(self.checkIsEdgeSubtile(kernel, tmpSgprInfo, \
+                    isEdgeTarget["Then"] if kernel["AdaptiveGemm"] == 0 else isEdgeTarget["NonEdgeEnd"], \
+                    isSize1=True, isLongBranch=isLongBranch), pos=0)
+                else:
+                  checkIsEdge = edgeModule.add(self.checkIsEdge(kernel, tmpSgprInfo, \
+                    isEdgeTarget["Then"] if kernel["AdaptiveGemm"] == 0 else isEdgeTarget["NonEdgeEnd"], \
                     kernel["MacroTile1"], isSize1=True, isLongBranch=isLongBranch), pos=0)
                 currentInstLength += countInstruction(checkIsEdge)
-              # If module, checking Size0 % MT0 > 0
+              # If module, checking Size0 % MT0 > 0  (or subtile alignment for M)
               isLongBranch = True if currentInstLength >= 16384 else False
               with self.allocTmpSgpr(4) as tmpSgprInfo:
-                checkIsEdge = edgeModule.add(self.checkIsEdge(kernel, tmpSgprInfo, \
-                  isEdgeTarget["Else"] if kernel["AdaptiveGemm"] == 0 else isEdgeTarget["NonEdgeEnd"], \
+                if useSubtileEdgeCheck:
+                  checkIsEdge = edgeModule.add(self.checkIsEdgeSubtile(kernel, tmpSgprInfo, \
+                    isEdgeTarget["Else"] if kernel["AdaptiveGemm"] == 0 else isEdgeTarget["NonEdgeEnd"], \
+                    isSize1=False, isLongBranch=isLongBranch), pos=0)
+                else:
+                  checkIsEdge = edgeModule.add(self.checkIsEdge(kernel, tmpSgprInfo, \
+                    isEdgeTarget["Else"] if kernel["AdaptiveGemm"] == 0 else isEdgeTarget["NonEdgeEnd"], \
                     kernel["MacroTile0"], isLongBranch=isLongBranch), pos=0)
                 currentInstLength += countInstruction(checkIsEdge)
           betaModule.add(edgeModule, pos=0)
@@ -12747,6 +12764,238 @@ class KernelWriterAssembly(KernelWriter):
     return module
 
   ##############################################################################
+  # checkIsEdgeSubtile
+  # Used when UseSubtileImpl is active. Checks whether the wave's M/N rows
+  # are subtile-aligned so the NonEdge paired-store path can be used.
+  #
+  # Non-last workgroups always take the NonEdge path (their tile is full).
+  # For the last workgroup in each dimension, we check that the partial
+  # remainder is subtile-aligned:
+  #   isSize1=False: (SizeI % MT0) % blockSizeM == 0  → NonEdge  (else → edge)
+  #                  blockSizeM = 16 for fp32 dest, 32 for 16-bit dest
+  #   isSize1=True : (SizeJ % MT1) % 16 == 0          → NonEdge  (else → edge)
+  #
+  # tmpSgpr must have at least 4 free SGPRs (same as checkIsEdge).
+  # isEdgeTarget is the label to branch to when the tile IS an edge.
+  ##############################################################################
+  def checkIsEdgeSubtile(self, kernel, tmpSgprInfo, isEdgeTarget, isSize1=False, isLongBranch=False):
+    assert(isinstance(isEdgeTarget, Label))
+    isEdgeTargetLabel = isEdgeTarget.getLabelName()
+    module = Module("checkIsEdgeSubtile")
+    dim = "N (isSize1)" if isSize1 else "M"
+    module.addComment1("Edge/NonEdge store path check (%s): subtile-aligned remainder -> NonEdge paired store; unaligned -> Edge scalar store" % dim)
+    tmpS0  = tmpSgprInfo.idx
+    tmpS1  = tmpS0 + 1
+    tmpS23 = tmpS1 + 1
+
+    sizeBoundary = [0, 0]
+    sizeBoundary[0] = \
+        sgpr("PackedSize0") if len(kernel["PackedC0IndicesX"]) > 1 \
+        else self.sizeRef(kernel["ProblemType"]["Index0"])
+    sizeBoundary[1] = \
+        sgpr("PackedSize1") if len(kernel["PackedC1IndicesX"]) > 1 \
+        else self.sizeRef(kernel["ProblemType"]["Index1"])
+
+    if not isSize1:
+      divisor   = kernel["MacroTile0"]
+      # The M-alignment granularity must be waveGroupM so that every wave in the tile
+      # has either 0 or a full waveGroupM valid rows.  Using only mBlockSize (32 for bf16)
+      # is insufficient when waveGroupM is not a multiple of mBlockSize (e.g., MIWT3 → 48).
+      waveGroupM = kernel["MIWaveTile"][0] * kernel["MatrixInstM"]
+      alignSize  = waveGroupM
+      wgSgpr    = "WorkGroup0"
+      nwgSgpr   = "NumWorkGroups0"
+      # tmpS0 = SizeI % MT0  (the trailing-row count for the last WG)
+      module.add(scalarStaticDivideAndRemainder(tmpS1, tmpS0, sizeBoundary[0], divisor,
+                                               ContinuousRegister(tmpS23, 2), 2))
+      # tmpS1 = nwg0 - 1
+      module.add(SAddU32(dst=sgpr(tmpS1), src0=hex(-1), src1=sgpr(nwgSgpr)))
+      # SCC = 1 if this is the last WG in dim 0
+      module.add(SCmpGeU32(src0=sgpr(wgSgpr), src1=sgpr(tmpS1), comment="wg0 >= nwg0-1 ?"))
+    else:
+      divisor   = kernel["MacroTile1"]
+      # N-dimension: use 16-row alignment (one MIWaveTile row = 16 cols for bf16)
+      alignSize  = 16
+      wgSgpr    = "WorkGroup1"
+      nwgSgpr   = "NumWorkGroups1"
+      # tmpS0 = SizeJ % MT1
+      module.add(scalarStaticDivideAndRemainder(tmpS1, tmpS0, sizeBoundary[1], divisor,
+                                               ContinuousRegister(tmpS23, 2), 2))
+      # tmpS1 = nwg1 - 1
+      module.add(SAddU32(dst=sgpr(tmpS1), src0=hex(-1), src1=sgpr(nwgSgpr)))
+      # SCC = 1 if this is the last WG in dim 1
+      module.add(SCmpGeU32(src0=sgpr(wgSgpr), src1=sgpr(tmpS1), comment="wg1 >= nwg1-1 ?"))
+
+    # myRem = last WG ? (SizeX % divisor) : 0
+    # Non-last WGs always take NonEdge (full tile), so myRem = 0 keeps them out of the edge branch.
+    module.add(SCSelectB32(dst=sgpr(tmpS0), src0=sgpr(tmpS0), src1=0,
+                           comment="myRem = last WG ? rem : 0"))
+
+    # Check alignment: myRem % alignSize != 0 → edge.
+    # alignSize is a compile-time value.  For power-of-2 use AND; for non-power-of-2
+    # (e.g., waveGroupM=48 from MIWT3), enumerate the valid multiples and branch-chain.
+    if alignSize & (alignSize - 1) == 0:
+      # Power of 2: use AND for fast modulo
+      module.add(SAndB32(dst=sgpr(tmpS0), src0=sgpr(tmpS0), src1=alignSize - 1,
+                         comment="myRem %% %d (subtile alignment check)" % alignSize))
+      module.add(self.getSCMPKInstruction("GTU32", tmpS0, 0,
+                                         comment="not subtile-aligned → edge"))
+      if isLongBranch:
+        module.add(self.longBranchScc1(isEdgeTarget, posNeg=1, tmpSgprInfo=tmpSgprInfo,
+                                       comment="jump to edge if not subtile-aligned"))
+      else:
+        module.add(SCBranchSCC1(labelName=isEdgeTargetLabel,
+                                comment="jump to edge if not subtile-aligned"))
+    else:
+      # Non-power-of-2: enumerate valid aligned multiples {0, alignSize, 2*alignSize, ...}.
+      # myRem is in [0, divisor-1]; divisor = alignSize * numWaves. At most numWaves values to check.
+      # Strategy: branch to Edge if NOT any valid multiple.
+      # We emit: for each valid k: if myRem==k*alignSize goto NonEdge
+      #          fall-through → Edge
+      if not isSize1:
+        numWaves = kernel["MIWaveGroup"][0]
+      else:
+        numWaves = kernel["MIWaveGroup"][1]
+      nonEdgeLabel = Label(self.labels.getNameInc("subtile_nonedge_aligned"),
+                           "myRem is a valid multiple of alignSize=%d" % alignSize)
+      for k in range(numWaves):
+        multiple = k * alignSize
+        module.add(self.getSCMPKInstruction("EQU32", tmpS0, multiple,
+                                           comment="myRem == %d (aligned multiple k=%d)?" % (multiple, k)))
+        module.add(SCBranchSCC1(labelName=nonEdgeLabel.getLabelName(),
+                                comment="aligned → NonEdge"))
+      # Not any valid multiple → Edge
+      if isLongBranch:
+        module.add(self.longBranchScc0(isEdgeTarget, posNeg=1, tmpSgprInfo=tmpSgprInfo,
+                                       comment="not subtile-aligned (alignSize=%d) → edge" % alignSize))
+      else:
+        module.add(SBranch(labelName=isEdgeTargetLabel,
+                           comment="not subtile-aligned (alignSize=%d) → edge" % alignSize))
+      module.add(nonEdgeLabel)
+    return module
+
+  ##############################################################################
+  # _emitSubtileMGuard
+  # Compute numValidMBlocks for UseSubtileImpl NonEdge path and store it in a
+  # freshly allocated SGPR (saved to self.states.subtileM32ValidBlocksSgpr).
+  #
+  # Algorithm:
+  #   validM      = SizeI - WG0 * MT0          (rows remaining in this WG)
+  #   waveIdM     = (serial >> 6) & (numWavesM - 1)
+  #   waveBase    = waveIdM * waveGroupM        (first row owned by this wave)
+  #   remainder   = max(validM - waveBase, 0)  (rows left for this wave)
+  #   numValidMBlocks = min(ceil(remainder / mBlockSize), MIWaveTile[0])
+  #
+  # mBlockSize is 32 for 16-bit dest (8 values/dword × 4 dwords) or 16 for
+  # fp32 dest (4 values/dword × 4 dwords).
+  ##############################################################################
+  def _emitSubtileMGuard(self, kernel, edgeModule):
+    mBlockSize  = 16 if kernel["ProblemType"]["DestDataType"].isSingle() else 32
+    mBlockShift = int(log(mBlockSize, 2))
+    waveGroupM  = kernel["MIWaveTile"][0] * kernel["MatrixInstM"]
+    numWavesM   = kernel["MIWaveGroup"][0]
+    mt0         = kernel["MacroTile0"]
+
+    guardSgpr = self.sgprPool.checkOut(1, "subtileMValidBlocks")
+    tmpSgpr   = self.sgprPool.checkOut(1, "subtileWaveId")
+
+    edgeModule.addComment1("UseSubtileImpl NonEdge M-guard: compute numValidMBlocks (blockSize=%d) for this wave" % mBlockSize)
+    # validM = SizeI - WG0 * MT0
+    edgeModule.add(SMulI32(dst=sgpr(guardSgpr), src0=sgpr("WorkGroup0"), src1=mt0,
+                           comment="WG0 * MT0"))
+    edgeModule.add(SSubU32(dst=sgpr(guardSgpr), src0=sgpr("SizeI"), src1=sgpr(guardSgpr),
+                           comment="validM = SizeI - WG0*MT0"))
+    # waveIdM = (serial >> 6) & (numWavesM - 1); waveBase = waveIdM * waveGroupM
+    edgeModule.add(VReadfirstlaneB32(dst=sgpr(tmpSgpr), src=vgpr("Serial"),
+                                     comment="lane 0 serial of this wave"))
+    edgeModule.add(SLShiftRightB32(dst=sgpr(tmpSgpr), src=sgpr(tmpSgpr),
+                                   shiftHex=6, comment="waveId = serial >> 6"))
+    # MIWaveGroup[0] is always a power of 2, so AND is correct for modulo.
+    edgeModule.add(SAndB32(dst=sgpr(tmpSgpr), src0=sgpr(tmpSgpr), src1=numWavesM - 1,
+                           comment="waveIdM = waveId %% numWavesM(%d)" % numWavesM))
+    edgeModule.add(SMulI32(dst=sgpr(tmpSgpr), src0=sgpr(tmpSgpr), src1=waveGroupM,
+                           comment="waveBase = waveIdM * waveGroupM(%d)" % waveGroupM))
+    # remainder = max(validM - waveBase, 0)
+    # SSubU32 sets SCC=1 on borrow (waveBase > validM → OOB); SCSelectB32 maps that to 0.
+    edgeModule.add(SSubU32(dst=sgpr(guardSgpr), src0=sgpr(guardSgpr), src1=sgpr(tmpSgpr),
+                           comment="validM - waveBase; SCC=1 if waveBase > validM (OOB)"))
+    edgeModule.add(SCSelectB32(dst=sgpr(guardSgpr), src0=0, src1=sgpr(guardSgpr),
+                               comment="0 if OOB, else validM-waveBase"))
+    # numValidMBlocks = min(ceil(remainder / mBlockSize), MIWaveTile[0])
+    # Ceiling division: (remainder + mBlockSize - 1) >> mBlockShift.
+    edgeModule.add(SAddU32(dst=sgpr(guardSgpr), src0=sgpr(guardSgpr), src1=mBlockSize - 1,
+                           comment="ceil: remainder + (%d-1)" % mBlockSize))
+    edgeModule.add(SLShiftRightB32(dst=sgpr(guardSgpr), src=sgpr(guardSgpr), shiftHex=mBlockShift,
+                                   comment="numValidMBlocks = ceil(remainder / %d)" % mBlockSize))
+    # Clamp to MIWaveTile[0]: blockIdxM in store paths goes up to MIWaveTile[0]-1, so the
+    # guard comparison (numValidMBlocks > blockIdxM) is always false for blockIdxM >= MIWaveTile[0].
+    edgeModule.add(SMinU32(dst=sgpr(guardSgpr), src0=sgpr(guardSgpr), src1=kernel["MIWaveTile"][0],
+                           comment="clamp to maxBlocksPerWave=%d" % kernel["MIWaveTile"][0]))
+
+    self.sgprPool.checkIn(tmpSgpr)
+    self.states.subtileM32ValidBlocksSgpr = guardSgpr
+    self.states.subtileMBlockSize = mBlockSize
+
+  ##############################################################################
+  # _emitSubtileNGuard
+  # Compute numValid16NBlocks for UseSubtileImpl NonEdge path and store it in a
+  # freshly allocated SGPR (saved to self.states.subtileN16ValidBlocksSgpr).
+  #
+  # Algorithm:
+  #   validN         = SizeJ - WG1 * MT1
+  #   waveIdN        = (serial >> 6) >> log2(numWavesM)   (only if numWavesN > 1)
+  #   waveBaseN      = waveIdN * waveGroupN
+  #   validN_wave    = max(validN - waveBaseN, 0)          (skipped if numWavesN == 1)
+  #   clamped        = min(validN_wave, waveGroupN)
+  #   numValid16NBlocks = clamped >> 4                     (16-column blocks)
+  ##############################################################################
+  def _emitSubtileNGuard(self, kernel, edgeModule, numWavesM):
+    waveGroupN    = kernel["MIWaveTile"][1] * kernel["MatrixInstN"]
+    numWavesN     = kernel["MIWaveGroup"][1]
+    log2numWavesM = int(log(numWavesM, 2))
+    mt1           = kernel["MacroTile1"]
+
+    guardSgpr = self.sgprPool.checkOut(1, "subtileN16ValidBlocks")
+    tmpSgpr   = self.sgprPool.checkOut(1, "subtileNTmp")
+
+    edgeModule.addComment1("UseSubtileImpl NonEdge N-guard: compute numValid16NBlocks")
+    # validN = SizeJ - WG1 * MT1
+    edgeModule.add(SMulI32(dst=sgpr(guardSgpr), src0=sgpr("WorkGroup1"), src1=mt1,
+                           comment="WG1 * MT1"))
+    edgeModule.add(SSubU32(dst=sgpr(guardSgpr),
+                           src0=self.sizeRef(kernel["ProblemType"]["Index1"]),
+                           src1=sgpr(guardSgpr),
+                           comment="validN = SizeJ - WG1*MT1"))
+    if numWavesN > 1:
+      # waveIdN = waveId >> log2(numWavesM); waveBaseN = waveIdN * waveGroupN
+      edgeModule.add(VReadfirstlaneB32(dst=sgpr(tmpSgpr), src=vgpr("Serial"),
+                                       comment="lane 0 serial of this wave"))
+      edgeModule.add(SLShiftRightB32(dst=sgpr(tmpSgpr), src=sgpr(tmpSgpr),
+                                     shiftHex=6, comment="waveId = serial >> 6"))
+      edgeModule.add(SLShiftRightB32(dst=sgpr(tmpSgpr), src=sgpr(tmpSgpr),
+                                     shiftHex=log2numWavesM,
+                                     comment="waveIdN = waveId >> log2(numWavesM=%d)" % numWavesM))
+      edgeModule.add(SMulI32(dst=sgpr(tmpSgpr), src0=sgpr(tmpSgpr), src1=waveGroupN,
+                             comment="waveBaseN = waveIdN * waveGroupN(%d)" % waveGroupN))
+      # validN_wave = max(validN - waveBaseN, 0)
+      edgeModule.add(SSubU32(dst=sgpr(guardSgpr), src0=sgpr(guardSgpr), src1=sgpr(tmpSgpr),
+                             comment="validN - waveBaseN; SCC=1 if OOB"))
+      edgeModule.add(SCSelectB32(dst=sgpr(guardSgpr), src0=0, src1=sgpr(guardSgpr),
+                                 comment="0 if OOB, else validN-waveBaseN"))
+    # clamped = min(validN_wave, waveGroupN)
+    # SSubU32 SCC=1 means borrow (validN_wave < waveGroupN) → keep validN_wave; else use waveGroupN.
+    edgeModule.add(SSubU32(dst=sgpr(tmpSgpr), src0=sgpr(guardSgpr), src1=waveGroupN,
+                           comment="validN_wave - waveGroupN; SCC=1 if validN_wave < waveGroupN"))
+    edgeModule.add(SCSelectB32(dst=sgpr(guardSgpr), src0=sgpr(guardSgpr), src1=waveGroupN,
+                               comment="min(validN_wave, waveGroupN)"))
+    # numValid16NBlocks = clamped >> 4  (16-column blocks)
+    edgeModule.add(SLShiftRightB32(dst=sgpr(guardSgpr), src=sgpr(guardSgpr), shiftHex=4,
+                                   comment="numValid16NBlocks = clamped >> 4"))
+
+    self.sgprPool.checkIn(tmpSgpr)
+    self.states.subtileN16ValidBlocksSgpr = guardSgpr
+
+  ##############################################################################
   # checkIsEdge
   # tmpSgpr must have at least 4 free SGPR
   # isEdgeTarget is the branch target if Size % divisor > 0
@@ -12755,6 +13004,8 @@ class KernelWriterAssembly(KernelWriter):
     assert(isinstance(isEdgeTarget, Label))
     isEdgeTargetLabel = isEdgeTarget.getLabelName()
     module = Module("checkIsEdge")
+    dim = "N (isSize1)" if isSize1 else "M"
+    module.addComment1("Edge/NonEdge store path check (%s): Size %% %d > 0 -> Edge store; else -> NonEdge store" % (dim, divisor))
     tmpS0  = tmpSgprInfo.idx
     tmpS1  = tmpS0 + 1
     tmpS23 = tmpS1 + 1
@@ -13782,6 +14033,23 @@ class KernelWriterAssembly(KernelWriter):
     #edgeModule.addComment("storeStats, %d, %d, %d"% (edge, numSgprs, numElementsPerBatch))
     # so if we don't have *GPR resources to handle a larger batch then need
     # to mark overflowedResources rather than generate a kernel that won't work.
+
+    # UseSubtileImpl NonEdge guard: compute numValidMBlocks / numValidNBlocks so
+    # stores can skip OOB wave groups.  Active for any NonEdge UseSubtileImpl path
+    # that is not multi-buffer GSU accumulation.
+    isSubtileNonEdge = (
+      not edge
+      and kernel.get("UseSubtileImpl")
+      and kernel["_GlobalAccumulation"] not in ("MultipleBufferSingleKernel", "MultipleBuffer")
+    )
+    if isSubtileNonEdge:
+      self._emitSubtileMGuard(kernel, edgeModule)
+      self._emitSubtileNGuard(kernel, edgeModule, numWavesM=kernel["MIWaveGroup"][0])
+    else:
+      self.states.subtileM32ValidBlocksSgpr = None
+      self.states.subtileN16ValidBlocksSgpr = None
+      self.states.subtileMBlockSize = 0
+
     # Activation
     actLoopEndLabel, actLoopLabelModules, actLoopEnumStrList = self.initActivationLoop(kernel, beta)
     actLoopModuleList = []
@@ -13842,7 +14110,14 @@ class KernelWriterAssembly(KernelWriter):
         actLoopModuleCodeLength.append(countInstruction(actLoopModule))
 
     #################
-    # Free after final vgpr vcalculation
+    # Free after final vgpr calculation
+    if self.states.subtileM32ValidBlocksSgpr is not None:
+      self.sgprPool.checkIn(self.states.subtileM32ValidBlocksSgpr)
+      self.sgprPool.checkIn(self.states.subtileN16ValidBlocksSgpr)
+      self.states.subtileM32ValidBlocksSgpr = None
+      self.states.subtileN16ValidBlocksSgpr = None
+      self.states.subtileMBlockSize = 0
+
     if tmpVgprDynamic:
       self.vgprPool.checkIn(tmpVgprDynamic.idx)
 
