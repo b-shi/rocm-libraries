@@ -3962,14 +3962,26 @@ class KernelWriterAssembly(KernelWriter):
     isMX = tc in ("MXSA", "MXSB")
     # UseSubtileImpl uses a tile-boundary fixed Srd+2 for both MX scale and data A/B.
     # This avoids 32-bit overflow when computing the full tensor2dSize (N*K or M*K > 2^32).
-    useFixedSrd2 = bool(kernel.get("UseSubtileImpl"))
+    useSubtile = bool(kernel.get("UseSubtileImpl"))
+    useFixedSrd2 = useSubtile
+    isPreShuffledAB = tc in ("A", "B") and kernel["ProblemType"].get("SwizzleTensor%s" % tc, False)
+    isSwizzled = isMX or isPreShuffledAB
     if isMX:
       tcab = "A" if tc == "MXSA" else "B"
       mxBlock = kernel["ProblemType"]["MXBlock%s"%tcab]
-      mxSwizzleSize0 = 32 # M,N direction
-      mxSwizzleSize1 = 256 # K direction
-      mxSwizzleBlockSize = mxSwizzleSize0 * mxSwizzleSize1 // mxBlock
-    allocateTensor2dSize = use64bShadowLimit and not isMX
+      swizzleSize0 = 32 # M,N direction
+      swizzleSize1 = 256 # K direction
+      swizzleBlockSize = swizzleSize0 * swizzleSize1 // mxBlock
+    else:
+      if isSwizzled:
+        swizzleSize0 = 16 # M,N direction
+        swizzleSize1 = 32 # K direction for MXFP4 (TODO: use bpe to support different dataTypes)
+      else:
+        swizzleSize0 = 1 # M,N direction
+        swizzleSize1 = 1 # K direction
+      swizzleBlockSize = swizzleSize0 * swizzleSize1
+
+    allocateTensor2dSize = use64bShadowLimit and not useFixedSrd2
     numDim = len(indices)
     with self.allocTmpSgpr(2 + 2 + (0 if allocateTensor2dSize else 2)) as tmpSgprInfo:
       stmp = tmpSgprInfo.idx
@@ -3993,10 +4005,10 @@ class KernelWriterAssembly(KernelWriter):
         #tP['ia'][1]
 
         # This is guaranteed to fit in 32-bit since the WG*MT is a number of elements in some unsigned direction:
-        if isMX and kernel.get("UseSubtileImpl"):
-          # UseSubtileImpl MX swizzled (pre-shuffle) case: tile start uses roundup(MT/mxSwizzleSize0)
-          mt = roundUp(kernel[tP["mt"]] / mxSwizzleSize0)
-          module.addModuleAsFlatItems(self.s_mul_u64_u32(sgpr(tileStart+0), sgpr(tileStart+1), sgpr(tP["wg"]), mt, comment="WorkGroup[01] * roundup(MT/%u)"%mxSwizzleSize0))
+        if useFixedSrd2:
+          # UseSubtileImpl fixedSrd2 case (including swizzle and nonSwizzle): tile start uses roundup(MT/swizzleSize0)
+          mt = roundUp(kernel[tP["mt"]] / swizzleSize0)
+          module.addModuleAsFlatItems(self.s_mul_u64_u32(sgpr(tileStart+0), sgpr(tileStart+1), sgpr(tP["wg"]), mt, comment="WorkGroup[01] * roundup(MT/%u)"%swizzleSize0))
         else:
           module.addModuleAsFlatItems(self.s_mul_u64_u32(sgpr(tileStart+0), sgpr(tileStart+1), sgpr(tP["wg"]), kernel[tP["mt"]], comment="WorkGroup[01] * MT"))
 
@@ -4045,42 +4057,32 @@ class KernelWriterAssembly(KernelWriter):
           module.add(SMovB32(dst=sgpr(tileStart+1), src=0))
         strideF = self.strideRef(tc, tP['tileIdx'])
         if not self.isConstUnitStride(strideF):
-          if kernel.get("UseSubtileImpl") and useFixedSrd2:
+          if useFixedSrd2:
             # Tile-boundary SRD+2 for UseSubtileImpl (unified for MX scale and data A/B).
             # Avoids 32-bit overflow from computing full tensor2dSize when N*K or M*K > 2^32.
             #
-            # MX scale:  tileStart is in block units (roundUp(MT/mxSwizzleSize0)).
-            #   numLine = min(roundUp(size/mxSwizzleSize0) - tileStart_blk, roundUp(MT/mxSwizzleSize0)) - 1
-            #   Srd+2   = numLine * stride_bytes + mxSwizzleBlockSize*(DepthU/mxSwizzleSize1)
-            #
-            # Data A/B:  tileStart is in element units (WG * MT).
-            #   numLine = min(size - WG*MT, MT) - 1
-            #   Srd+2   = (numLine * stride_elements + DepthU) * bpe
+            # tileStart is in block units (roundUp(MT/swizzleSize0)).
+            #   numLine = min(roundUp(size/swizzleSize0) - tileStart_blk, roundUp(MT/swizzleSize0)) - 1
+            #   Srd+2   = numLine * stride_bytes + swizzleBlockSize*(DepthU/swizzleSize1)
             #
             # Key: numLine/numElems <= MT (compile-time), so the multiply stays in 32 bits.
-            if isMX:
-              mt_units    = mt  # roundUp(MT/mxSwizzleSize0), compile-time
-              extra_bytes = mxSwizzleBlockSize * (kernel["DepthU"] // mxSwizzleSize1)
-            else:
-              mt_units    = kernel[tP["mt"]]  # MT0 or MT1, compile-time
-              extra_bytes = kernel["DepthU"]  # one K step in elements
+            mt_units    = mt  # roundUp(MT/swizzleSize0), compile-time
+            extra_bytes = swizzleBlockSize * (kernel["DepthU"] // swizzleSize1)
 
             for i in range(0, numDim):
               idx = indices[i]
               if idx == kernel["ProblemType"]["Index0"] or idx == kernel["ProblemType"]["Index1"]:
                 size = self.sizeRef(idx)
-                if isMX:
-                  # tileStart already in block units (WG * roundUp(MT/mxSwizzleSize0))
-                  module.add(SAddU32(dst=sgpr(stmp+0), src0=size, src1=(mxSwizzleSize0 - 1), comment="size + %u - 1"%mxSwizzleSize0))
-                  module.add(SLShiftRightB32(dst=sgpr(stmp+0), src=sgpr(stmp+0), shiftHex=log2(mxSwizzleSize0), comment="roundup(size/%u)"%mxSwizzleSize0))
-                  module.add(SSubU32(dst=sgpr(stmp+0), src0=sgpr(stmp+0), src1=sgpr(tileStart+0), comment="numBlkToEnd = roundUp(size/%u) - tileStart_blk"%mxSwizzleSize0))
-                  module.add(SMinU32(dst=sgpr(stmp+0), src0=sgpr(stmp+0), src1=mt_units, comment="min (numBlkToEnd, roundup(MT/%u))"%mxSwizzleSize0))
-                  module.add(SSubU32(dst=sgpr(stmp+0), src0=sgpr(stmp+0), src1=1, comment="numLine = min - 1 (0-based index)"))
+                if isSwizzled:
+                  # tileStart already in block units (WG * roundUp(MT/swizzleSize0))
+                  module.add(SAddU32(dst=sgpr(stmp+0), src0=size, src1=(swizzleSize0 - 1), comment="size + %u - 1"%swizzleSize0))
+                  module.add(SLShiftRightB32(dst=sgpr(stmp+0), src=sgpr(stmp+0), shiftHex=log2(swizzleSize0), comment="roundup(size/%u)"%swizzleSize0))
+                  module.add(SSubU32(dst=sgpr(stmp+0), src0=sgpr(stmp+0), src1=sgpr(tileStart+0), comment="numBlkToEnd = roundUp(size/%u) - tileStart_blk"%swizzleSize0))
                 else:
                   # tileStart in element units (WG * MT); no block rounding needed
                   module.add(SSubU32(dst=sgpr(stmp+0), src0=size, src1=sgpr(tileStart+0), comment="numToEnd = size - WG*MT"))
-                  module.add(SMinU32(dst=sgpr(stmp+0), src0=sgpr(stmp+0), src1=mt_units, comment="min(numToEnd, MT)"))
-                  module.add(SSubU32(dst=sgpr(stmp+0), src0=sgpr(stmp+0), src1=1, comment="numLine = min - 1 (0-based index)"))
+                module.add(SMinU32(dst=sgpr(stmp+0), src0=sgpr(stmp+0), src1=mt_units, comment="min (numBlkToEnd, roundup(MT/%u))"%swizzleSize0))
+                module.add(SSubU32(dst=sgpr(stmp+0), src0=sgpr(stmp+0), src1=1, comment="numLine = min - 1 (0-based index)"))
                 module.addModuleAsFlatItems(self.s_mul_u64_u32(sgpr(stmp+0), sgpr(stmp+1), sgpr(stmp+0), \
                           strideF, comment="numLine * stride"))
                 if isMX:
