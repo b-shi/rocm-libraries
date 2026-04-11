@@ -111,6 +111,13 @@ class GlobalWriteBatchWriter:
     self.factorDim = factorDim
     self.amdClangVersion = amdClangVersion
 
+    # Stateful tracking for N-group OOB guard deduplication (_emitSubtileOobGuard).
+    # The outer loop iterates N-outer / M-inner, so all M elements within a fixed N
+    # group share the same N guard result.  We emit the N s_cmp/s_cbranch only once
+    # per N group and skip it for subsequent M elements in the same group.
+    self._subtilePrevBlockIdxN = -1       # sentinel: no group seen yet
+    self._subtileNGroupSkipLabel = None   # N-group skip label pending placement
+
     # Internal state for GlobalWriteBatch
     # 0 for None, 1 for WorkGroupReduction = False, 2 for WorkGroupReduction = True
     self.storeBiasD = 0
@@ -421,6 +428,29 @@ class GlobalWriteBatchWriter:
       if self.beta:
         module.add(addrCalc.emitLdChange(self.kernel, self.ss, 'C', self.edge, self.beta, mask, bufferOOB, (elementIdx == 0), self.tmpVgpr, self.tmpSgpr, addrCVgpr, self.addrC, 0))
         if dataBeta not in loadedDataBeta:
+          # In the UseSubtileImpl NonEdge path the workgroup-level edge check is relaxed
+          # (subtile-aligned remainder is allowed into NonEdge), so individual waves may
+          # own rows/columns beyond the valid output region.  Gate each C load by writing
+          # SrdC+2 (num_records): BufferOOB → normal load, 0 → hardware returns zero.
+          mOffSgpr = self.parentWriter.states.subtileCloadMoffSgpr
+          if not self.edge and mOffSgpr is not None:
+            # element = (d1, d0, vc1, vc0) where d0 → M (row) dimension, d1 → N (col) dimension.
+            d1, d0 = element[0], element[1]
+            mGuardSgpr = self.parentWriter.states.subtileM32ValidBlocksSgpr
+            nGuardSgpr = self.parentWriter.states.subtileN16ValidBlocksSgpr
+            # Update M result once per d0 group (on the first d1 of each row group).
+            # s_cselect_b32 supports one 32-bit literal (src0) + one inline constant (src1),
+            # so BufferOOB can be used directly as src0 without a prior s_mov_b32.
+            if d1 == 0:
+              module.add(SCmpKGtU32(src=sgpr(mGuardSgpr), simm16=d0,
+                                    comment="subtile C load: numMBlocks > d0=%d?" % d0))
+              module.add(SCSelectB32(dst=sgpr(mOffSgpr), src0="BufferOOB", src1=0,
+                                     comment="mOff = BufferOOB if M valid, else 0"))
+            # Set SrdC+2: BufferOOB if both M and N valid, else 0 (skip load).
+            module.add(SCmpKGtU32(src=sgpr(nGuardSgpr), simm16=d1,
+                                  comment="subtile C load: numNBlocks > d1=%d?" % d1))
+            module.add(SCSelectB32(dst=sgpr("SrdC+2"), src0=sgpr(mOffSgpr), src1=0,
+                                   comment="SrdC+2 = mOff if N valid, else 0 (skip load)"))
           if self.kernel["GroupLoadStore"]:
             loadInputCode.add(self.parentWriter.readInput(self.kernel, self.ss, 'C', self.kernel["ProblemType"]["DestDataType"], addrCalc, vc0, data, self.gwvw, addrCVgpr, self.tmpS01))
           else:
@@ -577,6 +607,13 @@ class GlobalWriteBatchWriter:
           module.add(VAddU32(vgpr(self.parentWriter.vgprs.storeRemapCoord1), vgpr(self.parentWriter.vgprs.storeRemapCoord1), vgpr(self.tmpVgpr), "shift storeRemap coord1"))
 
     module.add(loadInputCode)
+
+    # Restore SrdC+2 = BufferOOB after subtile NonEdge C-load OOB gating (which may have set it to 0).
+    if self.beta and not self.edge:
+      mOffSgpr = self.parentWriter.states.subtileCloadMoffSgpr
+      if mOffSgpr is not None:
+        module.add(SMovB32(dst=sgpr("SrdC+2"), src="BufferOOB",
+                           comment="restore SrdC+2 after subtile NonEdge C-load OOB gating"))
 
     if self.beta and self.kernel["StoreSyncOpt"]:
       self._storeSyncOpt(module)
@@ -1356,6 +1393,9 @@ class GlobalWriteBatchWriter:
           if self.storeBiasD == 1:
             self.storesIssued += 1
 
+    # Close the last N-group OOB skip label (if any) opened by _emitSubtileOobGuard.
+    self._finalizeSubtileOobGuards(storeCode if self.kernel["GroupLoadStore"] else module)
+
     module.add(storeCode)
 
     if self.parentWriter.db["CheckStoreC"]>=0:
@@ -1485,34 +1525,65 @@ class GlobalWriteBatchWriter:
     For a store at (blockIdxM, blockIdxN):
       - If numValidMBlocks <= blockIdxM the wave group's M region is fully OOB → skip.
       - If numValidNBlocks <= blockIdxN the wave group's N region is fully OOB → skip.
-    Both checks branch to the same skip label; the label is placed by the caller
-    immediately after the guarded store instruction(s).
+    The N guard is emitted ONCE per N group (when blockIdxN changes) because the
+    element loop is N-outer / M-inner: all M elements in the same N group share the
+    same N guard result.  The per-element skip label covers only the M guard; the
+    N-group skip label spans the entire N group and is placed by
+    _finalizeSubtileOobGuards (called once after the element loop).
 
-    Returns the skip Label to append *after* the guarded store, or None if no
-    guard SGPRs are available (edge tiles / guard disabled).
+    Returns the per-element skip Label (M guard) to append *after* the guarded
+    store, or None if no guard SGPRs are available (edge tiles / guard disabled).
     """
     guardMSgpr = self.parentWriter.states.subtileM32ValidBlocksSgpr
     guardNSgpr = self.parentWriter.states.subtileN16ValidBlocksSgpr
     # No guard SGPRs means the store is always in-bounds for this path; nothing to emit.
     if guardMSgpr is None and guardNSgpr is None:
       return None
+
+    # --- N-group guard (emitted once per unique blockIdxN) ---
+    # Quick-exit: s_cmp_gt_u32 sets SCC=1 if numValidNBlocks > blockIdxN (N in-bounds).
+    # s_cbranch_scc0 skips the entire N group when SCC=0 (N OOB).
+    if guardNSgpr is not None and blockIdxN != self._subtilePrevBlockIdxN:
+      # Close the previous N group's skip label (if any) before starting a new group.
+      if self._subtileNGroupSkipLabel is not None:
+        targetModule.add(self._subtileNGroupSkipLabel)
+        self._subtileNGroupSkipLabel = None
+      nGroupLabelName = self.parentWriter.labels.getNameInc(
+        f"{labelPrefix}_N{blockIdxN}_group")
+      nGroupLabel = Label(nGroupLabelName,
+                          f"skip OOB store N group blockIdxN={blockIdxN}")
+      targetModule.add(SCmpKGtU32(src=sgpr(guardNSgpr), simm16=blockIdxN,
+                                   comment=f"quick-exit: numValidNBlocks > {blockIdxN}? (OOB -> skip N group)"))
+      targetModule.add(SCBranchSCC0(labelName=nGroupLabel.getLabelName(),
+                                     comment=f"quick-exit: N OOB at blockIdxN={blockIdxN}, skip N group"))
+      self._subtileNGroupSkipLabel = nGroupLabel
+      self._subtilePrevBlockIdxN = blockIdxN
+
+    # --- M guard (emitted per element) ---
+    # Quick-exit: s_cmp_gt_u32 sets SCC=1 if numValidMBlocks > blockIdxM (M in-bounds).
+    # s_cbranch_scc0 jumps past the store when SCC=0 (M OOB).
+    if guardMSgpr is None:
+      return None
     skipLabelName = self.parentWriter.labels.getNameInc(
       f"{labelPrefix}_M{blockIdxM}_N{blockIdxN}")
     skipLabel = Label(skipLabelName,
                       f"skip OOB store blockIdxM={blockIdxM} blockIdxN={blockIdxN}")
-    # Quick-exit: s_cmp_gt_u32 sets SCC=1 if numValidBlocks > blockIdx (store is in-bounds).
-    # s_cbranch_scc0 jumps past the store when SCC=0 (wave group is OOB -> skip store).
-    if guardMSgpr is not None:
-      targetModule.add(SCmpKGtU32(src=sgpr(guardMSgpr), simm16=blockIdxM,
-                                   comment=f"quick-exit: numValidMBlocks > {blockIdxM}? (OOB -> skip store)"))
-      targetModule.add(SCBranchSCC0(labelName=skipLabel.getLabelName(),
-                                     comment=f"quick-exit: M OOB at blockIdxM={blockIdxM}, skip store"))
-    if guardNSgpr is not None:
-      targetModule.add(SCmpKGtU32(src=sgpr(guardNSgpr), simm16=blockIdxN,
-                                   comment=f"quick-exit: numValidNBlocks > {blockIdxN}? (OOB -> skip store)"))
-      targetModule.add(SCBranchSCC0(labelName=skipLabel.getLabelName(),
-                                     comment=f"quick-exit: N OOB at blockIdxN={blockIdxN}, skip store"))
+    targetModule.add(SCmpKGtU32(src=sgpr(guardMSgpr), simm16=blockIdxM,
+                                 comment=f"quick-exit: numValidMBlocks > {blockIdxM}? (OOB -> skip store)"))
+    targetModule.add(SCBranchSCC0(labelName=skipLabel.getLabelName(),
+                                   comment=f"quick-exit: M OOB at blockIdxM={blockIdxM}, skip store"))
     return skipLabel
+
+  def _finalizeSubtileOobGuards(self, targetModule):
+    """Place the pending N-group skip label after the last element in the loop.
+
+    Must be called once, after all elements have been emitted (just before
+    module.add(storeCode)) to close out the last N group opened by
+    _emitSubtileOobGuard.
+    """
+    if self._subtileNGroupSkipLabel is not None:
+      targetModule.add(self._subtileNGroupSkipLabel)
+      self._subtileNGroupSkipLabel = None
 
   def _emit16bitSubtilePairedStore(self, addrCalc, sumIdx0: int, sumIdx1: int, prefixOffset: int, tt0: int = 0) -> Module:
     """Emit a paired 16bit store combining sba=0 and sba=1 subtile data.

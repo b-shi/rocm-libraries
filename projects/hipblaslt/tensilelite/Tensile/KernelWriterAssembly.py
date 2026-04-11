@@ -12913,7 +12913,7 @@ class KernelWriterAssembly(KernelWriter):
     tmpM       = self.sgprPool.checkOut(1, "subtileWaveIdM")
     tmpN       = self.sgprPool.checkOut(1, "subtileWaveIdN")
 
-    edgeModule.addComment1("UseSubtileImpl NonEdge guards: numValidMBlocks (blockSize=%d) and numValid16NBlocks" % mBlockSize)
+    edgeModule.addComment1("UseSubtileImpl NonEdge guards: numValidD1Steps (MatrixInstM=%d) and numValid16NBlocks" % kernel["MatrixInstM"])
 
     # Read waveId once; extract M (lower bits) and N (upper bits) before AND destroys waveId.
     edgeModule.add(VReadfirstlaneB32(dst=sgpr(tmpM), src=vgpr("Serial"),
@@ -12929,7 +12929,12 @@ class KernelWriterAssembly(KernelWriter):
                            comment="waveIdM = waveId & (numWavesM-1=%d)" % (numWavesM - 1)))
 
     # --- M guard ---
-    edgeModule.addComment0("M-guard: numValidMBlocks = min(ceil(max(validM-waveBase,0)/%d), MIWaveTile[0]=%d)" % (mBlockSize, kernel["MIWaveTile"][0]))
+    # Each d1 step in the C-load batch corresponds to MatrixInstM rows.
+    # We compute numValidD1Steps = min(ceil(max(validM-waveBase,0)/MatrixInstM), MIWaveTile[0]).
+    # The guard check is (numValidD1Steps > d1): true iff this wave's d1-th block has valid rows.
+    miM      = kernel["MatrixInstM"]
+    miMShift = int(log(miM, 2))
+    edgeModule.addComment0("M-guard: numValidD1Steps = min(ceil(max(validM-waveBase,0)/%d), MIWaveTile[0]=%d)" % (miM, kernel["MIWaveTile"][0]))
     edgeModule.add(SMulI32(dst=sgpr(mGuardSgpr), src0=sgpr("WorkGroup0"), src1=mt0,
                            comment="WG0 * MT0"))
     edgeModule.add(SSubU32(dst=sgpr(mGuardSgpr), src0=sgpr("SizeI"), src1=sgpr(mGuardSgpr),
@@ -12940,11 +12945,11 @@ class KernelWriterAssembly(KernelWriter):
                            comment="validM - waveBase; SCC=1 if OOB"))
     edgeModule.add(SCSelectB32(dst=sgpr(mGuardSgpr), src0=0, src1=sgpr(mGuardSgpr),
                                comment="remainder = 0 if OOB"))
-    edgeModule.add(SAddU32(dst=sgpr(mGuardSgpr), src0=sgpr(mGuardSgpr), src1=mBlockSize - 1,
-                           comment="ceil: remainder + (%d-1)" % mBlockSize))
-    edgeModule.add(SLShiftRightB32(dst=sgpr(mGuardSgpr), src=sgpr(mGuardSgpr), shiftHex=mBlockShift,
-                                   comment="numValidMBlocks = ceil(remainder / %d)" % mBlockSize))
-    # Clamp: guard comparison is (numValidMBlocks > blockIdxM); blockIdxM < MIWaveTile[0] always.
+    edgeModule.add(SAddU32(dst=sgpr(mGuardSgpr), src0=sgpr(mGuardSgpr), src1=miM - 1,
+                           comment="ceil: remainder + (%d-1)" % miM))
+    edgeModule.add(SLShiftRightB32(dst=sgpr(mGuardSgpr), src=sgpr(mGuardSgpr), shiftHex=miMShift,
+                                   comment="numValidD1Steps = ceil(remainder / %d)" % miM))
+    # Clamp: guard comparison is (numValidD1Steps > d1); d1 < MIWaveTile[0] always.
     edgeModule.add(SMinU32(dst=sgpr(mGuardSgpr), src0=sgpr(mGuardSgpr), src1=kernel["MIWaveTile"][0],
                            comment="clamp to MIWaveTile[0]=%d" % kernel["MIWaveTile"][0]))
     self.sgprPool.checkIn(tmpM)
@@ -12973,9 +12978,14 @@ class KernelWriterAssembly(KernelWriter):
                                    comment="numValid16NBlocks = clamped >> 4"))
     self.sgprPool.checkIn(tmpN)
 
+    # One extra SGPR used by GlobalWriteBatch to gate beta C loads via SrdC+2:
+    #   mOffSgpr: BufferOOB if this wave's M block is valid, else 0
+    mOffSgpr = self.sgprPool.checkOut(1, "subtileCloadMoff")
+
     self.states.subtileM32ValidBlocksSgpr = mGuardSgpr
     self.states.subtileN16ValidBlocksSgpr = nGuardSgpr
     self.states.subtileMBlockSize = mBlockSize
+    self.states.subtileCloadMoffSgpr = mOffSgpr
 
   ##############################################################################
   # checkIsEdge
@@ -14030,6 +14040,7 @@ class KernelWriterAssembly(KernelWriter):
       self.states.subtileM32ValidBlocksSgpr = None
       self.states.subtileN16ValidBlocksSgpr = None
       self.states.subtileMBlockSize = 0
+      self.states.subtileCloadMoffSgpr = None
 
     # Activation
     actLoopEndLabel, actLoopLabelModules, actLoopEnumStrList = self.initActivationLoop(kernel, beta)
@@ -14095,9 +14106,11 @@ class KernelWriterAssembly(KernelWriter):
     if self.states.subtileM32ValidBlocksSgpr is not None:
       self.sgprPool.checkIn(self.states.subtileM32ValidBlocksSgpr)
       self.sgprPool.checkIn(self.states.subtileN16ValidBlocksSgpr)
+      self.sgprPool.checkIn(self.states.subtileCloadMoffSgpr)
       self.states.subtileM32ValidBlocksSgpr = None
       self.states.subtileN16ValidBlocksSgpr = None
       self.states.subtileMBlockSize = 0
+      self.states.subtileCloadMoffSgpr = None
 
     if tmpVgprDynamic:
       self.vgprPool.checkIn(tmpVgprDynamic.idx)

@@ -12,7 +12,7 @@ GlobalParameters:
   MaxWorkspaceSize: 13421772800
   DataInitTypeA: 3
   DataInitTypeB: 3
-  DataInitTypeC: 0
+  DataInitTypeC: 3
   DataInitTypeAlpha: 1
   DataInitTypeBeta: 2
   DataInitTypeBias: 1
