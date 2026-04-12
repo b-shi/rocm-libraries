@@ -5,9 +5,9 @@ into Partitions, again split into subIterK steps.
 
 Naming conventions:
   - Partition:  A rectangle of subtiles (partitionSizeA x partitionSizeB)
-                processed together in one mainloop step. 
-  - subIterK:   K-dimension sub-iteration within a partition. Each subtile's
-                data is split along K into numSubIterK chunks (hardcoded to 2).
+                processed together in one mainloop step. This includes all K dimensions for those subtiles.
+  - subtileK:   K index of the partition's subtile in the Macrotile.
+  - subIterK:   K-index of the MFMA tiles within each subtiles (range [0,1] with current subtile shape)
   - MT iteration (macrotile iteration): Which macrotile's data is being
                 referenced. "n" = current iteration, "n+1" = next iteration, "n+2" = two ahead.
 
@@ -171,19 +171,22 @@ class VGPRTileAllocator:
 @dataclass
 class MFMAOp:
     mtIteration: str  # e.g. "n"
-    subIterK: int
+    subtileK: int     # subtiles K index
+    subIterK: int     # MFMA k index within subtile
     subtiles: List[Tuple[int, int]]
+    # Mapping to vgprTiles for values & scales
     vgprTileMapA: Dict[int, int]
     vgprTileMapB: Dict[int, int]
-    scaleMapA: Dict[int, int] = field(default_factory=dict)  # scaleGroupIdx → scaleVgprTileId
+    scaleMapA: Dict[int, int] = field(default_factory=dict)
     scaleMapB: Dict[int, int] = field(default_factory=dict)
 
 
 @dataclass
 class GROp:
     mtIteration: str  # e.g. "n+1", "n+2", "0", "1"
-    subtileA: List[int]
-    subtileB: List[int]
+    subtileA: List[int]  # M-dim subtile indices
+    subtileB: List[int]  # N-dim subtile indices
+    subtileK: int = 0        # subtiles K index
     lastForMT: bool = False  # True = last partition's GR for this MT → emit ptrUpdate+swap
     firstForMT: bool = False # True = first partition's GR for this MT → emit scale loads
 
@@ -211,7 +214,8 @@ class SyncOp:
 
 @dataclass
 class LROp:
-    mtIteration: str  # e.g. "n", "n+1", "0"
+    mtIteration: str
+    subtileK: int
     subIterK: int
     lrLoadA: Dict[int, int]
     lrLoadB: Dict[int, int]
@@ -281,8 +285,9 @@ class PartitionGR:
 
 @dataclass
 class SubIterKSchedule:
-    """Ops for one subIterK iteration within a partition."""
-    subIterK: int
+    """Ops for one (subtileK, subIterK) step within a partition."""
+    subtileK: int      # subtile K index (0..numSubtileK-1)
+    subIterK: int      # localK within subtile (0..subtileShapeK-1)
     modules: List[AnnotatedModule] = field(default_factory=list)
 
 
@@ -579,18 +584,18 @@ class SubtileBasedScheduler:
         self.numPartitionsA = self.MTA // config.partitionSizeA
         self.numPartitionsB = self.MTB // config.partitionSizeB
 
-        self.numSubIterK = tileInfoA.subtileShape[1]
-        assert self.numSubIterK == tileInfoB.subtileShape[1], \
+        self.subtileShapeK = tileInfoA.subtileShape[1]
+        assert self.subtileShapeK == tileInfoB.subtileShape[1], \
             "A and B must have same subtileShape[1]"
-        assert tileInfoA.localSubtileGrid[1] == 1, \
-            f"Scheduler requires localSubtileGrid[1]==1 for A, got {tileInfoA.localSubtileGrid[1]}"
-        assert tileInfoB.localSubtileGrid[1] == 1, \
-            f"Scheduler requires localSubtileGrid[1]==1 for B, got {tileInfoB.localSubtileGrid[1]}"
+        self.numSubtileK = tileInfoA.localSubtileGrid[1]
+        self.numSubIterK = self.subtileShapeK  # intra-subtile K steps only
 
         self.partitions: List[Partition] = self._buildPartitions()
         self.allocator = VGPRTileAllocator()
 
         # Scale VGPR tile IDs are deterministic: gid for A, numScaleGroupsA + gid for B.
+        # Each scale VGPR covers 2 M-adjacent subtiles × 2 localK (4 E8M0 bytes).
+        # Subtile K indices reuse the same VGPRs (consumed sequentially).
         self.numScaleGroupsA = math.ceil(self.MTA / 2) if self.hasScale else 0
         self.numScaleGroupsB = math.ceil(self.MTB / 2) if self.hasScale else 0
         self.totalScaleVGPRTiles = self.numScaleGroupsA + self.numScaleGroupsB
@@ -605,7 +610,8 @@ class SubtileBasedScheduler:
 
     def scaleVid(self, tc: str, subtileIdx: int) -> Tuple[int, int]:
         """Deterministic scale VGPR tile ID for the group containing subtileIdx.
-        Returns (scaleGroupIdx, vgprTileId)."""
+        Returns (scaleGroupIdx, vgprTileId).
+        Subtile K indices reuse the same VGPRs — they are reloaded per subtileK."""
         gid = subtileIdx // 2
         vid = gid if tc == 'A' else self.numScaleGroupsA + gid
         return gid, vid
@@ -692,40 +698,44 @@ class SubtileBasedScheduler:
         preloadMT1_A = list(first.tileAIndices)
         preloadMT1_B = list(first.tileBIndices)
 
-        # Number of subIterK to preload LR for
+        # Preload range: HALF preloads (subtileK=0, localK=0) only; FULL preloads all
         if self.config.prefetchMode == PrefetchMode.HALF_PREFETCH:
-            numPreloadSubIterKs = 1
+            numPreloadSId1s = 1
+            numPreloadLocalKs = 1
         elif self.config.prefetchMode == PrefetchMode.FULL_PREFETCH:
-            numPreloadSubIterKs = self.numSubIterK
+            numPreloadSId1s = self.numSubtileK
+            numPreloadLocalKs = self.numSubIterK
 
         # Allocate VGPRs for first group and build LR maps
         lrOps = []
-        for sik in range(numPreloadSubIterKs):
-            lrLoadA = {}
-            lrLoadB = {}
-            for tA in first.tileAIndices:
-                lrLoadA[tA] = self.allocator.allocate('A', tA, sik)
-            for tB in first.tileBIndices:
-                lrLoadB[tB] = self.allocator.allocate('B', tB, sik)
-
-            # Allocate scale VGPRs at subIterK==0 (scale is constant across subIterK)
-            lrScaleA = {}
-            lrScaleB = {}
-            if self.hasScale and sik == 0:
+        for subtileK in range(numPreloadSId1s):
+            for localK in range(numPreloadLocalKs):
+                flatK = subtileK * self.subtileShapeK + localK
+                lrLoadA = {}
+                lrLoadB = {}
                 for tA in first.tileAIndices:
-                    gid, vid = self.scaleVid('A', tA)
-                    lrScaleA.setdefault(gid, vid)
+                    lrLoadA[tA] = self.allocator.allocate('A', tA, flatK)
                 for tB in first.tileBIndices:
-                    gid, vid = self.scaleVid('B', tB)
-                    lrScaleB.setdefault(gid, vid)
+                    lrLoadB[tB] = self.allocator.allocate('B', tB, flatK)
 
-            lrOps.append(LROp(mtIteration="0", subIterK=sik,
-                              lrLoadA=lrLoadA, lrLoadB=lrLoadB,
-                              lrScaleA=lrScaleA, lrScaleB=lrScaleB))
+                # Allocate scale VGPRs at the start of each subtile K index
+                lrScaleA = {}
+                lrScaleB = {}
+                if self.hasScale and localK == 0:
+                    for tA in first.tileAIndices:
+                        gid, vid = self.scaleVid('A', tA)
+                        lrScaleA.setdefault(gid, vid)
+                    for tB in first.tileBIndices:
+                        gid, vid = self.scaleVid('B', tB)
+                        lrScaleB.setdefault(gid, vid)
 
-        # Build preloop steps: GR(MT0) split by partition, WAIT, LR(MT0), SKIP guards, GR(MT1)
+                lrOps.append(LROp(mtIteration="0", subtileK=subtileK, subIterK=localK,
+                                  lrLoadA=lrLoadA, lrLoadB=lrLoadB,
+                                  lrScaleA=lrScaleA, lrScaleB=lrScaleB))
+
+        # Build preloop steps: GR(MT0) split by partition × subtileK, WAIT, LR(MT0), SKIP guards, GR(MT1)
         preloopOps: List[ScheduleOp] = []
-        # Split MT 0 GR by partition with dedup (same order as mainloop)
+        # Split MT 0 GR by partition with dedup, one GR per (partition, subtileK)
         loadedA: Set[int] = set()
         loadedB: Set[int] = set()
         for partition in self.partitions:
@@ -734,9 +744,10 @@ class SubtileBasedScheduler:
             loadedA.update(partition.tileAIndices)
             loadedB.update(partition.tileBIndices)
             if grA or grB:
-                preloopOps.append(GROp(mtIteration="0",
-                                       subtileA=grA, subtileB=grB,
-                                       lastForMT=False))
+                for subtileK in range(self.numSubtileK):
+                    preloopOps.append(GROp(mtIteration="0",
+                                           subtileA=grA, subtileB=grB, subtileK=subtileK,
+                                           lastForMT=False))
         # Mark the first MT 0 GR as firstForMT
         for i in range(len(preloopOps)):
             if isinstance(preloopOps[i], GROp):
@@ -759,28 +770,32 @@ class SubtileBasedScheduler:
         nllTarget = "NLLEarly" if self.hasScale else "NLL"
         preloopOps.append(SkipOp(compare="LE", value=1, target=nllTarget))
         mt1Complete = (set(preloadMT1_A) == set(allA) and set(preloadMT1_B) == set(allB))
-        preloopOps.append(GROp(mtIteration="1",
-                               subtileA=preloadMT1_A, subtileB=preloadMT1_B,
-                               firstForMT=True, lastForMT=mt1Complete))
+        for subtileK in range(self.numSubtileK):
+            isFirstSId1 = (subtileK == 0)
+            isLastSId1 = (subtileK == self.numSubtileK - 1)
+            preloopOps.append(GROp(mtIteration="1",
+                                   subtileA=preloadMT1_A, subtileB=preloadMT1_B, subtileK=subtileK,
+                                   firstForMT=isFirstSId1, lastForMT=mt1Complete and isLastSId1))
         if mt1Complete:
             preloopOps.append(GR_INCOp())
         preloopOps.append(SkipOp(compare="LE", value=2, target="NGLL"))
-        preloopSik = SubIterKSchedule(subIterK=0)
+        preloopSik = SubIterKSchedule(subtileK=0, subIterK=0)
         preloopSik.modules = [AnnotatedModule(op=op) for op in preloopOps]
         self.preloopSteps: List[PartitionSchedule] = [
             PartitionSchedule(partitionId=0, subIterKSteps=[preloopSik])]
 
         return set(preloadMT1_A), set(preloadMT1_B)
 
-    def _buildSubIterK(self, partition, pi, sik, numPartitions):
-        """Build MFMA + LR modules for one subIterK step within a partition."""
+    def _buildSubIterK(self, partition, pi, subtileK, localK, numPartitions):
+        """Build MFMA + LR modules for one (subtileK, localK) step within a partition."""
+        flatK = subtileK * self.subtileShapeK + localK
         # MFMA: map subtile indices to VGPR tile IDs
-        vgprTileMapA = {tA: self.allocator.getVGPRTileId('A', tA, sik)
+        vgprTileMapA = {tA: self.allocator.getVGPRTileId('A', tA, flatK)
                         for tA in partition.tileAIndices}
-        vgprTileMapB = {tB: self.allocator.getVGPRTileId('B', tB, sik)
+        vgprTileMapB = {tB: self.allocator.getVGPRTileId('B', tB, flatK)
                         for tB in partition.tileBIndices}
 
-        # MFMA scale maps
+        # MFMA scale maps — same VGPRs reloaded per subtile K index
         scaleMapA, scaleMapB = {}, {}
         if self.hasScale:
             for tA in partition.tileAIndices:
@@ -791,17 +806,18 @@ class SubtileBasedScheduler:
                 scaleMapB.setdefault(gid, vid)
 
         # LR: load targets determined by prefetch mode
-        loadATiles, loadBTiles, loadSubIterK = self._getLoadTargets(pi, sik, numPartitions)
-        isWrapAround = self._isWrapAroundLoad(pi, sik, numPartitions)
+        loadATiles, loadBTiles, targetSId1, targetLocalK = self._getLoadTargets(pi, subtileK, localK, numPartitions)
+        isWrapAround = self._isWrapAroundLoad(pi, subtileK, localK, numPartitions)
+        loadFlatK = targetSId1 * self.subtileShapeK + targetLocalK
 
         lrLoadA = {tA: v for tA in (loadATiles or [])
-                   if (v := self._loadTile('A', tA, loadSubIterK, isWrapAround)) is not None}
+                   if (v := self._loadTile('A', tA, loadFlatK, isWrapAround)) is not None}
         lrLoadB = {tB: v for tB in (loadBTiles or [])
-                   if (v := self._loadTile('B', tB, loadSubIterK, isWrapAround)) is not None}
+                   if (v := self._loadTile('B', tB, loadFlatK, isWrapAround)) is not None}
 
-        # Scale VGPRs for loaded tiles (only for subIterK==0 loads)
+        # Scale VGPRs for loaded tiles (at the start of each subtile K index)
         lrScaleA, lrScaleB = {}, {}
-        if self.hasScale and loadSubIterK == 0:
+        if self.hasScale and targetLocalK == 0:
             for tA in (loadATiles or []):
                 gid, vid = self.scaleVid('A', tA)
                 lrScaleA.setdefault(gid, vid)
@@ -814,21 +830,20 @@ class SubtileBasedScheduler:
         loadIds = set(lrLoadA.values()) | set(lrLoadB.values())
         overlap = mfmaIds & loadIds
         if overlap:
-            # Fail for now. We could support this by duplicating the loop and use different VGPR tiles.
             raise RuntimeError(
-                f"VGPR tile conflict in partition {partition.partitionId} subIterK={sik}: "
+                f"VGPR tile conflict in partition {partition.partitionId} subtileK={subtileK} localK={localK}: "
                 f"MFMA and LR share tile IDs {overlap}")
 
         # Build modules
         mfmas = [(a, b) for a in sorted(vgprTileMapA) for b in sorted(vgprTileMapB)]
         mtLoad = "n+1" if isWrapAround else "n"
-        siks = SubIterKSchedule(subIterK=sik)
+        siks = SubIterKSchedule(subtileK=subtileK, subIterK=localK)
         siks.modules.append(AnnotatedModule(op=MFMAOp(
-            mtIteration="n", subIterK=sik, subtiles=mfmas,
+            mtIteration="n", subtileK=subtileK, subIterK=localK, subtiles=mfmas,
             vgprTileMapA=vgprTileMapA, vgprTileMapB=vgprTileMapB,
             scaleMapA=scaleMapA, scaleMapB=scaleMapB)))
         siks.modules.append(AnnotatedModule(op=LROp(
-            mtIteration=mtLoad, subIterK=loadSubIterK,
+            mtIteration=mtLoad, subtileK=targetSId1, subIterK=targetLocalK,
             lrLoadA=lrLoadA, lrLoadB=lrLoadB,
             lrScaleA=lrScaleA, lrScaleB=lrScaleB)))
 
@@ -864,30 +879,47 @@ class SubtileBasedScheduler:
         return False
 
     def _insertGROps(self, pss, pi, gr, numPartitions):
-        """Insert GR ops for a partition, splitting across subIterK=0 and subIterK=1."""
+        """Insert GR ops for a partition, one per (M-subtile-chunk, subtileK), spread across steps."""
         if not gr.subtileA and not gr.subtileB:
             return
 
         totalGR_A = sorted(gr.subtileA)
         totalGR_B = sorted(gr.subtileB)
-        splitA = (len(totalGR_A) + 1) // 2
-        splitB = (len(totalGR_B) + 1) // 2
-        gr0_A, gr1_A = totalGR_A[:splitA], totalGR_A[splitA:]
-        gr0_B, gr1_B = totalGR_B[:splitB], totalGR_B[splitB:]
         isLast = self._isLastGRForMT(pi, gr, numPartitions)
         isFirst = self._isFirstGRForMT(pi, gr, numPartitions)
-        hasSik1 = bool(gr1_A or gr1_B)
-        # handle case where gr1 is empty.
-        if gr0_A or gr0_B:
-            pss.subIterKSteps[0].modules.append(AnnotatedModule(op=GROp(
+
+        # Split M-dim subtiles into min(numSubIterK, 2) chunks, then replicate per subtileK.
+        numMSplits = min(self.numSubIterK, 2)
+        def _splitEvenly(items, n):
+            k, r = divmod(len(items), n)
+            chunks, start = [], 0
+            for i in range(n):
+                end = start + k + (1 if i < r else 0)
+                chunks.append(items[start:end])
+                start = end
+            return chunks
+
+        mChunksA = _splitEvenly(totalGR_A, numMSplits)
+        mChunksB = _splitEvenly(totalGR_B, numMSplits)
+
+        # Build flat list of (stepIdx, GROp) — one per (mChunk, subtileK)
+        grOps = []
+        totalSteps = len(pss.subIterKSteps)
+        stepIdx = 0
+        for subtileK in range(self.numSubtileK):
+            for mIdx in range(numMSplits):
+                cA, cB = mChunksA[mIdx], mChunksB[mIdx]
+                if cA or cB:
+                    grOps.append((min(stepIdx, totalSteps - 1), subtileK, cA, cB))
+                stepIdx += 1
+
+        # Assign firstForMT / lastForMT
+        for i, (si, subtileK, cA, cB) in enumerate(grOps):
+            pss.subIterKSteps[si].modules.append(AnnotatedModule(op=GROp(
                 mtIteration=gr.mtIteration,
-                subtileA=gr0_A, subtileB=gr0_B,
-                firstForMT=isFirst,
-                lastForMT=isLast and not hasSik1)))
-        if hasSik1:
-            pss.subIterKSteps[1].modules.append(AnnotatedModule(op=GROp(
-                mtIteration=gr.mtIteration,
-                subtileA=gr1_A, subtileB=gr1_B, lastForMT=isLast)))
+                subtileA=cA, subtileB=cB, subtileK=subtileK,
+                firstForMT=isFirst and i == 0,
+                lastForMT=isLast and i == len(grOps) - 1)))
 
     # Generate the schedule
     # 1- build subIterK steps
@@ -907,9 +939,10 @@ class SubtileBasedScheduler:
         for pi, partition in enumerate(self.partitions):
             pss = PartitionSchedule(partitionId=partition.partitionId)
 
-            for sik in range(self.numSubIterK):
-                pss.subIterKSteps.append(
-                    self._buildSubIterK(partition, pi, sik, numPartitions))
+            for subtileK in range(self.numSubtileK):
+                for localK in range(self.numSubIterK):
+                    pss.subIterKSteps.append(
+                        self._buildSubIterK(partition, pi, subtileK, localK, numPartitions))
 
             # split GR ops across subIterK steps and determine lastForMT
             self._insertGROps(pss, pi, self.partitionGRs[pi], numPartitions)
@@ -937,41 +970,45 @@ class SubtileBasedScheduler:
         # Tile stays alive, reuse in place
         return None
 
-    def _isWrapAroundLoad(self, partitionIdx: int, subIterK: int, numPartitions: int) -> bool:
+    def _isWrapAroundLoad(self, partitionIdx: int, subtileK: int, localK: int, numPartitions: int) -> bool:
         """True when this step's load targets partition 0 for the next macrotile iteration."""
         if self.config.prefetchMode == PrefetchMode.HALF_PREFETCH:
-            return partitionIdx == numPartitions - 1 and subIterK == self.numSubIterK - 1
+            return (partitionIdx == numPartitions - 1
+                    and subtileK == self.numSubtileK - 1
+                    and localK == self.numSubIterK - 1)
         elif self.config.prefetchMode == PrefetchMode.FULL_PREFETCH:
             return partitionIdx == numPartitions - 1
         return False
 
     # ── Prefetch modes ───────────────────────────────────────
 
-    def _getLoadTargets(self, partitionIdx: int, subIterK: int,
-                        numPartitions: int) -> Tuple[Optional[List[int]], Optional[List[int]], int]:
-        """Returns (loadATiles, loadBTiles, targetSubIterK)."""
+    def _getLoadTargets(self, partitionIdx: int, subtileK: int, localK: int,
+                        numPartitions: int) -> Tuple[Optional[List[int]], Optional[List[int]], int, int]:
+        """Returns (loadATiles, loadBTiles, targetSId1, targetLocalK)."""
         if self.config.prefetchMode == PrefetchMode.HALF_PREFETCH:
-            return self._loadTargetsHalfPrefetch(partitionIdx, subIterK, numPartitions)
+            return self._loadTargetsHalfPrefetch(partitionIdx, subtileK, localK, numPartitions)
         elif self.config.prefetchMode == PrefetchMode.FULL_PREFETCH:
-            return self._loadTargetsFullPrefetch(partitionIdx, subIterK, numPartitions)
-        return (None, None, 0)
+            return self._loadTargetsFullPrefetch(partitionIdx, subtileK, localK, numPartitions)
+        return (None, None, 0, 0)
 
-    def _loadTargetsHalfPrefetch(self, partitionIdx, subIterK, numPartitions):
-        """HALF: subIterK=0 loads same-partition subIterK=1, subIterK=last loads next-partition subIterK=0.
-        Last partition wraps around to partition 0 (next iteration)."""
+    def _loadTargetsHalfPrefetch(self, partitionIdx, subtileK, localK, numPartitions):
+        """HALF: advance (subtileK, localK) by one step. Wraps subtileK then partition."""
         currentPartition = self.partitions[partitionIdx]
-        if subIterK < self.numSubIterK - 1:
-            targetSubIterK = subIterK + 1
-            return (currentPartition.tileAIndices, currentPartition.tileBIndices, targetSubIterK)
+        if localK < self.numSubIterK - 1:
+            # Next localK, same subtileK, same partition
+            return (currentPartition.tileAIndices, currentPartition.tileBIndices, subtileK, localK + 1)
+        elif subtileK < self.numSubtileK - 1:
+            # First localK, next subtileK, same partition
+            return (currentPartition.tileAIndices, currentPartition.tileBIndices, subtileK + 1, 0)
         else:
+            # First localK, first subtileK, next partition
             nextPartition = self.partitions[(partitionIdx + 1) % numPartitions]
-            return (nextPartition.tileAIndices, nextPartition.tileBIndices, 0)
+            return (nextPartition.tileAIndices, nextPartition.tileBIndices, 0, 0)
 
-    def _loadTargetsFullPrefetch(self, partitionIdx, subIterK, numPartitions):
-        """FULL: subIterK=0 loads next-partition subIterK=0, subIterK=1 loads next-partition subIterK=1.
-        Last partition wraps around to partition 0 (next iteration)."""
+    def _loadTargetsFullPrefetch(self, partitionIdx, subtileK, localK, numPartitions):
+        """FULL: load same (subtileK, localK) from next partition."""
         nextPartition = self.partitions[(partitionIdx + 1) % numPartitions]
-        return (nextPartition.tileAIndices, nextPartition.tileBIndices, subIterK)
+        return (nextPartition.tileAIndices, nextPartition.tileBIndices, subtileK, localK)
 
     # ── Reuse strategies ─────────────────────────────────────
 
@@ -1006,7 +1043,7 @@ class SubtileBasedScheduler:
                     if isinstance(mod.op, GROp):
                         grEvents.append((opIdx, mod.op.mtIteration,
                                          set(mod.op.subtileA), set(mod.op.subtileB),
-                                         mod.op.firstForMT))
+                                         mod.op.lastForMT))
                     opIdx += 1
         return grEvents
 
@@ -1031,7 +1068,7 @@ class SubtileBasedScheduler:
         after  = [(mt, a, b, first) for (idx, mt, a, b, first) in grEvents if idx >= sikEnd]
         totalA, totalB, scaleA, scaleB = 0, 0, 0, 0
 
-        for (grMT, grA, grB, firstForMT) in reversed(before):
+        for (grMT, grA, grB, lastForMT) in reversed(before):
             grOffset = self._parseMTOffset(grMT)
             if grOffset is None:
                 continue
@@ -1039,11 +1076,11 @@ class SubtileBasedScheduler:
                 return totalA, totalB, scaleA, scaleB
             totalA += len(grA)
             totalB += len(grB)
-            if firstForMT and self.hasScale:
+            if lastForMT and self.hasScale:
                 scaleA += self.scaleLoadsPerMT_A
                 scaleB += self.scaleLoadsPerMT_B
 
-        for (grMT, grA, grB, firstForMT) in reversed(after):
+        for (grMT, grA, grB, lastForMT) in reversed(after):
             grOffset = self._parseMTOffset(grMT)
             if grOffset is None:
                 continue
@@ -1051,7 +1088,7 @@ class SubtileBasedScheduler:
                 return totalA, totalB, scaleA, scaleB
             totalA += len(grA)
             totalB += len(grB)
-            if firstForMT and self.hasScale:
+            if lastForMT and self.hasScale:
                 scaleA += self.scaleLoadsPerMT_A
                 scaleB += self.scaleLoadsPerMT_B
 
@@ -1059,7 +1096,7 @@ class SubtileBasedScheduler:
 
     def _buildWaitGROp(self, lrOp, pendingA, pendingB, sikStart, sikEnd, grEvents):
         """Determine if a WAIT_GR is needed before this LR. Returns (waitGROp, waitA, waitB)."""
-        if not lrOp or lrOp.subIterK != 0:
+        if not lrOp or lrOp.subtileK != 0 or lrOp.subIterK != 0:
             return None, set(), set()
 
         waitA = set(lrOp.lrLoadA.keys()) & pendingA
@@ -1178,7 +1215,7 @@ class SubtileBasedScheduler:
         for pss in self.mainloopSteps:
             newPss = PartitionSchedule(partitionId=pss.partitionId)
             for dus in pss.subIterKSteps:
-                newDus = SubIterKSchedule(subIterK=dus.subIterK)
+                newDus = SubIterKSchedule(subtileK=dus.subtileK, subIterK=dus.subIterK)
                 for mod in dus.modules:
                     if isinstance(mod.op, GROp) and mod.op.mtIteration == "n+2":
                         continue
@@ -1209,7 +1246,7 @@ class SubtileBasedScheduler:
         for pss in self.mainloopSteps:
             newPss = PartitionSchedule(partitionId=pss.partitionId)
             for dus in pss.subIterKSteps:
-                newDus = SubIterKSchedule(subIterK=dus.subIterK)
+                newDus = SubIterKSchedule(subtileK=dus.subtileK, subIterK=dus.subIterK)
                 # Track which modules are being removed (for filtering module refs)
                 removedMods = set()
                 for mod in dus.modules:
@@ -1262,17 +1299,17 @@ class SubtileBasedScheduler:
 
     @staticmethod
     def _printOp(op: ScheduleOp, indent: str = "",
-                 showVgpr: bool = False, showSubtiles: bool = False):
+                 showVgpr: bool = False, showSubtiles: bool = False,
+                 scaleSet: int = 0, scaleLRSet: int = 0):
         if isinstance(op, MFMAOp):
-            print(f"{indent}MFMAs (MT {op.mtIteration}, subIterK {op.subIterK}):")
+            scaleLabel = f"  scaleSet={scaleSet}" if (op.scaleMapA or op.scaleMapB) else ""
+            print(f"{indent}MFMAs (MT {op.mtIteration}, subtileK {op.subtileK}, subIterK {op.subIterK}):{scaleLabel}")
             if showSubtiles:
                 print(f"{indent}  - {op.subtiles}")
             if showVgpr:
                 print(f"{indent}  - USING  A: {op.vgprTileMapA}  B: {op.vgprTileMapB}")
-                if op.scaleMapA or op.scaleMapB:
-                    print(f"{indent}  - SCALE  A: {op.scaleMapA}  B: {op.scaleMapB}")
         elif isinstance(op, GROp):
-            print(f"{indent}GR (MT {op.mtIteration}):  A: {op.subtileA}  B: {op.subtileB}")
+            print(f"{indent}GR (MT {op.mtIteration}, subtileK {op.subtileK}):  A: {op.subtileA}  B: {op.subtileB}")
         elif isinstance(op, WaitGROp):
             if op.inflightLoadsA is not None:
                 inflight = f" — inflight SubtileLoads A={op.inflightLoadsA} B={op.inflightLoadsB} scaleA={op.inflightScaleLoadsA} scaleB={op.inflightScaleLoadsB}"
@@ -1284,14 +1321,12 @@ class SubtileBasedScheduler:
         elif isinstance(op, SyncOp):
             print(f"{indent}SYNC")
         elif isinstance(op, LROp):
-            sikLabel = f", subIterK {op.subIterK}" if op.subIterK >= 0 else ""
-            aKeys = sorted(op.lrLoadA.keys())
-            bKeys = sorted(op.lrLoadB.keys())
-            print(f"{indent}LR (MT {op.mtIteration}{sikLabel}) A: {aKeys}  B: {bKeys}")
+            sikLabel = f", subtileK {op.subtileK}, subIterK {op.subIterK}" if op.subIterK >= 0 else ""
+            scaleLabel = f"  scaleSet={scaleLRSet}" if (op.lrScaleA or op.lrScaleB) else ""
             if showVgpr:
-                print(f"{indent}  - LOAD  A: {op.lrLoadA}  B: {op.lrLoadB}")
-                if op.lrScaleA or op.lrScaleB:
-                    print(f"{indent}  - SCALE  A: {op.lrScaleA}  B: {op.lrScaleB}")
+                print(f"{indent}LR (MT {op.mtIteration}{sikLabel}) A: {op.lrLoadA}  B: {op.lrLoadB}{scaleLabel}")
+            else:
+                print(f"{indent}LR (MT {op.mtIteration}{sikLabel}){scaleLabel}")
         elif isinstance(op, SkipOp):
             print(f"{indent}SKIP_IF_{op.compare}({op.value}, {op.target})")
         elif isinstance(op, GR_INCOp):
@@ -1304,9 +1339,9 @@ class SubtileBasedScheduler:
         if e.module:
             op = e.module.op
             if isinstance(op, LROp):
-                return f"LR(MT {op.mtIteration}, sik {op.subIterK})"
+                return f"LR (MT {op.mtIteration}, subtileK {op.subtileK}, subIterK {op.subIterK})"
             elif isinstance(op, GROp):
-                return f"GR(MT {op.mtIteration})"
+                return f"GR(MT {op.mtIteration}, subtileK {op.subtileK})"
             return type(op).__name__
         op = e.op
         if isinstance(op, WaitGROp) and op.inflightLoadsA is not None:
@@ -1315,10 +1350,12 @@ class SubtileBasedScheduler:
 
     def _printModules(self, modules: List[AnnotatedModule], indent: str,
                       showVgpr: bool = False, showDeps: bool = False,
-                      showSubtiles: bool = False):
+                      showSubtiles: bool = False,
+                      scaleSet: int = 0, scaleLRSet: int = 0):
         for mod in modules:
             self._printOp(mod.op, indent=indent, showVgpr=showVgpr,
-                          showSubtiles=showSubtiles)
+                          showSubtiles=showSubtiles,
+                          scaleSet=scaleSet, scaleLRSet=scaleLRSet)
             if showDeps:
                 before_str = ", ".join(self._depEdgeLabel(e) for e in mod.before) if mod.before else "none"
                 after_str = ", ".join(self._depEdgeLabel(e) for e in mod.after) if mod.after else "none"
@@ -1326,14 +1363,25 @@ class SubtileBasedScheduler:
 
     def _printLoopSteps(self, loopSteps: List[PartitionSchedule], indent: str,
                         showVgpr: bool = False, showDeps: bool = False,
-                        showSubtiles: bool = False):
+                        showSubtiles: bool = False,
+                        scaleSet: int = 0, scaleLRSet: int = None):
+        if scaleLRSet is None:
+            scaleLRSet = 1 - scaleSet if self.hasScale else scaleSet
         for partition in loopSteps:
             print(f"{indent}Partition {partition.partitionId}:")
+            prevSubtileK = None
             for dus in partition.subIterKSteps:
-                print(f"{indent}  subIterK={dus.subIterK}:")
+                if self.hasScale and prevSubtileK is not None \
+                        and dus.subtileK != prevSubtileK:
+                    scaleSet, scaleLRSet = scaleLRSet, scaleSet
+                prevSubtileK = dus.subtileK
+                print(f"{indent}  subtileK={dus.subtileK} subIterK={dus.subIterK}:")
                 self._printModules(dus.modules, indent=f"{indent}    ",
                                    showVgpr=showVgpr, showDeps=showDeps,
-                                   showSubtiles=showSubtiles)
+                                   showSubtiles=showSubtiles,
+                                   scaleSet=scaleSet, scaleLRSet=scaleLRSet)
+            if self.hasScale:
+                scaleSet, scaleLRSet = scaleLRSet, scaleSet
 
     def printSchedule(self, showVgpr: bool = False, showDeps: bool = False,
                       showSubtiles: bool = False):
@@ -1344,7 +1392,7 @@ class SubtileBasedScheduler:
             showDeps: show before/after dependency edges on each module.
             showSubtiles: show MFMA subtile coordinate lists.
         """
-        print(f"SubtileGridA={self.MTA}, SubtileGridB={self.MTB}")
+        print(f"SubtileGridA={self.MTA}x{self.numSubtileK}, SubtileGridB={self.MTB}x{self.numSubtileK}")
         print(f"Partition grid: {self.numPartitionsA} x {self.numPartitionsB}")
         print(f"Partition size: {self.config.partitionSizeA} x {self.config.partitionSizeB}")
         print(f"Prefetch: {self.config.prefetchMode.name}")
@@ -1441,8 +1489,8 @@ class SubtileBasedScheduler:
                 scaleGroupB = b // 2
                 scaleAVgpr = scaleTiles[op.scaleMapA[scaleGroupA]]
                 scaleBVgpr = scaleTiles[op.scaleMapB[scaleGroupB]]
-                sAsel = (a % 2) + 2 * (op.subIterK % 2)
-                sBsel = (b % 2) + 2 * (op.subIterK % 2)
+                sAsel = (a % 2) + 2 * op.subIterK
+                sBsel = (b % 2) + 2 * op.subIterK
             else:
                 scaleAVgpr = scaleBVgpr = -1
                 sAsel = sBsel = 0
@@ -1451,7 +1499,7 @@ class SubtileBasedScheduler:
                 writer, kernel, aTile, bTile, dTile, dTile,
                 scaleAVgpr=scaleAVgpr, scaleBVgpr=scaleBVgpr,
                 scaleAsel=sAsel, scaleBsel=sBsel,
-                comment=f"MFMA C[{a},{b}] += A[{a},subIterK{op.subIterK}] * B[{b},subIterK{op.subIterK}]"))
+                comment=f"MFMA C[{a},{b}] += A[{a},subtileK={op.subtileK},lK={op.subIterK}] * B[{b},subtileK={op.subtileK},lK={op.subIterK}]"))
 
         return module
 
@@ -1462,21 +1510,19 @@ class SubtileBasedScheduler:
         module = Module()
         for tA, vgprTileId in op.lrLoadA.items():
             dstTile = self.vgprTiles[vgprTileId]
-            # Using 0 for subtile ID1 for now
             module.add(emitSingleDsRead(
-                self.tileInfoA, tA, 0, op.subIterK, dstTile))
+                self.tileInfoA, tA, op.subtileK, op.subIterK, dstTile))
         for tB, vgprTileId in op.lrLoadB.items():
             dstTile = self.vgprTiles[vgprTileId]
-            # Using 0 for subtile ID1 for now
             module.add(emitSingleDsRead(
-                self.tileInfoB, tB, 0, op.subIterK, dstTile))
+                self.tileInfoB, tB, op.subtileK, op.subIterK, dstTile))
         if op.lrScaleA:
-            self._emitScaleDsReads(module, writer, 'MXSA', op.lrScaleA, scaleSet=scaleSet)
+            self._emitScaleDsReads(module, writer, 'MXSA', op.lrScaleA, op.subtileK, scaleSet=scaleSet)
         if op.lrScaleB:
-            self._emitScaleDsReads(module, writer, 'MXSB', op.lrScaleB, scaleSet=scaleSet)
+            self._emitScaleDsReads(module, writer, 'MXSB', op.lrScaleB, op.subtileK, scaleSet=scaleSet)
         return module
 
-    def _emitScaleDsReads(self, module, writer, tc, lrScale, scaleSet=0):
+    def _emitScaleDsReads(self, module, writer, tc, lrScale, subtileK, scaleSet=0):
         """Emit DSLoadB32 for scale groups using scheduler-managed VGPRs."""
         tileInfo = self.scaleTileInfoA if tc == 'MXSA' else self.scaleTileInfoB
         scaleTiles = self.scaleVgprTiles if scaleSet == 0 else self.scaleVgprTilesAlt
@@ -1485,12 +1531,12 @@ class SubtileBasedScheduler:
         # covers 1 subtile, and a group is 2 subtiles).
         groupStride = 2 * tileInfo.subtileSize
         for scaleGroupIdx, scaleVgprTileId in lrScale.items():
-            dsOffset = groupStride * scaleGroupIdx
+            dsOffset = groupStride * (scaleGroupIdx * self.numSubtileK + subtileK)
             vdst = scaleTiles[scaleVgprTileId]
             module.add(DSLoadB32(dst=vgpr(vdst),
                                  src=vgpr(tileInfo.sharedVgprLROffset[0]),
                                  ds=DSModifiers(offset=dsOffset),
-                                 comment="scale%s[group%u]: load 4B from LDS" % (tc, scaleGroupIdx)))
+                                 comment="scale%s[group%u,subtileK=%u]: load 4B from LDS" % (tc, scaleGroupIdx, subtileK)))
 
     def emitWaitGR(self, inflightLoadsA, inflightLoadsB,
                    inflightScaleLoadsA=0, inflightScaleLoadsB=0):
@@ -1513,15 +1559,17 @@ class SubtileBasedScheduler:
     def emitGR(self, writer, kernel, op):
         """Emit GR (Global Read) buffer_load instructions for a single GROp."""
         module = Module()
-        # Scale DTL loads: emitted on the first GR of an MT to maximize overlap
-        if op.firstForMT and self.hasScale:
+        # Scale DTL loads: emitted on the last GR of an MT so all scale LR from the
+        # current bank have completed before the DTL overwrites them (scale DTL
+        # covers all subtileK values in a single load).
+        if op.lastForMT and self.hasScale:
             module.add(globalReadDoScaleSubtile('MXSA', writer, kernel))
             module.add(globalReadDoScaleSubtile('MXSB', writer, kernel))
-        # A and B data loads — emitSingleBufferLoad skips redundant loads internally
+        # A and B data loads for this GR's subtileK layer
         for subtileList, tileInfo in [(op.subtileA, self.tileInfoA),
                                       (op.subtileB, self.tileInfoB)]:
             for sId0 in subtileList:
-                module.add(emitSingleBufferLoad(tileInfo, kernel, sId0, 0))
+                module.add(emitSingleBufferLoad(tileInfo, kernel, sId0, op.subtileK))
         return module
 
     def _emitOp(self, writer, kernel, op, dtileInfo, scaleSet=0, scaleLRSet=0):
@@ -1697,7 +1745,7 @@ class SubtileBasedScheduler:
         """
         dtileInfo = writer.states.d.tileInfo
         module = Module()
-        module.addComment0(f"Partition {pss.partitionId}: subIterK={dus.subIterK}")
+        module.addComment0(f"Partition {pss.partitionId}: subtileK={dus.subtileK} subIterK={dus.subIterK}")
 
         hasMFMA = any(isinstance(m.op, MFMAOp) for m in dus.modules)
         if hasMFMA:
@@ -1853,13 +1901,21 @@ class SubtileBasedScheduler:
         scaleLRSet: which scale VGPR set LR writes to (defaults to 1-scaleSet if None).
             Both rotate per partition so each partition's MFMA reads the scales
             that the previous partition's LR loaded.
+            Additionally, when numSubtileK > 1, scaleSet/scaleLRSet swap at
+            subtileK boundaries so each subtileK's MFMAs read the scales that
+            the previous subtileK's LR loaded into the alternate set.
         """
         if scaleLRSet is None:
             scaleLRSet = 1 - scaleSet if self.hasScale else scaleSet
         module = Module(label)
         module.addComment0(f"{label} start")
         for pss in steps:
+            prevSubtileK = None
             for dus in pss.subIterKSteps:
+                if self.hasScale and prevSubtileK is not None \
+                        and dus.subtileK != prevSubtileK:
+                    scaleSet, scaleLRSet = scaleLRSet, scaleSet
+                prevSubtileK = dus.subtileK
                 subModule = self._emitSubIterK(writer, kernel, pss, dus,
                                                scaleSet=scaleSet, scaleLRSet=scaleLRSet)
                 module.add(subModule)
