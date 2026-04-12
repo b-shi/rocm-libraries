@@ -1756,7 +1756,6 @@ def _build_sgprs_for_beta_test(writer):
       Beta       (1 reg, s[28]): beta scalar (1.0f)
       mGuard     (1 reg, s[29]): subtileM32ValidBlocksSgpr — numValidD1Steps
       nGuard     (1 reg, s[30]): subtileN16ValidBlocksSgpr — numValid16NBlocks
-      mOff       (1 reg, s[31]): subtileCloadMoffSgpr — BufferOOB or 0
 
     Returns the sgprs dict (same reference as writer.sgprs).
     """
@@ -1770,9 +1769,6 @@ def _build_sgprs_for_beta_test(writer):
 
     nGuard = writer.sgprPool.checkOut(1, "subtileNValidBlocks")
     writer.sgprs["subtileNValidBlocks"] = nGuard
-
-    mOff = writer.sgprPool.checkOut(1, "subtileCloadMoff")
-    writer.sgprs["subtileCloadMoff"] = mOff
 
     return sgprs
 
@@ -1945,7 +1941,6 @@ def _run_storeD_beta(cfg, tmp_path, size_i, size_j, mi_wave_group=None, dump_asm
     # Wire subtile guard SGPRs into kw.states so GlobalWriteBatch can use them.
     kw.states.subtileM32ValidBlocksSgpr = sgprs["subtileMValidBlocks"]
     kw.states.subtileN16ValidBlocksSgpr = sgprs["subtileNValidBlocks"]
-    kw.states.subtileCloadMoffSgpr      = sgprs["subtileCloadMoff"]
     kw.states.subtileMBlockSize         = 16  # MatrixInstM for f32
 
     tmp_v = writer.vgprPool.checkOut(1, "tmp_v", preventOverflow=False)
@@ -2166,7 +2161,6 @@ def _run_storeD_cload_pagefault(cfg, tmp_path, size_i, size_j, mi_wave_group=Non
 
     kw.states.subtileM32ValidBlocksSgpr = sgprs["subtileMValidBlocks"]
     kw.states.subtileN16ValidBlocksSgpr = sgprs["subtileNValidBlocks"]
-    kw.states.subtileCloadMoffSgpr      = sgprs["subtileCloadMoff"]
     kw.states.subtileMBlockSize         = 16
 
     tmp_v = writer.vgprPool.checkOut(1, "tmp_v", preventOverflow=False)

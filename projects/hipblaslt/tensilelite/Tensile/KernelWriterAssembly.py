@@ -12978,14 +12978,9 @@ class KernelWriterAssembly(KernelWriter):
                                    comment="numValid16NBlocks = clamped >> 4"))
     self.sgprPool.checkIn(tmpN)
 
-    # One extra SGPR used by GlobalWriteBatch to gate beta C loads via SrdC+2:
-    #   mOffSgpr: BufferOOB if this wave's M block is valid, else 0
-    mOffSgpr = self.sgprPool.checkOut(1, "subtileCloadMoff")
-
     self.states.subtileM32ValidBlocksSgpr = mGuardSgpr
     self.states.subtileN16ValidBlocksSgpr = nGuardSgpr
     self.states.subtileMBlockSize = mBlockSize
-    self.states.subtileCloadMoffSgpr = mOffSgpr
 
   ##############################################################################
   # checkIsEdge
@@ -14040,7 +14035,6 @@ class KernelWriterAssembly(KernelWriter):
       self.states.subtileM32ValidBlocksSgpr = None
       self.states.subtileN16ValidBlocksSgpr = None
       self.states.subtileMBlockSize = 0
-      self.states.subtileCloadMoffSgpr = None
 
     # Activation
     actLoopEndLabel, actLoopLabelModules, actLoopEnumStrList = self.initActivationLoop(kernel, beta)
@@ -14106,11 +14100,9 @@ class KernelWriterAssembly(KernelWriter):
     if self.states.subtileM32ValidBlocksSgpr is not None:
       self.sgprPool.checkIn(self.states.subtileM32ValidBlocksSgpr)
       self.sgprPool.checkIn(self.states.subtileN16ValidBlocksSgpr)
-      self.sgprPool.checkIn(self.states.subtileCloadMoffSgpr)
       self.states.subtileM32ValidBlocksSgpr = None
       self.states.subtileN16ValidBlocksSgpr = None
       self.states.subtileMBlockSize = 0
-      self.states.subtileCloadMoffSgpr = None
 
     if tmpVgprDynamic:
       self.vgprPool.checkIn(tmpVgprDynamic.idx)
