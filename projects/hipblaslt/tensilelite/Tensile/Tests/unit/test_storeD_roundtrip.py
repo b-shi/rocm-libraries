@@ -55,6 +55,8 @@ from gpu_test_helpers import (
     generate_set_directives,
     generate_load_params,
     assemble_and_run,
+    assemble_kernel,
+    hip_check,
     init_rocisa,
 )
 
@@ -260,6 +262,8 @@ def _build_store_kernel(cfg, mi_wave_group=None, use_bf16=False):
     kernel["GroupLoadStore"] = False
     kernel["GlobalWriteVectorWidth"] = min(16 // bpe, mi_output_vw)
     kernel["NonTemporalD"] = 0
+    kernel["NonTemporalC"] = 0
+    kernel["NonTemporalE"] = 0
     kernel["StorePriorityOpt"] = False
     kernel["StoreSyncOpt"] = False
     kernel["AssertFree0ElementMultiple"] = 1
@@ -897,11 +901,51 @@ def _make_full_dref(mt0, mt1):
     return [[c * mt0 + r for c in range(mt1)] for r in range(mt0)]
 
 
+def _verify_oob_sentinel(out, round_mt0, round_mt1, size_i, size_j, label="f32"):
+    """Assert every OOB position in the D buffer still holds the hardware sentinel.
+
+    The GPU runner initialises the output buffer with 0xFF bytes before launching
+    the kernel, so every element starts as:
+      f32  → 0xFFFFFFFF (quiet NaN)
+      bf16 → 0xFFFF per element → zero-extended to 0x0000FFFF as f32
+
+    Any store that reaches an OOB address must be suppressed (by the SrdD
+    BufferOOB redirect or the SrdC+2 gating).  If a store slips through it
+    overwrites the sentinel and the assertion fires.
+
+    Args:
+        out:       Flat sequence of float values from the GPU output buffer.
+        round_mt0: Buffer rows (leading dimension of the column-major buffer).
+        round_mt1: Buffer cols.
+        size_i:    Number of valid rows  (positions [0, size_i) × [0, size_j) are valid).
+        size_j:    Number of valid cols.
+        label:     "f32" or "bf16" — selects which sentinel bit pattern to expect.
+    """
+    D_u32 = np.array(out, dtype=np.float32).view(np.uint32).reshape(round_mt0, round_mt1, order='F')
+    # f32:  buffer init is 0xFF bytes → each f32 element = 0xFFFFFFFF.
+    # bf16: buffer init is 0xFF bytes → each bf16 element = 0xFFFF (uint16).
+    #       The caller zero-extends via (uint16 << 16), so the sentinel in the
+    #       'out' array is 0xFFFF0000 (not 0x0000FFFF).
+    sentinel = np.uint32(0xFFFFFFFF) if label == "f32" else np.uint32(0xFFFF0000)
+    errors = []
+    for col in range(round_mt1):
+        for row in range(round_mt0):
+            if row < size_i and col < size_j:
+                continue  # valid position — not checked here
+            if D_u32[row, col] != sentinel:
+                errors.append((row, col, hex(int(sentinel)), hex(int(D_u32[row, col]))))
+    if errors:
+        assert False, (
+            f"OOB sentinel overwritten at {len(errors)} positions "
+            f"(first 5 (row,col,expected,got): {errors[:5]})"
+        )
+
+
 def _verify_matrix_positions(out, round_mt0, round_mt1, size_i=None, size_j=None):
-    """Verify the output exactly matches the serial column-major D_ref matrix.
+    """Verify the output exactly matches the serial column-major D_ref matrix,
+    and that every OOB position still holds the f32 sentinel (0xFFFFFFFF).
 
     D_ref[row][col] = col * size_i + row  for row < size_i, col < size_j.
-    OOB positions (row >= size_i or col >= size_j) are not checked.
 
     size_i / size_j default to round_mt0 / round_mt1 (full-tile case).
 
@@ -929,6 +973,7 @@ def _verify_matrix_positions(out, round_mt0, round_mt1, size_i=None, size_j=None
             f"Matrix position mismatch in {len(errors)} elements "
             f"(first 5 (row,col,expected,got): {errors[:5]})"
         )
+    _verify_oob_sentinel(out, round_mt0, round_mt1, size_i, size_j, label="f32")
 
 
 def _bf16_rne(f32_arr):
@@ -946,15 +991,12 @@ def _bf16_rne(f32_arr):
 
 
 def _verify_bf16_random_matrix_positions(out, ref_arr, round_mt0, round_mt1, size_i, size_j):
-    """Verify bf16 D output matches bf16_rne(ref) at valid positions only.
+    """Verify bf16 D output matches bf16_rne(ref) at valid positions, and that OOB
+    positions still hold the bf16 sentinel (0x0000FFFF when zero-extended to f32).
 
     ref_arr contains f32 random values (valid positions) and f32 sentinel (OOB).
     The GPU converts accvgprs to bf16 via v_cvt_pk_bf16_f32, so the expected value
     at each valid position is bf16_rne(ref_arr[r, c]).
-
-    OOB positions are not checked: the f32 ref sentinel (0xFFFFFFFF) and the bf16
-    output's unwritten sentinel (0xFFFF → upcast 0xFFFF0000) have different bit
-    patterns, so a bitwise comparison there would always fail.
 
     Args:
         out:      Flat sequence of bf16-upcast-to-f32 values from the GPU output.
@@ -978,17 +1020,15 @@ def _verify_bf16_random_matrix_positions(out, ref_arr, round_mt0, round_mt1, siz
             f"BF16 partial-tile mismatch in {len(errors)} valid positions "
             f"(first 5 (row,col,expected,got): {errors[:5]})"
         )
+    _verify_oob_sentinel(out, round_mt0, round_mt1, size_i, size_j, label="bf16")
 
 
 def _verify_bf16_matrix_positions(out, round_mt0, round_mt1, size_i=None, size_j=None):
-    """Verify bf16 output matches the serial input matrix down-cast to bf16 (RNE).
+    """Verify bf16 output matches the serial input matrix down-cast to bf16 (RNE),
+    and that every OOB position still holds the bf16 sentinel (0x0000FFFF as f32).
 
     Input matrix: D_ref[row][col] = float(col * round_mt0 + row) (column-major).
     Each output element at a valid position should equal bf16_rne(D_ref[row][col]).
-
-    When size_i/size_j are given (partial-tile case) only valid positions are checked;
-    OOB positions are skipped because the bf16 unwritten sentinel (0xFFFF0000) differs
-    from the f32 sentinel (0xFFFFFFFF) used in the reference matrix.
 
     Args:
         out:        Flat tuple of float values from the GPU output buffer (bf16 values
@@ -1017,6 +1057,7 @@ def _verify_bf16_matrix_positions(out, round_mt0, round_mt1, size_i=None, size_j
             f"BF16 matrix position mismatch in {len(errors)} valid elements "
             f"(first 5 (row,col,expected,got): {errors[:5]})"
         )
+    _verify_oob_sentinel(out, round_mt0, round_mt1, size_i, size_j, label="bf16")
 
 
 def _inject_bf16_permute(store_asm: str, perm_addr_reg: int, perm_tmp_regs: tuple) -> str:
@@ -1524,7 +1565,7 @@ def _build_accvgpr_init_matrix_asm(agpr_indices, kernel, tileInfoD, sgprs, tmp_v
     MT_a        = kernel["MacroTile0"]
     mma_m       = kernel["MatrixInstM"]   # 16
     mma_n       = kernel["MatrixInstN"]   # 16
-    regs_per_subtile = tileInfoD.mmaTileRegCount  # 4
+    regs_per_subtile = int(tileInfoD.mmaTileRegCount)  # 4
 
     # Dimensions of each wave's block and per-wave subtile grid.
     wave_rows = MT_a // wg0                              # rows owned by one wave
@@ -1649,6 +1690,650 @@ def _verify_random_matrix_positions(out, ref_arr, round_mt0, round_mt1):
             f"Random-init matrix mismatch in {len(bad)} positions "
             f"(first 5 (row,col,expected,got): {errors})"
         )
+
+
+# ---------------------------------------------------------------------------
+# Beta-path OOB guard test (UseSubtileImpl NonEdge).
+#
+# The SrdC+2 gating fix prevents OOB waves from reading garbage from C when
+# beta != 0.  In the NonEdge path, M % MT != 0 but M % subtile_block == 0,
+# so some waves are entirely OOB in M or N.  Without the fix those waves load
+# from C and corrupt D; with it, SrdC+2 is set to 0 (hardware returns zero)
+# for OOB elements before each beta C load.
+#
+# Test strategy: alpha=0, beta=1, accvgprs=0, C=serial values.
+#   D_expected = 0*alpha + 1*C = C   at valid positions
+#   D_expected = sentinel            at OOB positions (C load gated → 0 + 0 = 0,
+#                                    but store is also OOB-redirected → sentinel)
+#
+# We verify:
+#   1. Every valid (row,col) in D equals the corresponding C value.
+#   2. No OOB position is corrupted (remains sentinel or is legitimately 0).
+# ---------------------------------------------------------------------------
+
+# MT=64×64, MIWaveTile=[2,2] → MIWaveGroup=[2,2], 4 waves.
+# Wave layout: wave_rows=32 (MatrixInstM*MIWaveTile[0]=16*2), wave_cols=32.
+#
+# Guard values per (M, N) — each wave owns 2 d0 (M) and 2 d1 (N) steps:
+#
+#   numValidD1Steps  (M guard, per wave in M dim):
+#     M=16  → wave-0: ceil(16/16)=1,  wave-1: 0        guard values {0,1}
+#     M=32  → wave-0: 2,              wave-1: 0        guard values {0,2}
+#     M=48  → wave-0: 2,              wave-1: ceil(16/16)=1  guard values {1,2}
+#     M=64  → wave-0: 2,              wave-1: 2        guard values {2,2}
+#
+#   numValid16NBlocks (N guard, per wave in N dim):
+#     N=16  → wave-0-N: 1,            wave-1-N: 0      guard values {0,1}
+#     N=32  → wave-0-N: 2,            wave-1-N: 0      guard values {0,2}
+#     N=48  → wave-0-N: 2,            wave-1-N: 1      guard values {1,2}
+#     N=64  → wave-0-N: 2,            wave-1-N: 2      guard values {2,2}
+#
+# Cases cover every distinct guard value combination for M and N:
+_BETA_CFG = TileConfig(mt_a=64, mt_b=64, depth_u=512)
+BETA_OOB_CASES = [
+    # --- M guard boundary cases ---
+    (_BETA_CFG, 64, 64),   # M guard={2,2}, N guard={2,2}: baseline, all waves valid
+    (_BETA_CFG, 32, 64),   # M guard={2,0}, N guard={2,2}: wave-1 fully OOB in M
+    (_BETA_CFG, 16, 64),   # M guard={1,0}, N guard={2,2}: wave-0 partial (d0=0 only), wave-1 OOB
+    (_BETA_CFG, 48, 64),   # M guard={2,1}, N guard={2,2}: wave-1 partial (d0=0 only)
+    # --- N guard boundary cases ---
+    (_BETA_CFG, 64, 32),   # M guard={2,2}, N guard={2,0}: wave-1-N fully OOB in N
+    (_BETA_CFG, 64, 16),   # M guard={2,2}, N guard={1,0}: wave-0-N partial (d1=0 only), wave-1-N OOB
+    (_BETA_CFG, 64, 48),   # M guard={2,2}, N guard={2,1}: wave-1-N partial (d1=0 only)
+    # --- combined M+N guard cases ---
+    (_BETA_CFG, 32, 32),   # M guard={2,0}, N guard={2,0}: wave-1 and wave-1-N fully OOB
+    (_BETA_CFG, 48, 48),   # M guard={2,1}, N guard={2,1}: both dims partial at wave-1
+    (_BETA_CFG, 16, 16),   # M guard={1,0}, N guard={1,0}: both dims partial at wave-0, wave-1 OOB
+    (_BETA_CFG, 32, 48),   # M guard={2,0}, N guard={2,1}: M-OOB + N-partial corner
+    (_BETA_CFG, 48, 32),   # M guard={2,1}, N guard={2,0}: M-partial + N-OOB corner
+]
+
+
+def _build_sgprs_for_beta_test(writer):
+    """Extend the store-D sgpr layout with Beta and subtile guard SGPRs.
+
+    Builds on _build_sgprs_for_test and adds:
+      Beta       (1 reg, s[28]): beta scalar (1.0f)
+      mGuard     (1 reg, s[29]): subtileM32ValidBlocksSgpr — numValidD1Steps
+      nGuard     (1 reg, s[30]): subtileN16ValidBlocksSgpr — numValid16NBlocks
+
+    Returns the sgprs dict (same reference as writer.sgprs).
+    """
+    sgprs = _build_sgprs_for_test(writer)
+
+    beta = writer.sgprPool.checkOut(1, "Beta")
+    writer.sgprs["Beta"] = beta
+
+    mGuard = writer.sgprPool.checkOut(1, "subtileMValidBlocks")
+    writer.sgprs["subtileMValidBlocks"] = mGuard
+
+    nGuard = writer.sgprPool.checkOut(1, "subtileNValidBlocks")
+    writer.sgprs["subtileNValidBlocks"] = nGuard
+
+    return sgprs
+
+
+def _build_beta_prologue(sgprs, mt0, mt1, size_i, size_j, mi_wave_tile, c_stride=None):
+    """Prologue for the beta-path OOB guard test.
+
+    Loads two buffers from kernargs:
+      kernarg[0:8]   = C buffer ptr  (SrdC base)
+      kernarg[8:16]  = D buffer ptr  (SrdD base)
+      kernarg[16:20] = size_i
+      kernarg[20:24] = size_j
+      kernarg[24:28] = stride (= mt0, the buffer leading dimension)
+
+    Computes the subtile M/N guard SGPRs statically: because WG=(0,0) and the
+    geometry is fixed at test-build time, we precompute the values for each wave
+    in Python and write them via s_cselect (conditioned on waveIdM and waveIdN).
+
+    Guard semantics (matching _emitSubtileGuards):
+      mGuard = numValidD1Steps  = min(ceil(max(validM-waveBase,0)/MatrixInstM), MIWaveTile[0])
+      nGuard = numValid16NBlocks = min(max(validN-waveBaseN,0), waveGroupN) >> 4
+      mOff   = uninitialized (GlobalWriteBatch fills it per d0 group via s_cselect)
+
+    For WG0=WG1=0:
+      validM = size_i,  validN = size_j
+      waveBase(waveIdM) = waveIdM * waveGroupM  (waveGroupM = MatrixInstM * MIWaveTile[0])
+      waveBaseN(waveIdN) = waveIdN * waveGroupN
+    """
+    from rocisa.instruction import SLoadB64, SLoadB32, SMovB32, SLShiftRightB32, SAndB32
+
+    miM       = 16               # MatrixInstM
+    miN       = 16               # MatrixInstN
+    wg0, wg1  = 2, 2             # MIWaveGroup (4 waves)
+    miwt0     = mi_wave_tile[0]  # MIWaveTile[0]
+    miwt1     = mi_wave_tile[1]  # MIWaveTile[1]
+    waveGroupM = miM * miwt0     # rows per wave in M
+    waveGroupN = miN * miwt1     # cols per wave in N
+
+    m = Module("beta_prologue")
+
+    # Load pointers and scalars from kernargs.
+    # kernargs layout: [C_ptr(8), D_ptr(8), size_i(4), size_j(4), stride(4)]
+    srd_c = sgprs["SrdC"]
+    srd_d = sgprs["SrdD"]
+    m.add(SLoadB64(dst=sgpr(srd_c, 2), base=sgpr(0, 2), soffset=0,
+                   comment="C ptr → SrdC[0:1]"))
+    m.add(SLoadB64(dst=sgpr(srd_d, 2), base=sgpr(0, 2), soffset=8,
+                   comment="D ptr → SrdD[0:1]"))
+    m.add(SLoadB32(dst=sgpr(sgprs["SizeI"]),    base=sgpr(0, 2), soffset=16,
+                   comment="size_i → SizeI"))
+    m.add(SLoadB32(dst=sgpr(sgprs["SizeJ"]),    base=sgpr(0, 2), soffset=20,
+                   comment="size_j → SizeJ"))
+    m.add(SLoadB32(dst=sgpr(sgprs["StrideDJ"]), base=sgpr(0, 2), soffset=24,
+                   comment="stride → StrideDJ"))
+    m.add(SWaitCnt(dscnt=0, comment="wait sloads"))
+
+    # Set up SrdC: num_records = BufferOOB (real kernel restores this; here we start open).
+    m.add(SMovB32(dst=sgpr(srd_c + 2), src="0x80000000", comment="SrdC num_records = BufferOOB"))
+    m.add(SMovB32(dst=sgpr(srd_c + 3), src="0x20000",    comment="SrdC format word"))
+
+    # SrdD: same setup.
+    m.add(SMovB32(dst=sgpr(srd_d + 2), src="0x80000000", comment="SrdD num_records = BufferOOB"))
+    m.add(SMovB32(dst=sgpr(srd_d + 3), src="0x20000",    comment="SrdD format word"))
+
+    # Scalar constants.
+    m.add(SMovB32(dst=sgpr(sgprs["WorkGroup0"]), src=0,  comment="WorkGroup0 = 0"))
+    m.add(SMovB32(dst=sgpr(sgprs["WorkGroup1"]), src=0,  comment="WorkGroup1 = 0"))
+    if c_stride is not None:
+        m.add(SMovB32(dst=sgpr(sgprs["StrideCJ"]), src=c_stride,
+                      comment=f"StrideCJ = {c_stride} (tight C stride for page-fault test)"))
+    else:
+        m.add(SMovB32(dst=sgpr(sgprs["StrideCJ"]), src=sgpr(sgprs["StrideDJ"]), comment="StrideCJ = StrideDJ"))
+    m.add(SMovB32(dst=sgpr(sgprs["NumWorkGroups0"]), src=1, comment="NumWorkGroups0 = 1"))
+    m.add(SMovB32(dst=sgpr(sgprs["NumWorkGroups1"]), src=1, comment="NumWorkGroups1 = 1"))
+    # Alpha = 0.0f: accvgprs are 0, so alpha*acc = 0 regardless; but set to 1.0f for clarity.
+    # The test uses accvgprs=0, so D = alpha*0 + beta*C = beta*C = C (with beta=1).
+    m.add(SMovB32(dst=sgpr(sgprs["Alpha"]),     src="0x3f800000", comment="Alpha = 1.0f"))
+    m.add(SMovB32(dst=sgpr(sgprs["Alpha"] + 1), src="0x3f800000", comment="Alpha[1] = 1.0f"))
+    # Beta = 1.0f.
+    m.add(SMovB32(dst=sgpr(sgprs["Beta"]), src="0x3f800000", comment="Beta = 1.0f"))
+
+    # Compute subtile M/N guard SGPRs using SGPR arithmetic (matches _emitSubtileGuards).
+    # For WG=(0,0): validM = SizeI, validN = SizeJ.
+    # waveId = tid >> 6; waveIdM = waveId & 1; waveIdN = waveId >> 1.
+    # We use a scratch vgpr (v0 = tid) to read waveId into an SGPR via v_readfirstlane.
+    mGuard = sgprs["subtileMValidBlocks"]
+    nGuard = sgprs["subtileNValidBlocks"]
+
+    # Emit the guard computation matching _emitSubtileGuards logic.
+    # Use TextBlock since we need vgpr reads that are easier to express as raw asm.
+    import math
+    log2_wg0    = int(math.log2(wg0))
+    miMShift    = int(math.log2(miM))
+
+    m.add(TextBlock(
+        # --- waveId extraction ---
+        f"  v_readfirstlane_b32 s{mGuard}, v0          // lane0 tid\n"
+        f"  s_lshr_b32 s{mGuard}, s{mGuard}, 6         // waveId = tid >> 6\n"
+        f"  s_lshr_b32 s{nGuard}, s{mGuard}, {log2_wg0} // waveIdN = waveId >> {log2_wg0}\n"
+        f"  s_and_b32  s{mGuard}, s{mGuard}, {wg0-1}   // waveIdM = waveId & {wg0-1}\n"
+        # --- M guard: numValidD1Steps ---
+        # waveBase = waveIdM * waveGroupM
+        f"  s_mul_i32  s{mGuard}, s{mGuard}, {waveGroupM} // waveBase = waveIdM * {waveGroupM}\n"
+        # remainder = max(validM - waveBase, 0)  using SizeI for validM (WG0=0)
+        f"  s_sub_u32  s{mGuard}, s{sgprs['SizeI']}, s{mGuard} // remainder = SizeI - waveBase; SCC=1 if OOB\n"
+        f"  s_cselect_b32 s{mGuard}, 0, s{mGuard}      // clamp to 0 if OOB\n"
+        # ceil(remainder / miM)
+        f"  s_add_u32  s{mGuard}, s{mGuard}, {miM-1}   // ceil: + {miM-1}\n"
+        f"  s_lshr_b32 s{mGuard}, s{mGuard}, {miMShift} // numValidD1Steps = >> {miMShift}\n"
+        # min(result, MIWaveTile[0])
+        f"  s_min_u32  s{mGuard}, s{mGuard}, {miwt0}   // clamp to MIWaveTile[0]={miwt0}\n"
+        # --- N guard: numValid16NBlocks ---
+        # waveBaseN = waveIdN * waveGroupN
+        f"  s_mul_i32  s{nGuard}, s{nGuard}, {waveGroupN} // waveBaseN = waveIdN * {waveGroupN}\n"
+        # remainder = max(validN - waveBaseN, 0)  using SizeJ for validN (WG1=0)
+        f"  s_sub_u32  s{nGuard}, s{sgprs['SizeJ']}, s{nGuard} // validN - waveBaseN; SCC=1 if OOB\n"
+        f"  s_cselect_b32 s{nGuard}, 0, s{nGuard}      // clamp to 0 if OOB\n"
+        # clamp to waveGroupN
+        f"  s_sub_u32  s{sgprs['Alpha']+1}, s{nGuard}, {waveGroupN} // SCC=1 if < waveGroupN\n"
+        f"  s_cselect_b32 s{nGuard}, s{nGuard}, {waveGroupN} // min(validN_wave, waveGroupN)\n"
+        f"  s_lshr_b32 s{nGuard}, s{nGuard}, 4          // numValid16NBlocks = >> 4\n"
+        # Restore Alpha[1] = 1.0f (reused as tmp above).
+        f"  s_mov_b32  s{sgprs['Alpha']+1}, 0x3f800000  // restore Alpha[1] = 1.0f\n"
+    ))
+
+    return m
+
+
+def _build_accvgpr_zero_asm(agpr_indices, tmp_v):
+    """Zero-initialize all accvgprs (simulates a GEMM result of 0)."""
+    m = Module("accvgpr_zero")
+    m.add(TextBlock(f"  v_mov_b32 v{tmp_v}, 0           // zero\n"))
+    for agpr in agpr_indices:
+        m.add(TextBlock(f"  v_accvgpr_write_b32 a{agpr}, v{tmp_v}\n"))
+    return m
+
+
+def _run_storeD_beta(cfg, tmp_path, size_i, size_j, mi_wave_group=None, dump_asm=False):
+    """Assemble and run the store-D beta-path test.
+
+    Sets up UseSubtileImpl=1, UseBeta=True, alpha=1, beta=1, accvgprs=0.
+    Loads C from a column-major buffer; D should equal C at valid (row,col)
+    positions and remain sentinel at OOB positions (SrdC+2 gating prevents
+    OOB C loads, and SrdD OOB-redirects the store).
+
+    Returns:
+        (out, c_arr, round_mt0, round_mt1):
+            out       — flat float32 tuple from the D output buffer.
+            c_arr     — numpy float32 array (column-major, size round_mt0*round_mt1)
+                        used as the reference C values at valid positions.
+            round_mt0 — buffer row count (= mt0 = 64 for this test)
+            round_mt1 — buffer col count (= mt1 = 64)
+    """
+    if mi_wave_group is None:
+        mi_wave_group = [2, 2]
+
+    # Build kernel with UseSubtileImpl=1 and UseBeta=True.
+    kernel = _build_store_kernel(cfg, mi_wave_group=mi_wave_group)
+    kernel["UseSubtileImpl"] = True
+    kernel["ProblemType"]["UseBeta"] = True
+    kernel["NumThreads"] = NUM_THREADS
+
+    writer, _, _, _ = create_writer(cfg, mi_wave_group=mi_wave_group)
+    sgprs = _build_sgprs_for_beta_test(writer)
+
+    tileInfoD, agpr_indices = _allocate_d_tile(kernel, writer)
+    kw = _build_kwa(kernel, writer)
+    kw.states.d.tileInfo = tileInfoD
+
+    # Wire subtile guard SGPRs into kw.states so GlobalWriteBatch can use them.
+    kw.states.subtileM32ValidBlocksSgpr = sgprs["subtileMValidBlocks"]
+    kw.states.subtileN16ValidBlocksSgpr = sgprs["subtileNValidBlocks"]
+    kw.states.subtileMBlockSize         = 16  # MatrixInstM for f32
+
+    tmp_v = writer.vgprPool.checkOut(1, "tmp_v", preventOverflow=False)
+
+    kw.codes.accVgprRead = mapAcctoArchRegs(kernel, kw.states.maxLimitAgprs, write=False)
+    store_indices_mod = kw.notLocalSplitUGlobalWriteIndices(kernel)
+    kw.states.c.startVgprValu = 0
+    store_write_mod = kw.notLocalSplitUGlobalWrite(kernel, tPA=None, tPB=None)
+
+    round_mt0 = cfg.mt_a
+    round_mt1 = cfg.mt_b
+    stride_d  = round_mt0
+
+    # C buffer: column-major, value at (row, col) = float(col * round_mt0 + row).
+    # Positions outside (size_i, size_j) use the NaN sentinel so that any OOB
+    # load that bypasses the guard would produce an obviously wrong value in D.
+    _SENTINEL_F32 = struct.unpack('f', struct.pack('I', 0xFFFFFFFF))[0]
+    c_flat = []
+    for col in range(round_mt1):
+        for row in range(round_mt0):
+            if row < size_i and col < size_j:
+                c_flat.append(float(col * round_mt0 + row))
+            else:
+                c_flat.append(_SENTINEL_F32)
+    c_arr = np.array(c_flat, dtype=np.float32)
+
+    prologue = _build_beta_prologue(sgprs, round_mt0, round_mt1, size_i, size_j,
+                                    mi_wave_tile=kernel["MIWaveTile"])
+    init_mod = _build_accvgpr_zero_asm(agpr_indices, tmp_v)
+
+    store_write_asm = str(store_write_mod)
+    inner_asm = "\n".join([
+        ".set BufferOOB, 0x80000000\n",
+        ".set vgprValuC, 0\n",
+        str(prologue),
+        str(init_mod),
+        "  s_nop 3  // CDNA3 acc write→read latency\n",
+        str(store_indices_mod),
+        store_write_asm,
+    ])
+
+    wg = mi_wave_group
+    label = f"beta_{cfg.label}_wg{'x'.join(str(g) for g in wg)}_m{size_i}n{size_j}"
+
+    args = [
+        ("c_input",  8, "global_buffer", "u8"),
+        ("output",   8, "global_buffer", "u8"),
+        ("size_i",   4, "by_value",      "u32"),
+        ("size_j",   4, "by_value",      "u32"),
+        ("stride_d", 4, "by_value",      "u32"),
+    ]
+
+    full_asm = generate_kernel_asm(inner_asm, writer, args, lds_size=0, num_threads=NUM_THREADS)
+
+    if dump_asm:
+        print(f"\n[dump_asm] {label}")
+        print(f"Store indices:\n{str(store_indices_mod)}")
+        print(f"Store write (first 200 lines):\n" +
+              "\n".join(store_write_asm.splitlines()[:200]))
+
+    output_size = round_mt0 * round_mt1 * 4  # f32 bytes
+    raw = assemble_and_run(
+        full_asm, tmp_path, label,
+        output_size=output_size,
+        inputs=(c_arr,),
+        scalars=(size_i, size_j, stride_d),
+        num_threads=NUM_THREADS,
+    )
+    out = struct.unpack(f"{round_mt0 * round_mt1}f", raw[:output_size])
+    return out, c_arr, round_mt0, round_mt1
+
+
+@pytest.mark.parametrize("cfg,size_i,size_j", BETA_OOB_CASES,
+                         ids=[f"{c.label}_m{si}n{sj}" for c, si, sj in BETA_OOB_CASES])
+def test_storeD_beta_oob_guard(cfg, size_i, size_j, tmp_path):
+    """Beta-path OOB guard: SrdC+2 gating prevents OOB waves from loading garbage from C.
+
+    Geometry: MT=64×64, MIWaveTile=[2,2], UseSubtileImpl=1.
+    Wave layout: 4 waves (MIWaveGroup=[2,2]), wave_rows=32, wave_cols=32.
+
+    Scenario: accvgprs=0, alpha=1, beta=1.
+      D = alpha*acc + beta*C = 0 + 1*C = C   at valid positions
+      D = sentinel                            at OOB positions (store OOB-redirected)
+
+    The SrdC+2 gating fix (GlobalWriteBatch.py) must ensure that OOB waves do
+    NOT load C (which would produce garbage) and instead use 0, so that the
+    final D value at valid positions is exactly C.
+
+    Without the fix, OOB waves load garbage from C, then the store for valid
+    elements of the same wave sees the corrupted acc value and writes wrong data.
+    With the fix: SrdC+2=0 returns 0 for all C bytes of OOB waves, so D=C
+    at valid positions and the OOB store is suppressed by the SrdD OOB redirect.
+    """
+    init_rocisa()
+    out, c_arr, round_mt0, round_mt1 = _run_storeD_beta(cfg, tmp_path, size_i, size_j)
+
+    D_u32   = np.array(out,   dtype=np.float32).view(np.uint32).reshape(round_mt0, round_mt1, order='F')
+    ref_u32 = c_arr.view(np.uint32).reshape(round_mt0, round_mt1, order='F')
+
+    D_f32 = np.array(out, dtype=np.float32).reshape(round_mt0, round_mt1, order='F')
+    C_f32 = c_arr.reshape(round_mt0, round_mt1, order='F')
+
+    errors = []
+    for col in range(size_j):
+        for row in range(size_i):
+            if D_u32[row, col] != ref_u32[row, col]:
+                errors.append((row, col, float(C_f32[row, col]), float(D_f32[row, col])))
+    assert not errors, (
+        f"Beta OOB guard mismatch at {len(errors)} valid positions "
+        f"(first 5 (row,col,expected_C,got): {errors[:5]})"
+    )
+    _verify_oob_sentinel(out, round_mt0, round_mt1, size_i, size_j, label="f32")
+
+
+# ---------------------------------------------------------------------------
+# SrdC+2 C-load OOB guard test via page-fault detection
+#
+# Allocates the C buffer with tight stride (size_i) so that the last valid
+# element sits exactly at a page boundary.  The next page is mprotect'd
+# PROT_NONE and not registered with HIP, so it has no IOMMU mapping.
+#
+# If SrdC+2 gating is broken (OOB C loads go through), the OOB wave's load
+# for the last valid N column hits the guard page → GPU IOMMU fault →
+# hipDeviceSynchronize() returns a non-zero error code.
+#
+# If the fix is in place (SrdC+2=0 for OOB elements), the hardware returns
+# 0 without touching memory and the kernel completes cleanly.
+# ---------------------------------------------------------------------------
+
+import ctypes
+import mmap as mmap_module
+import resource as resource_module
+
+# Cases where OOB C loads reliably reach the guard page (verified empirically).
+# For M=16/48 the per-thread MI layout keeps addresses within the allocated
+# buffer even when SrdC+2 gating is disabled, so those cases can't trigger
+# the hardware fault — they are covered by test_storeD_beta_oob_guard instead.
+CLOAD_OOB_CASES = [
+    (_BETA_CFG, 32, 64),   # wave-1-M fully OOB → last col hits guard
+    (_BETA_CFG, 64, 32),   # wave-1-N fully OOB → last row hits guard
+    (_BETA_CFG, 64, 16),   # wave-0-N partially OOB → hits guard
+    (_BETA_CFG, 64, 48),   # wave-1-N partially OOB → hits guard
+    (_BETA_CFG, 32, 32),   # M and N both OOB → hits guard
+    (_BETA_CFG, 32, 48),   # M OOB + N partial → hits guard
+]
+
+# Cases where the per-thread MI address layout stays within the allocated
+# buffer even without SrdC+2 gating.  These should never trigger a page fault
+# regardless of whether the gate is present.
+CLOAD_SAFE_CASES = [
+    # Fully in-bounds baseline: M%MT0==0, N%MT1==0 → all waves valid.
+    (_BETA_CFG, 64, 64),
+
+    # M Edge-path (M%MT0 ∉ {0, 32}): edgeProtectCode handles masking, not SrdC+2.
+    # The page-fault mechanism cannot distinguish broken SrdC+2 gating on these
+    # cases — they are covered by test_storeD_beta_oob_guard (sentinel check).
+    (_BETA_CFG, 16, 64),   # M=16: edge path for M
+    (_BETA_CFG, 48, 64),   # M=48: edge path for M
+    (_BETA_CFG, 48, 48),   # M=48, N=48: both edge path
+    (_BETA_CFG, 16, 16),   # M=16, N=16: both edge path
+
+    # NonEdge path (M%MT0==32 or N%MT1==32): SrdC+2 gate is emitted.
+    # M/N does not divide MT; the OOB stride offset overshoots the single guard
+    # page window (guard page = c_pages..c_pages+PAGE_SIZE), so no IOMMU fault
+    # occurs even when SrdC+2 gating is absent.
+    (_BETA_CFG, 32, 16),   # M%MT0==32 → NonEdge; N=16 small partial (N%MT1≠32)
+    (_BETA_CFG, 16, 32),   # N%MT1==32 → NonEdge; M=16 edge (M%MT0≠32)
+    (_BETA_CFG, 48, 32),   # N%MT1==32 → NonEdge; M=48 edge (M%MT0≠32)
+]
+
+CLOAD_OOB_CASES = [
+    (_BETA_CFG, 32, 64),   # wave-1-M fully OOB → last col hits guard
+    (_BETA_CFG, 64, 32),   # wave-1-N fully OOB → last row hits guard
+    (_BETA_CFG, 64, 16),   # wave-0-N partially OOB → hits guard
+    (_BETA_CFG, 64, 48),   # wave-1-N partially OOB → hits guard
+    (_BETA_CFG, 32, 32),   # M and N both OOB → hits guard
+    (_BETA_CFG, 32, 48),   # M OOB + N partial → hits guard
+]
+
+
+def _run_storeD_cload_pagefault(cfg, tmp_path, size_i, size_j, mi_wave_group=None,
+                                dump_asm=False):
+    """Assemble and run the C-load page-fault OOB detection test.
+
+    C buffer layout (tight stride = size_i):
+      - Valid region: size_i × size_j f32 elements, column-major
+      - Last valid byte sits exactly at a page boundary
+      - The next page is PROT_NONE and has no HIP/IOMMU mapping
+
+    An OOB C load (SrdC+2 not gated to 0) for the last N column will access
+    the guard page → GPU IOMMU fault → non-zero hipDeviceSynchronize() result.
+
+    Returns:
+        (err_code, int): The raw hipDeviceSynchronize() return value.
+                         0 = no fault (test should pass), non-zero = fault detected.
+    """
+    PAGE_SIZE = resource_module.getpagesize()
+
+    # Initialize device first so hipHostRegister has a valid context even after
+    # a hipDeviceReset() in a previous test iteration.
+    hip_check(hip.hipInit(0))
+    hip_check(hip.hipSetDevice(0))
+
+    if mi_wave_group is None:
+        mi_wave_group = [2, 2]
+
+    kernel = _build_store_kernel(cfg, mi_wave_group=mi_wave_group)
+    kernel["UseSubtileImpl"] = True
+    kernel["ProblemType"]["UseBeta"] = True
+    kernel["NumThreads"] = NUM_THREADS
+
+    writer, _, _, _ = create_writer(cfg, mi_wave_group=mi_wave_group)
+    sgprs = _build_sgprs_for_beta_test(writer)
+
+    tileInfoD, agpr_indices = _allocate_d_tile(kernel, writer)
+    kw = _build_kwa(kernel, writer)
+    kw.states.d.tileInfo = tileInfoD
+
+    kw.states.subtileM32ValidBlocksSgpr = sgprs["subtileMValidBlocks"]
+    kw.states.subtileN16ValidBlocksSgpr = sgprs["subtileNValidBlocks"]
+    kw.states.subtileMBlockSize         = 16
+
+    tmp_v = writer.vgprPool.checkOut(1, "tmp_v", preventOverflow=False)
+
+    kw.codes.accVgprRead = mapAcctoArchRegs(kernel, kw.states.maxLimitAgprs, write=False)
+    store_indices_mod = kw.notLocalSplitUGlobalWriteIndices(kernel)
+    kw.states.c.startVgprValu = 0
+    store_write_mod = kw.notLocalSplitUGlobalWrite(kernel, tPA=None, tPB=None)
+
+    round_mt0 = cfg.mt_a
+    round_mt1 = cfg.mt_b
+
+    # Use tight stride (size_i) for C so OOB accesses in the last column
+    # spill past the buffer end and into the guard page.
+    prologue = _build_beta_prologue(sgprs, round_mt0, round_mt1, size_i, size_j,
+                                    mi_wave_tile=kernel["MIWaveTile"],
+                                    c_stride=size_i)
+    init_mod = _build_accvgpr_zero_asm(agpr_indices, tmp_v)
+
+    store_write_asm = str(store_write_mod)
+    inner_asm = "\n".join([
+        ".set BufferOOB, 0x80000000\n",
+        ".set vgprValuC, 0\n",
+        str(prologue),
+        str(init_mod),
+        "  s_nop 3\n",
+        str(store_indices_mod),
+        store_write_asm,
+    ])
+
+    label = f"cload_pg_{cfg.label}_m{size_i}n{size_j}"
+    args = [
+        ("c_input",  8, "global_buffer", "u8"),
+        ("output",   8, "global_buffer", "u8"),
+        ("size_i",   4, "by_value",      "u32"),
+        ("size_j",   4, "by_value",      "u32"),
+        ("stride_d", 4, "by_value",      "u32"),
+    ]
+
+    full_asm = generate_kernel_asm(inner_asm, writer, args, lds_size=0, num_threads=NUM_THREADS)
+
+    if dump_asm:
+        print(f"\n[dump_asm] {label}")
+        print(store_write_asm[:2000])
+
+    # Assemble to code object.
+    co_path = str(tmp_path / f"test_{label}.co")
+    assemble_kernel(full_asm, co_path)
+
+    # --- Guarded C buffer ---
+    # Tight C layout: size_i × size_j f32, column-major, stride=size_i.
+    valid_bytes = size_i * size_j * 4
+    c_pages = ((valid_bytes + PAGE_SIZE - 1) // PAGE_SIZE) * PAGE_SIZE
+    total   = c_pages + PAGE_SIZE  # valid region + 1 guard page
+
+    mm = mmap_module.mmap(-1, total,
+                          flags=mmap_module.MAP_SHARED | mmap_module.MAP_ANONYMOUS,
+                          prot=mmap_module.PROT_READ | mmap_module.PROT_WRITE)
+    libc    = ctypes.CDLL("libc.so.6", use_errno=True)
+    buf_ptr = ctypes.addressof(ctypes.c_char.from_buffer(mm))
+
+    # Protect the guard page (CPU PROT_NONE; also not registered with HIP).
+    ret = libc.mprotect(ctypes.c_void_p(buf_ptr + c_pages),
+                        ctypes.c_size_t(PAGE_SIZE), ctypes.c_int(0))
+    assert ret == 0, f"mprotect failed errno={ctypes.get_errno()}"
+
+    # Register valid pages with HIP so the GPU can access them via IOMMU.
+    # hipHostRegister expects a plain int for the host pointer.
+    hip_check(hip.hipHostRegister(buf_ptr, c_pages, int(hip.hipHostRegisterDefault)))
+
+    # Shift C data to end exactly at the page boundary.
+    # data_ptr = buf_ptr + c_pages - valid_bytes → last byte at buf_ptr+c_pages-1.
+    data_offset = c_pages - valid_bytes
+    host_data_ptr = buf_ptr + data_offset
+
+    # Fill valid C region (column-major, stride=size_i).
+    c_np = np.arange(size_i * size_j, dtype=np.float32)
+    ctypes.memmove(host_data_ptr, c_np.ctypes.data, valid_bytes)
+
+    dev_c_ptr = hip_check(hip.hipHostGetDevicePointer(host_data_ptr, 0))
+
+    # --- D output buffer (regular hipMalloc, round_mt0 stride) ---
+    output_size = round_mt0 * round_mt1 * 4
+    d_output    = hip_check(hip.hipMalloc(output_size))
+    hip_check(hip.hipMemset(d_output, 0xff, output_size))
+
+    # --- Launch kernel ---
+    module = hip_check(hip.hipModuleLoad(co_path.encode()))
+    kern   = hip_check(hip.hipModuleGetFunction(module, b"test_kernel"))
+
+    stride_d = round_mt0
+
+    class KernArgs(ctypes.Structure):
+        _fields_ = [
+            ("c_ptr",    ctypes.c_uint64),
+            ("out_ptr",  ctypes.c_uint64),
+            ("size_i",   ctypes.c_uint32),
+            ("size_j",   ctypes.c_uint32),
+            ("stride_d", ctypes.c_uint32),
+        ]
+
+    kargs      = KernArgs(int(dev_c_ptr), int(d_output),
+                          size_i, size_j, stride_d)
+    kargs_size = ctypes.c_size_t(ctypes.sizeof(kargs))
+    extra = (ctypes.c_void_p * 5)(
+        ctypes.c_void_p(0x01),
+        ctypes.c_void_p(ctypes.addressof(kargs)),
+        ctypes.c_void_p(0x02),
+        ctypes.c_void_p(ctypes.addressof(kargs_size)),
+        ctypes.c_void_p(0x03),
+    )
+
+    hip_check(hip.hipModuleLaunchKernel(kern, 1, 1, 1, NUM_THREADS, 1, 1,
+                                        0, None, None, extra))
+
+    # Do NOT use hip_check here: a page-fault returns non-zero and we want to
+    # observe the error rather than raise immediately.
+    sync_result = hip.hipDeviceSynchronize()
+    if isinstance(sync_result, tuple):
+        err_code = sync_result[0]
+    else:
+        err_code = sync_result
+
+    # Cleanup.  On GPU fault the context is poisoned; hipDeviceReset recovers it
+    # but invalidates all existing allocations, so skip further HIP calls.
+    if err_code != 0:
+        hip.hipDeviceReset()
+        # hipHostUnregister would fail on the reset context; skip it.
+        # The mmap will be closed below which releases the host memory.
+    else:
+        hip_check(hip.hipFree(d_output))
+        hip_check(hip.hipModuleUnload(module))
+        hip.hipHostUnregister(buf_ptr)  # best-effort; ignore return value
+    mm.close()
+
+    return err_code
+
+
+@pytest.mark.parametrize("cfg,size_i,size_j", CLOAD_OOB_CASES,
+                         ids=[f"{c.label}_m{si}n{sj}" for c, si, sj in CLOAD_OOB_CASES])
+def test_storeD_cload_pagefault(cfg, size_i, size_j, tmp_path):
+    """SrdC+2 gating: OOB C loads must not reach memory (verified via page-fault).
+
+    C buffer is tight-stride (stride=size_i) with a guard page immediately
+    after the last valid byte.  With the fix (SrdC+2=0 for OOB elements) no
+    memory access crosses the boundary and the kernel completes cleanly.
+
+    Without the fix (SrdC+2=BufferOOB for OOB elements), the last-column OOB
+    load hits the guard page → GPU IOMMU fault → non-zero sync error.
+    """
+    init_rocisa()
+    err = _run_storeD_cload_pagefault(cfg, tmp_path, size_i, size_j)
+    assert err == 0, (
+        f"GPU page fault detected (err={err}): OOB C load crossed guard page. "
+        f"SrdC+2 gating is broken for size_i={size_i}, size_j={size_j}."
+    )
+
+
+@pytest.mark.parametrize("cfg,size_i,size_j", CLOAD_SAFE_CASES,
+                         ids=[f"{c.label}_m{si}n{sj}" for c, si, sj in CLOAD_SAFE_CASES])
+def test_storeD_cload_pagefault_safe(cfg, size_i, size_j, tmp_path):
+    """Guard-page test for cases where MI layout keeps accesses in-bounds.
+
+    These sizes never trigger a fault even without SrdC+2 gating, so the
+    page-fault mechanism cannot detect a broken gate here.  The test verifies
+    that the infrastructure itself doesn't spuriously fault on safe inputs.
+    """
+    init_rocisa()
+    err = _run_storeD_cload_pagefault(cfg, tmp_path, size_i, size_j)
+    assert err == 0, (
+        f"Unexpected GPU fault (err={err}) on safe-case size_i={size_i}, size_j={size_j}. "
+        "The guard page was hit even though all C accesses should be in-bounds."
+    )
 
 
 # ---------------------------------------------------------------------------
