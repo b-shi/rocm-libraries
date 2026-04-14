@@ -3915,6 +3915,10 @@ class KernelWriter(metaclass=abc.ABCMeta):
       if tileInfo != None:
         tileInfo.deallocOffsetRegisters(self, kernel)
 
+    # For subtile kernels, free SGPRs that were only needed during the main loop
+    if kernel["UseSubtileImpl"]:
+      module.add(self.undefineSubtileMainLoopSgprs(kernel))
+
     # Deallocate registers used for VGPR A/B/MXS tiles
     if pgr != 2:
       for tileInfo in [atileInfo, btileInfo,mxsatileInfo, mxsbtileInfo]:

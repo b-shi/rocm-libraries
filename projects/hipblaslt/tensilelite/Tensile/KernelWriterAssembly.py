@@ -560,6 +560,26 @@ class KernelWriterAssembly(KernelWriter):
 
     return module
 
+  def undefineSubtileMainLoopSgprs(self, kernel):
+    """Undefine SGPRs used only during the main loop that are not needed in the post-loop.
+    Called for subtile kernels after deallocOffsetRegisters and before endSummation/post-loop."""
+    module = Module("UndefineSubtileMainLoopSgprs")
+    for name in ["LocalWriteBaseAddrA", "LocalWriteBaseAddrB"]:
+      if name in self.sgprs:
+        module.add(self.undefineSgpr(name))
+    if kernel["ProblemType"]["MXBlockA"] and "LocalWriteBaseAddrMXSA" in self.sgprs:
+      module.add(self.undefineSgpr("LocalWriteBaseAddrMXSA"))
+    if kernel["ProblemType"]["MXBlockB"] and "LocalWriteBaseAddrMXSB" in self.sgprs:
+      module.add(self.undefineSgpr("LocalWriteBaseAddrMXSB"))
+    for name in ["SwapA", "SwapB"]:
+      if name in self.sgprs:
+        module.add(self.undefineSgpr(name))
+    if kernel["ProblemType"]["MXBlockA"] and "SwapMXSA" in self.sgprs:
+      module.add(self.undefineSgpr("SwapMXSA"))
+    if kernel["ProblemType"]["MXBlockB"] and "SwapMXSB" in self.sgprs:
+      module.add(self.undefineSgpr("SwapMXSB"))
+    return module
+
   def removeGROffsetsVariableSgprsFromPool(self, kernel):
     module = Module("RemoveGROffsetSgprsFromPool")
 
