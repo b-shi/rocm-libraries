@@ -91,6 +91,24 @@ def create_writer_with_tiles(kernel, tiA, tiB, scaleTiA=None, scaleTiB=None):
         scaleTiA.allocOffsetRegisters(writer, kernel)
     if scaleTiB:
         scaleTiB.allocOffsetRegisters(writer, kernel)
+    # Named sgprs for GR_INC / LR_INC emit paths
+    writer.sgprs = {}
+    writer.sgprs["SrdA"] = writer.sgprPool.checkOutAligned(4, 4, "SrdA", preventOverflow=False)
+    writer.sgprs["SrdB"] = writer.sgprPool.checkOutAligned(4, 4, "SrdB", preventOverflow=False)
+    writer.sgprs["LocalWriteBaseAddrA"] = writer.sgprPool.checkOut(1, preventOverflow=False)
+    writer.sgprs["LocalWriteBaseAddrB"] = writer.sgprPool.checkOut(1, preventOverflow=False)
+    writer.sgprs["SwapA"] = writer.sgprPool.checkOut(1, preventOverflow=False)
+    writer.sgprs["SwapB"] = writer.sgprPool.checkOut(1, preventOverflow=False)
+    writer.ldsTotalSize = 0
+    if scaleTiA and scaleTiB:
+        writer.sgprs["SrdMXSA"] = writer.sgprPool.checkOutAligned(4, 4, "SrdMXSA", preventOverflow=False)
+        writer.sgprs["SrdMXSB"] = writer.sgprPool.checkOutAligned(4, 4, "SrdMXSB", preventOverflow=False)
+        writer.sgprs["LocalWriteBaseAddrMXSA"] = writer.sgprPool.checkOut(1, preventOverflow=False)
+        writer.sgprs["LocalWriteBaseAddrMXSB"] = writer.sgprPool.checkOut(1, preventOverflow=False)
+        writer.sgprs["SwapMXSA"] = writer.sgprPool.checkOut(1, preventOverflow=False)
+        writer.sgprs["SwapMXSB"] = writer.sgprPool.checkOut(1, preventOverflow=False)
+        writer.sgprs["StridesMXSA"] = writer.sgprPool.checkOut(1, preventOverflow=False)
+        writer.sgprs["StridesMXSB"] = writer.sgprPool.checkOut(1, preventOverflow=False)
     return writer
 
 
@@ -494,7 +512,7 @@ def test_PGR2_64_64_1x1_emitted_modules_links(verbose=False):
         (4, "sync", 1, 3),
         (5, "lr_inc", 6, 4),
         (6, "wait_lr", 1, 1),
-        (7, "gr_inc", 10, 2),
+        (7, "gr_inc", 8, 2),
     ]
 
     if verbose:
@@ -548,7 +566,7 @@ def test_PGR2_256_256_1x1_extract_paths_from_before_deps():
         (4, "sync", 1, 3),
         (5, "lr_inc", 6, 4),
         (6, "wait_lr", 1, 1),
-        (7, "gr_inc", 10, 2),
+        (7, "gr_inc", 8, 2),
     ]
 
     mfmaIdx0, pathOrders0 = SubtileBasedScheduler._extractPathsFromBeforeDeps(emitted0)
@@ -646,8 +664,8 @@ def test_PGR2_256_256_fp4_instruction_schedule_exact():
         "MLMLMLMLMLMLMLMLMLMLMLMLMLMLMLMLMMMMSSMSSMGSMSMMMGMSMMMGMSMMMGMSMMMGM" \
         "SMMMGMSMMMGMSMMMGMSMMMGMSMMMGMMMMMM"
     expected_sik1 = \
-        "MSMGMSMMMMMGMSMMMMMGMSMMMMMGMSMMMMMGMSMMMSMSSMSGSMSSSMSSMSSMSLMLMGLM" \
-        "SLMLMLMLMLMGLSMSLSMSLSMSLSMSLSMSLSMSLSMSLSMSLSMSLSMSLMLMLMLMLMLMMMMSM"
+        "MSMGMSMMMMMGMSMMMMMMGMSMMMMMGMSMMMMMMGMSMSMSSMSSMSSMSSGMSSSMSLMLMLML" \
+        "MLMGLMSLMLMLMLMLMLGMSLSMSLSMSLSMSLSMSLSMSLSMSLSMSLSMSLSMLMLMLMMMMSM"
 
     assert seq0 == expected_sik0, f"subIterK=0 mismatch:\n  got: {seq0}\n  exp: {expected_sik0}"
     assert seq1 == expected_sik1, f"subIterK=1 mismatch:\n  got: {seq1}\n  exp: {expected_sik1}"
