@@ -552,8 +552,6 @@ def _applyWavePartitionLROffset(module, writer, kernel, tileInfo):
   waveId = writer.vgprPool.checkOut(1)
   module.add(VLShiftRightB32(dst=vgpr(waveId), shiftHex=hex(wavesize.bit_length()-1), src=vgpr("Serial"), comment="waveId"))
 
-  # Interleaved needed to be compatible with tensilelite storeC code.
-  interleaved = False#True
   if tileInfo.loadRatioGR == 1.0:
     # W0 W2
     # W1 W3
@@ -563,9 +561,9 @@ def _applyWavePartitionLROffset(module, writer, kernel, tileInfo):
     else:
       module.add(VLShiftRightB32(dst=vgpr(waveId), shiftHex=hex(1), src=vgpr(waveId), comment="%s: waveId / 2"%tc))
 
-    sInterval = tileInfo.subtileSize if interleaved else MT * subIterKBytes // 2
+    sInterval = MT * subIterKBytes // 2
   elif tileInfo.loadRatioGR == 0.5:
-    sInterval = tileInfo.subtileSize if interleaved else MT * subIterKBytes // 4
+    sInterval = MT * subIterKBytes // 4
   else:
     raise NotImplementedError("Unsupported loadRatioGR for wave partition: %s"%str(tileInfo.loadRatioGR))
 
@@ -1329,7 +1327,7 @@ def globalReadDoSubtile(tc, writer, kernel):
 
   return module
 
-def emitSingleDsRead(tileInfo, sId0, sId1, subIterK, dstTile, interleaved = False):
+def emitSingleDsRead(tileInfo, sId0, sId1, subIterK, dstTile):
   """Emit a single DSLoadB128 for one MMA tile within a subtile.
 
   Args:
@@ -1344,15 +1342,7 @@ def emitSingleDsRead(tileInfo, sId0, sId1, subIterK, dstTile, interleaved = Fals
   addrVgpr = tileInfo.sharedVgprLROffset[mfmaId]
 
   offsetStride = tileInfo.subtileSize
-  if interleaved:
-    if tileInfo.loadRatioGR == 2.0:
-      offset = sId0*offsetStride
-    elif tileInfo.loadRatioGR == 0.5:
-      offset = sId0*4*offsetStride
-    else:
-      offset = sId0*2*offsetStride
-  else:
-    offset = sId0*offsetStride
+  offset = sId0*offsetStride
 
   offset = offset + sId1 * tileInfo.globalSubtileGrid[0] * offsetStride
 

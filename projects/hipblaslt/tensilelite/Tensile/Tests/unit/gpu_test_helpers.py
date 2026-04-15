@@ -121,6 +121,8 @@ def _create_kernel(cfg, mi_wave_group=None):
         "MIWaveGroup": MIWaveGroup,
         "WavefrontSize": WAVESIZE,
         "UseSubtileImpl": True,
+        "NonTemporalA": 0,
+        "NonTemporalB": 0,
         "ProblemType": {
             "DataTypeA": dtype,
             "DataTypeB": dtype,
