@@ -117,6 +117,12 @@ BenchmarkProblems:
           - Exact: [33,  128, 1, 256]   # M odd, N full tile
           - Exact: [128,  33, 1, 256]   # M full tile, N odd
           - Exact: [3,     5, 1, 256]   # very small odd
+          # Batched (batch_count > 1)
+          - Exact: [128, 128, 2, 256]   # batch=2, full tile
+          - Exact: [256, 256, 3, 256]   # batch=3, full tile
+          - Exact: [192, 192, 2, 256]   # batch=2, edge case
+          - Exact: [48,   48, 2, 256]   # batch=2, non-mult-of-32
+          - Exact: [33,   65, 2, 256]   # batch=2, both odd
 
   ########################################
   # FP4 TN — no bias, large DU (DU = 512)
@@ -179,6 +185,9 @@ BenchmarkProblems:
           - Exact: [17,   33, 1,  512]   # both odd
           - Exact: [63,   63, 1,  512]   # both odd, just below 64
           - Exact: [97,  129, 1,  512]   # both odd, just above 96/128
+          # Batched (batch_count > 1)
+          - Exact: [128, 128, 2,  512]   # batch=2, full tile
+          - Exact: [63,   63, 2,  512]   # batch=2, both odd
 
   ########################################
   # F4SS TN — MX FP4 input, F32 output, DU = 2*MI_K = 256
@@ -240,6 +249,10 @@ BenchmarkProblems:
           # Odd M,N
           - Exact: [17,   33, 1, 256]   # both odd
           - Exact: [63,   63, 1, 256]   # both odd, just below 64
+          # Batched (batch_count > 1)
+          - Exact: [128, 128, 2, 256]   # batch=2, full tile
+          - Exact: [192, 192, 3, 256]   # batch=3, edge case
+          - Exact: [50,  100, 2, 256]   # batch=2, non-mult-of-32
 
   ########################################
   # FP4 TN — with bias (float32 bias vector)
@@ -283,6 +296,7 @@ BenchmarkProblems:
       BenchmarkFinalParameters:
         - ProblemSizes:
           - Exact: [128, 128, 1, 256]
+          - Exact: [128, 128, 2, 256]   # batch=2, with bias
         - BiasTypeArgs: ['s']
         - ActivationArgs:
           - [Enum: none]

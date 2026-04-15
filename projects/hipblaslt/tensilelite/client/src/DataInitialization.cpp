@@ -1844,11 +1844,22 @@ namespace TensileLite
                 auto        rows    = tensorA.sizes()[0];
                 auto        cols    = tensorA.sizes()[1];
                 auto        stride  = tensorA.strides()[1];
+                size_t      batchCount = tensorA.sizes().size() > 2 ? tensorA.sizes()[2] : 1;
 
                 auto& pristineA
                     = m_vdata[ContractionProblemGemm::TENSOR::A].pristine[rocisa::DataType::Float4];
                 auto& pristineMXScaleA
                     = m_vdata[ContractionProblemGemm::TENSOR::MXSA].pristine[problem.mxsa().dataType()];
+
+                // FP4: 2 elements packed per byte, batch stride in bytes = strides[2] / 2
+                size_t dataBatchStrideBytes = 0;
+                size_t scaleBatchStrideBytes = 0;
+                if(batchCount > 1)
+                {
+                    dataBatchStrideBytes  = tensorA.strides()[2] / 2;
+                    auto const& mxsaTensor = problem.mxsa();
+                    scaleBatchStrideBytes = mxsaTensor.strides()[mxsaTensor.sizes().size() - 1];
+                }
 
                 auto initA = m_vdata[ContractionProblemGemm::TENSOR::A].init;
 
@@ -1856,21 +1867,29 @@ namespace TensileLite
                 std::memset(pristineMXScaleA.cpuInput.valid.get(),
                             0x00,
                             problem.mxsa().totalAllocatedElements());
-                generateMXInput((hipDataType)HIP_R_4F_E2M1,
-                                pristineA.cpuInput.valid.get(),
-                                pristineMXScaleA.cpuInput.valid.get(),
-                                rows,
-                                cols,
-                                stride,
-                                problem.transA(),
-                                preSwizzleA,
-                                preTileA,
-                                problem.mxBlockA(),
-                                1,
-                                true,
-                                initModeToMXMethod(initA),
-                                -1.0f,
-                                1.0f);
+
+                for(size_t b = 0; b < batchCount; b++)
+                {
+                    auto* dataPtr  = static_cast<uint8_t*>(pristineA.cpuInput.valid.get())
+                                     + b * dataBatchStrideBytes;
+                    auto* scalePtr = static_cast<uint8_t*>(pristineMXScaleA.cpuInput.valid.get())
+                                     + b * scaleBatchStrideBytes;
+                    generateMXInput((hipDataType)HIP_R_4F_E2M1,
+                                    dataPtr,
+                                    scalePtr,
+                                    rows,
+                                    cols,
+                                    stride,
+                                    problem.transA(),
+                                    preSwizzleA,
+                                    preTileA,
+                                    problem.mxBlockA(),
+                                    1,
+                                    true,
+                                    initModeToMXMethod(initA),
+                                    -1.0f,
+                                    1.0f);
+                }
             }
 
             if(isMXFP4Tensor(problem.b(), problem.mxBlockB()))
@@ -1879,11 +1898,22 @@ namespace TensileLite
                 auto        rows    = tensorB.sizes()[0];
                 auto        cols    = tensorB.sizes()[1];
                 auto        stride  = tensorB.strides()[1];
+                size_t      batchCount = tensorB.sizes().size() > 2 ? tensorB.sizes()[2] : 1;
 
                 auto& pristineB
                     = m_vdata[ContractionProblemGemm::TENSOR::B].pristine[rocisa::DataType::Float4];
                 auto& pristineMXScaleB
                     = m_vdata[ContractionProblemGemm::TENSOR::MXSB].pristine[problem.mxsb().dataType()];
+
+                // FP4: 2 elements packed per byte, batch stride in bytes = strides[2] / 2
+                size_t dataBatchStrideBytes = 0;
+                size_t scaleBatchStrideBytes = 0;
+                if(batchCount > 1)
+                {
+                    dataBatchStrideBytes  = tensorB.strides()[2] / 2;
+                    auto const& mxsbTensor = problem.mxsb();
+                    scaleBatchStrideBytes = mxsbTensor.strides()[mxsbTensor.sizes().size() - 1];
+                }
 
                 auto initB = m_vdata[ContractionProblemGemm::TENSOR::B].init;
 
@@ -1891,21 +1921,29 @@ namespace TensileLite
                 std::memset(pristineMXScaleB.cpuInput.valid.get(),
                             0x00,
                             problem.mxsb().totalAllocatedElements());
-                generateMXInput((hipDataType)HIP_R_4F_E2M1,
-                                pristineB.cpuInput.valid.get(),
-                                pristineMXScaleB.cpuInput.valid.get(),
-                                rows,
-                                cols,
-                                stride,
-                                problem.transB(),
-                                preSwizzleB,
-                                preTileB,
-                                problem.mxBlockB(),
-                                1,
-                                false,
-                                initModeToMXMethod(initB),
-                                -1.0f,
-                                1.0f);
+
+                for(size_t b = 0; b < batchCount; b++)
+                {
+                    auto* dataPtr  = static_cast<uint8_t*>(pristineB.cpuInput.valid.get())
+                                     + b * dataBatchStrideBytes;
+                    auto* scalePtr = static_cast<uint8_t*>(pristineMXScaleB.cpuInput.valid.get())
+                                     + b * scaleBatchStrideBytes;
+                    generateMXInput((hipDataType)HIP_R_4F_E2M1,
+                                    dataPtr,
+                                    scalePtr,
+                                    rows,
+                                    cols,
+                                    stride,
+                                    problem.transB(),
+                                    preSwizzleB,
+                                    preTileB,
+                                    problem.mxBlockB(),
+                                    1,
+                                    false,
+                                    initModeToMXMethod(initB),
+                                    -1.0f,
+                                    1.0f);
+                }
             }
         }
 
