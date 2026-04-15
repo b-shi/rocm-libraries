@@ -255,9 +255,11 @@ BenchmarkProblems:
           - Exact: [50,  100, 2, 256]   # batch=2, non-mult-of-32
 
   ########################################
-  # FP4 TN — with bias (float32 bias vector)
+  # FP4 TN — bias epilogue, BF16 output (F4BS)
   #
-  # Reduced to 2 configs and StreamK=0 to keep scope small
+  # Covers even and odd wavetile sizes, both StreamK=0 and SK=3.
+  # Tests f32 bias with none/relu/gelu activations.
+  # Full-tile and edge sizes.
   ########################################
   -
     - # ProblemType
@@ -282,14 +284,72 @@ BenchmarkProblems:
         - KernelLanguage: ["Assembly"]
       ForkParameters:
         - MatrixInstruction:
+          # Even wavetile sizes
           - [16, 16, 128, 1,  1, 4, 4,  2, 2]  # MT 128x128
           - [16, 16, 128, 1,  1, 8, 8,  2, 2]  # MT 256x256
+          - [16, 16, 128, 1,  1, 2, 6,  4, 1]  # MT 128x96  (4x1 wave group)
+          # Odd M wavetile
+          - [16, 16, 128, 1,  1, 6, 4,  2, 2]  # MT 192x128
+          - [16, 16, 128, 1,  1, 6, 8,  2, 2]  # MT 192x256
         - PrefetchGlobalRead: [0]
         - PrefetchLocalRead: [0]
         - DepthU: [256]
         - ScheduleIterAlg: [3]
         - DirectToLds: [1]
-        - StreamK: [0]
+        - StreamK: [0, 3]
+        - StaggerU: [0]
+        - UseSubtileImpl: [1]
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          # Full-tile size
+          - Exact: [128, 128, 1, 256]
+          # Edge: M,N not multiple of macro tile
+          - Exact: [192, 192, 1, 256]
+        - BiasTypeArgs: ['s']
+        - ActivationArgs:
+          - [Enum: none]
+          - [Enum: relu]
+          - [Enum: gelu]
+
+  ########################################
+  # FP4 TN — bias epilogue, F32 output (F4SS)
+  #
+  # Covers even and odd wavetile sizes with f32 destination.
+  # StreamK=0 and SK=3. Full-tile and edge sizes.
+  ########################################
+  -
+    - # ProblemType
+      OperationType: GEMM
+      DataType: F4
+      DestDataType: s
+      ComputeDataType: s
+      HighPrecisionAccumulate: True
+      MXBlockA: 32
+      MXBlockB: 32
+      TransposeA: 1
+      TransposeB: 0
+      UseBeta: True
+      Batched: True
+      Activation: True
+      ActivationType: hipblaslt_all
+      UseBias: 1
+      BiasDataTypeList: [s]
+
+    - InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+          - [16, 16, 128, 1,  1, 4, 4,  2, 2]  # MT 128x128
+          - [16, 16, 128, 1,  1, 8, 8,  2, 2]  # MT 256x256
+          - [16, 16, 128, 1,  1, 6, 4,  2, 2]  # MT 192x128 (odd M wavetile)
+        - PrefetchGlobalRead: [0]
+        - PrefetchLocalRead: [0]
+        - DepthU: [256]
+        - ScheduleIterAlg: [3]
+        - DirectToLds: [1]
+        - StreamK: [0, 3]
         - StaggerU: [0]
         - UseSubtileImpl: [1]
       BenchmarkJoinParameters:
@@ -297,9 +357,11 @@ BenchmarkProblems:
         - ProblemSizes:
           - Exact: [128, 128, 1, 256]
           - Exact: [128, 128, 2, 256]   # batch=2, with bias
+          - Exact: [192, 192, 1, 256]
         - BiasTypeArgs: ['s']
         - ActivationArgs:
           - [Enum: none]
+          - [Enum: relu]
 
   ########################################
   # FP4 TN — PGR=2, PLR=1 (scheduler path)
