@@ -1294,7 +1294,6 @@ class KernelWriterAssembly(KernelWriter):
 
     def macroAndSetVgprImplSubtile():
       module.add(RegSet("v", "vgprSerial", self.states.startVgprSerial))
-      print(self.vgprPool.size())
       #self.vgprPool.remove(self.states.startVgprSerial, 1)
       #module.addComment0("Need %u vgprs for GR A"%(self.states.a.tileInfo.numGRPerSubtile))
       return
@@ -11580,8 +11579,7 @@ class KernelWriterAssembly(KernelWriter):
     # Keep tmp SGPR usage lean for the common path (same as develop).
     # BAddrInterleave needs additional temporaries for baseCol computation; allocate
     # those *only when enabled* so marginal kernels don't overflow MaxSgpr.
-    # alignment=2 required: s_lshl_b64/s_mul_u64_u32 use tmpS0:tmpS1 as a 64-bit pair.
-    with self.allocTmpSgpr(3, alignment=2) as tmpSgprInfo:
+    with self.allocTmpSgpr(3) as tmpSgprInfo:
       tmpS0 = tmpSgprInfo.idx
       tmpS1 = tmpS0+1
       wgMT1 = tmpS0+2
