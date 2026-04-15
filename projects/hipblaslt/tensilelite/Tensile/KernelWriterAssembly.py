@@ -564,20 +564,14 @@ class KernelWriterAssembly(KernelWriter):
     """Undefine SGPRs used only during the main loop that are not needed in the post-loop.
     Called for subtile kernels after deallocOffsetRegisters and before endSummation/post-loop."""
     module = Module("UndefineSubtileMainLoopSgprs")
-    for name in ["LocalWriteBaseAddrA", "LocalWriteBaseAddrB"]:
+    sgprsToUndefine = [
+      "LocalWriteBaseAddrA", "LocalWriteBaseAddrB",
+      "LocalWriteBaseAddrMXSA", "LocalWriteBaseAddrMXSB",
+      "SwapA", "SwapB", "SwapMXSA", "SwapMXSB",
+    ]
+    for name in sgprsToUndefine:
       if name in self.sgprs:
         module.add(self.undefineSgpr(name))
-    if kernel["ProblemType"]["MXBlockA"] and "LocalWriteBaseAddrMXSA" in self.sgprs:
-      module.add(self.undefineSgpr("LocalWriteBaseAddrMXSA"))
-    if kernel["ProblemType"]["MXBlockB"] and "LocalWriteBaseAddrMXSB" in self.sgprs:
-      module.add(self.undefineSgpr("LocalWriteBaseAddrMXSB"))
-    for name in ["SwapA", "SwapB"]:
-      if name in self.sgprs:
-        module.add(self.undefineSgpr(name))
-    if kernel["ProblemType"]["MXBlockA"] and "SwapMXSA" in self.sgprs:
-      module.add(self.undefineSgpr("SwapMXSA"))
-    if kernel["ProblemType"]["MXBlockB"] and "SwapMXSB" in self.sgprs:
-      module.add(self.undefineSgpr("SwapMXSB"))
     return module
 
   def removeGROffsetsVariableSgprsFromPool(self, kernel):
@@ -11570,10 +11564,24 @@ class KernelWriterAssembly(KernelWriter):
     else:
       useSize = [False for _ in srdTcList]
 
+    # For subtile StreamK kernels (StreamK==3, no atomic), the SGPR pool is exhausted
+    # after endSummation. Temporarily expose SrdWS (s60-s63) as Available scratch so
+    # that allocTmpSgpr calls within this function (and the SK component call below)
+    # can borrow those slots. Restore SrdWS as InUse at the end.
+    srdWsAvailableCtx = (
+        kernel.get("StreamK", 0) == 3
+        and kernel.get("StreamKAtomic", 1) == 0
+        and "SrdWS" in self.sgprs
+        and "SrdWS" not in self.states.freeSgprVarPool
+    )
+    if srdWsAvailableCtx:
+      self.addSgprVarToPool("SrdWS")
+
     # Keep tmp SGPR usage lean for the common path (same as develop).
     # BAddrInterleave needs additional temporaries for baseCol computation; allocate
     # those *only when enabled* so marginal kernels don't overflow MaxSgpr.
-    with self.allocTmpSgpr(3) as tmpSgprInfo:
+    # alignment=2 required: s_lshl_b64/s_mul_u64_u32 use tmpS0:tmpS1 as a 64-bit pair.
+    with self.allocTmpSgpr(3, alignment=2) as tmpSgprInfo:
       tmpS0 = tmpSgprInfo.idx
       tmpS1 = tmpS0+1
       wgMT1 = tmpS0+2
@@ -11706,6 +11714,8 @@ class KernelWriterAssembly(KernelWriter):
           addrSrcSgpr = "Srd" # update src Sgpr for the second or later iterations
 
     if noMultipleBuffer:
+      if srdWsAvailableCtx:
+        self.removeSgprVarFromPool("SrdWS")
       return module
 
     gsuComponent = Component.GSU.find(self)
@@ -11725,6 +11735,9 @@ class KernelWriterAssembly(KernelWriter):
           else:
             module.add(SMulI32(dst=sgpr(packedSizes), src0=sgpr(packedSizes), \
                       src1=self.sizeRef(idx), comment="first packed size"))
+
+    if srdWsAvailableCtx:
+      self.removeSgprVarFromPool("SrdWS")
 
     return module
 

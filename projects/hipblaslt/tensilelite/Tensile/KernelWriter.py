@@ -7206,25 +7206,18 @@ class KernelWriter(metaclass=abc.ABCMeta):
           self.defineSgpr("LocalWriteAddrMXSA", 1)
       if kernel["ProblemType"]["MXBlockB"] and kernel["LocalWriteUseSgprMXSB"]:
           self.defineSgpr("LocalWriteAddrMXSB", 1)
-    else:
-      self.defineSgpr("LocalWriteBaseAddrA", 1)
-      self.defineSgpr("LocalWriteBaseAddrB", 1)
-      if kernel["ProblemType"]["MXBlockA"]:
-        self.defineSgpr("LocalWriteBaseAddrMXSA", 1)
-      if kernel["ProblemType"]["MXBlockB"]:
-        self.defineSgpr("LocalWriteBaseAddrMXSB", 1)
 
     # Allocate registers to swap between lds buffers
     if self.states.useCommonSgprSwap and not kernel["UseSubtileImpl"]:
       self.defineSgpr("SwapCommon", 1)
-    elif kernel["StoreSwapAddr"] or kernel["UseSubtileImpl"]:
-      if kernel["LocalWriteUseSgprA"] or kernel["UseSubtileImpl"]:
+    elif not kernel["UseSubtileImpl"] and (kernel["StoreSwapAddr"]):
+      if kernel["LocalWriteUseSgprA"]:
         self.defineSgpr("SwapA", 1)
-      if kernel["LocalWriteUseSgprB"] or kernel["UseSubtileImpl"]:
+      if kernel["LocalWriteUseSgprB"]:
         self.defineSgpr("SwapB", 1)
-      if kernel["ProblemType"]["MXBlockA"] and (kernel["LocalWriteUseSgprMXSA"] or kernel["UseSubtileImpl"]):
+      if kernel["ProblemType"]["MXBlockA"] and kernel["LocalWriteUseSgprMXSA"]:
           self.defineSgpr("SwapMXSA", 1)
-      if kernel["ProblemType"]["MXBlockB"] and (kernel["LocalWriteUseSgprMXSB"] or kernel["UseSubtileImpl"]):
+      if kernel["ProblemType"]["MXBlockB"] and kernel["LocalWriteUseSgprMXSB"]:
           self.defineSgpr("SwapMXSB", 1)
       if kernel["ProblemType"]["Sparse"] and kernel["LocalWriteUseSgprMetadata"]:
         self.defineSgpr("SwapMetadata", 1)
@@ -7240,36 +7233,51 @@ class KernelWriter(metaclass=abc.ABCMeta):
     if kernel["GlobalSplitU"] != 0:
       self.defineSgpr("GSU", 1)  # Can't move to the front because of the preload arguments
 
+    # Collect SGPRs to allocate via the deferred interleaved loop.
+    # Using a list allows allocation order to be controlled, minimising
+    # alignment holes (e.g. keeping the pool on a 4-aligned boundary
+    # immediately before any 4-aligned SrdWS allocation).
+    requiredUnalignedSgprVar = []
+    requiredAligned4SgprVar = []
+
     if kernel["StreamK"]:
-      # StreamK vars
-      # Specify list of SK Variables we need to allocate in a list first
-      # to allow allocation in a order to minimize allocation holes due to
-      # alignment
-      requiredUnalignedSKVar = [
+      requiredUnalignedSgprVar += [
         "StreamKIdx",
         "StreamKIter",
         "StreamKIterEnd",
         "StreamKLocalStart",
         "StreamKLocalEnd",
       ]
-      requiredAligned4SKVar = []
-
       if len(kernel["SpaceFillingAlgo"]):
-        requiredUnalignedSKVar.append("StreamKTileID")
-
+        requiredUnalignedSgprVar.append("StreamKTileID")
       if kernel["StreamKAtomic"] == 0:
-        requiredAligned4SKVar.append("SrdWS")
+        requiredAligned4SgprVar.append("SrdWS")
 
-      # Actual allocation of SGPRs
-      # Prioritize SGPRs what require alignment first
-      #
-      while len(requiredUnalignedSKVar) or len(requiredAligned4SKVar):
-        if self.sgprPool.size() % 4 == 0 and len(requiredAligned4SKVar):
-          var = requiredAligned4SKVar.pop()
-          self.defineSgpr(var, 4, 4)
-        elif len(requiredUnalignedSKVar):
-          var = requiredUnalignedSKVar.pop()
-          self.defineSgpr(var, 1)
+    if kernel["UseSubtileImpl"]:
+      requiredUnalignedSgprVar.append("LocalWriteBaseAddrA")
+      requiredUnalignedSgprVar.append("LocalWriteBaseAddrB")
+      if kernel["ProblemType"]["MXBlockA"]:
+        requiredUnalignedSgprVar.append("LocalWriteBaseAddrMXSA")
+      if kernel["ProblemType"]["MXBlockB"]:
+        requiredUnalignedSgprVar.append("LocalWriteBaseAddrMXSB")
+      requiredUnalignedSgprVar.append("SwapA")
+      requiredUnalignedSgprVar.append("SwapB")
+      if kernel["ProblemType"]["MXBlockA"]:
+        requiredUnalignedSgprVar.append("SwapMXSA")
+      if kernel["ProblemType"]["MXBlockB"]:
+        requiredUnalignedSgprVar.append("SwapMXSB")
+      if kernel["ProblemType"]["Sparse"] and kernel["LocalWriteUseSgprMetadata"]:
+        requiredUnalignedSgprVar.append("SwapMetadata")
+
+    # Actual allocation: prioritise 4-aligned SGPRs whenever the pool is
+    # already on a 4-aligned boundary, otherwise consume unaligned ones.
+    while len(requiredUnalignedSgprVar) or len(requiredAligned4SgprVar):
+      if self.sgprPool.size() % 4 == 0 and len(requiredAligned4SgprVar):
+        var = requiredAligned4SgprVar.pop()
+        self.defineSgpr(var, 4, 4)
+      elif len(requiredUnalignedSgprVar):
+        var = requiredUnalignedSgprVar.pop()
+        self.defineSgpr(var, 1)
 
     # These SGPRs aren't used right away, add them to spr pool temporarily
     if self.states.doShadowInit and kernel["BufferStore"]:
