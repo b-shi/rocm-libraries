@@ -128,22 +128,24 @@ def compute_expected_lr_offset(thread_id, cfg, tileInfo, ldsStartOffsetB=None):
             newColOffset = (colOffset + numMFMACols * lr_idx) % blockSize
         offsets.append(newColOffset * LOAD_WIDTH + rowOffset)
 
-    # --- Step 5: Wave partitioning ---
+    # --- Step 5: Wave partitioning (non-interleaved layout) ---
     waveId = thread_id // WAVESIZE
     partitionOffset = 0
+    MT = tileInfo.globalMMATileGrid[0] * tileInfo.mmaTileShape[0]
+    subIterKBytes = depthUBytes
 
     if tileInfo.loadRatioGR >= 2.0:
         pass  # no partition needed
     elif tileInfo.loadRatioGR == 1.0:
-        # 2x2 config, interleaved
+        # 2x2 config, non-interleaved: sInterval = MT * subIterKBytes // 2
         if tileInfo.tc == 'A':
             wavePartId = waveId & 1
         else:
             wavePartId = waveId >> 1
-        partitionOffset = wavePartId * tileInfo.subtileSize
+        partitionOffset = wavePartId * (MT * subIterKBytes // 2)
     elif tileInfo.loadRatioGR == 0.5:
-        # 4x1 / 1x4 config
-        partitionOffset = waveId * tileInfo.subtileSize
+        # 4x1 / 1x4 config, non-interleaved: sInterval = MT * subIterKBytes // 4
+        partitionOffset = waveId * (MT * subIterKBytes // 4)
     else:
         raise NotImplementedError(f"Unsupported loadRatioGR: {tileInfo.loadRatioGR}")
 
