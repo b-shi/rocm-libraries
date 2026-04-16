@@ -179,6 +179,13 @@ class GlobalWriteBatchWriter:
     module = Module(self.moduleName)
     self._prolog(module)
     self._emitAdd(module)
+    # UseSubtileImpl with bias/SAV: drain LDS reads and sync waves after alpha
+    # multiply to prevent cross-wave LDS corruption from ds_bpermute.
+    if self.kernel.get("UseSubtileImpl") and \
+       (self.parentWriter.states.useBias != DataDirection.NONE or \
+        self.kernel["ProblemType"].get("UseScaleAlphaVec", 0)):
+      module.add(SWaitCnt(dscnt=0, comment="drain bias/SAV LDS reads"))
+      module.add(SBarrier("sync waves before subtile paired stores"))
     self._epilog(module)
     return module
 
@@ -200,7 +207,12 @@ class GlobalWriteBatchWriter:
         waitLoadCnt += self.eLoadIssued[elementIdx]
         waitLoadCntStrList.append("%d (load E)"%self.eLoadIssued[elementIdx])
       # Calculate local loads
-      if self.parentWriter.states.useBias == DataDirection.READ:
+      # UseSubtileImpl with bias/SAV: skip bias/SAV LDS loads from interleaved
+      # waitcnt and rely on the batch-start barrier for LDS synchronization.
+      subtileBarrierDrains = self.kernel.get("UseSubtileImpl") and \
+        (self.parentWriter.states.useBias != DataDirection.NONE or \
+         self.kernel["ProblemType"].get("UseScaleAlphaVec", 0))
+      if self.parentWriter.states.useBias == DataDirection.READ and not subtileBarrierDrains:
         waitLocalLoadCnt += self.biasLoadIssued[elementIdx]
         waitLocalLoadCntStrList.append("%d (bias)"%self.biasLoadIssued[elementIdx])
       if (self.kernel["ProblemType"]["UseScaleAB"] == "Vector") and isSingleKernel:
@@ -208,7 +220,8 @@ class GlobalWriteBatchWriter:
         waitLocalLoadCntStrList.append("%d (scaleAVec)"%self.scaleAVecLoadIssued[elementIdx])
         waitLocalLoadCnt += self.scaleBVecLoadIssued[elementIdx]
         waitLocalLoadCntStrList.append("%d (scaleBVec)"%self.scaleBVecLoadIssued[elementIdx])
-      if self.kernel["ProblemType"]["UseScaleAlphaVec"] and isSingleKernel:
+      # Skip scaleAlphaVec when subtileBarrierDrains
+      if self.kernel["ProblemType"]["UseScaleAlphaVec"] and isSingleKernel and not subtileBarrierDrains:
         waitLocalLoadCnt += self.scaleAlphaVecLoadIssued[elementIdx]
         waitLocalLoadCntStrList.append("%d (scaleAlphaVec)"%self.scaleAlphaVecLoadIssued[elementIdx])
       # Get vlcnt and dscnt
@@ -378,6 +391,7 @@ class GlobalWriteBatchWriter:
             for vi in range(self.gwvw):
               module.add(replaceHolder(self.codeMulAlpha.popFirstItem(), self.ss.elementSumIdx[elementIdx]*regsPerScalar + regsPerScalar*vi))
 
+
     loadInputCode    = Module("loadInputCode")
 
     self.betaLoadIssued = []
@@ -446,14 +460,14 @@ class GlobalWriteBatchWriter:
             d1, d0 = element[0], element[1]
             # N guard: emit once per d1 group.
             if nGuardSgpr is not None and d1 != self._subtileCloadPrevD1:
-              module.add(SCmpKGtU32(src=sgpr(nGuardSgpr), simm16=d1,
+              module.add(SCmpKGtU32(src=sgpr("SubtileNGuard"), simm16=d1,
                                     comment="subtile C load: numNBlocks > d1=%d?" % d1))
               module.add(SCSelectB32(dst=sgpr("SrdC+2"), src0="BufferOOB", src1=0,
                                      comment="SrdC+2 = BufferOOB if N valid, else 0"))
               self._subtileCloadPrevD1 = d1
             # M guard: emit per element, AND into SrdC+2.
             if mGuardSgpr is not None:
-              module.add(SCmpKGtU32(src=sgpr(mGuardSgpr), simm16=d0,
+              module.add(SCmpKGtU32(src=sgpr("SubtileMGuard"), simm16=d0,
                                     comment="subtile C load: numMBlocks > d0=%d?" % d0))
               if nGuardSgpr is not None:
                 module.add(SCSelectB32(dst=sgpr("SrdC+2"), src0=sgpr("SrdC+2"), src1=0,
@@ -1571,7 +1585,7 @@ class GlobalWriteBatchWriter:
         f"{labelPrefix}_N{blockIdxN}_end")
       nGroupEndLabel = Label(nGroupEndLabelName,
                              f"end of N group blockIdxN={blockIdxN} (M cbranch target)")
-      targetModule.add(SCmpKGtU32(src=sgpr(guardNSgpr), simm16=blockIdxN,
+      targetModule.add(SCmpKGtU32(src=sgpr("SubtileNGuard"), simm16=blockIdxN,
                                    comment=f"quick-exit: numValidNBlocks > {blockIdxN}? (OOB -> skip all stores)"))
       targetModule.add(SCBranchSCC0(labelName=self._subtileAllStoresEndLabel.getLabelName(),
                                      comment=f"quick-exit: N OOB at blockIdxN={blockIdxN}, skip all remaining stores"))
@@ -1584,7 +1598,7 @@ class GlobalWriteBatchWriter:
     # is OOB then all subsequent M elements in this N group are also OOB.
     if guardMSgpr is None:
       return None
-    targetModule.add(SCmpKGtU32(src=sgpr(guardMSgpr), simm16=blockIdxM,
+    targetModule.add(SCmpKGtU32(src=sgpr("SubtileMGuard"), simm16=blockIdxM,
                                  comment=f"quick-exit: numValidMBlocks > {blockIdxM}? (OOB -> skip N group)"))
     if guardNSgpr is not None and self._subtileNGroupSkipLabel is not None:
       # M OOB → jump to end of this N group (no per-element label needed).

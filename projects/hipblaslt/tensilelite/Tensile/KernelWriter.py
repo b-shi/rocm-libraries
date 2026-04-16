@@ -35,7 +35,7 @@ from rocisa.instruction import BufferLoadB128, BufferLoadB192, BufferLoadB32, Bu
   DSStoreB32, DSStoreB64, DSStoreB8, DSStoreInstruction, FlatLoadB128, FlatLoadB192, FlatLoadB32, \
   FlatLoadB64, FlatStoreB128, FlatStoreB32, FlatStoreB64, Instruction, MacroInstruction, \
   MFMAInstruction, MXMFMAInstruction, SBarrier, SBranch, SCBranchSCC0, SCBranchSCC1, SCBranchVCCNZ, SCmpEQU32, SCmpLeU32, \
-  SMFMAInstruction, SNop, SSetPrior, SSetRegIMM32B32, SSubU32, SWaitCnt, SWaitAlu, \
+  SMFMAInstruction, SNop, SEndpgm, SSetPrior, SSetRegIMM32B32, SSubU32, SWaitCnt, SWaitAlu, \
   SLongBranchPositive, VFmaMixF32, VMadMixF32, VMovB32, VAndB32, VCmpEQU32, VCndMaskB32, VMovB64, Instruction
 from rocisa.register import RegisterPool
 from rocisa.enum import RegisterType, DataTypeEnum
@@ -3918,6 +3918,15 @@ class KernelWriter(metaclass=abc.ABCMeta):
     # For subtile kernels, free SGPRs that were only needed during the main loop
     if kernel["UseSubtileImpl"]:
       module.add(self.undefineSubtileMainLoopSgprs(kernel))
+      # Immediately allocate permanent SGPRs for subtile M/N guards.
+      # Must be done here (before endSummation) so they get indices from
+      # the freshly-freed swap/LocalWriteBaseAddr range.
+      self.states.subtileM32ValidBlocksSgpr = self.defineSgprIdx("SubtileMGuard", 1)
+      self.states.subtileN16ValidBlocksSgpr = self.defineSgprIdx("SubtileNGuard", 1)
+      module.add(RegSet("s", "sgprSubtileMGuard", self.states.subtileM32ValidBlocksSgpr))
+      module.add(RegSet("s", "sgprSubtileNGuard", self.states.subtileN16ValidBlocksSgpr))
+      self.states.nonPostLoopSgpr.append("SubtileMGuard")
+      self.states.nonPostLoopSgpr.append("SubtileNGuard")
 
     # Deallocate registers used for VGPR A/B/MXS tiles
     if pgr != 2:
@@ -3960,16 +3969,65 @@ class KernelWriter(metaclass=abc.ABCMeta):
 
       # global write
       #module.addComment1("not-LocalSplitU: global write")
-      module.add(self.notLocalSplitUGlobalWrite(kernel, tensorParametersA, tensorParametersB))
+      storeModule, deferredGSU0 = self.notLocalSplitUGlobalWrite(kernel, tensorParametersA, tensorParametersB)
+      module.add(storeModule)
 
       self.vgprPool.checkIn(self.states.c.startVgprValu)
 
     # Deallocate registers used for C/D tiles after store code instructions are emitted
     dtileInfo.deallocVgprTileRegisters(self, kernel)
 
+    hasDeferredGSU0 = deferredGSU0 and len(deferredGSU0.items()) > 0
+    hasDeferredFixup = hasattr(self.states, 'deferredFixupModule') and self.states.deferredFixupModule is not None
+    hasDeferredEdge = hasattr(self.states, 'deferredEdgeModules') and self.states.deferredEdgeModules
+    hasDeferredPartials = hasattr(self.states, 'deferredPartialsModule') and self.states.deferredPartialsModule is not None
+    hasDeferredActivation = hasattr(self.states, 'deferredActivationModules') and self.states.deferredActivationModules is not None
+    hasAnyDeferred = hasDeferredGSU0 or hasDeferredFixup or hasDeferredEdge or hasDeferredPartials
 
-
-    module.add(self.functionEnd(kernel, addLabel=True))
+    if hasAnyDeferred:
+      loopComponent = Component.PersistentLoop.find(self)
+      module.add(loopComponent.closePersistentLoop(self, kernel))
+      # After persistent loop exits, skip over all deferred blocks
+      kernelEndLabel = Label("KernelEnd", "")
+      with self.allocTmpSgpr(3) as tmpSgprInfo:
+        module.add(SLongBranchPositive(kernelEndLabel, tmpSgprInfo, comment="persistent loop done, skip deferred blocks"))
+      module.addComment0("#" * 60)
+      module.addComment0("#" * 60)
+      module.addComment0("##")
+      module.addComment0("##  DEFERRED BLOCKS START")
+      module.addComment0("##  The following code blocks have been moved here from their")
+      module.addComment0("##  original inline positions to keep the optimized NonEdge")
+      module.addComment0("##  beta=0 store path close to the main loop.")
+      module.addComment0("##  Each block is reached via unconditional branch from its")
+      module.addComment0("##  original label stub and returns via branch-back.")
+      module.addComment0("##")
+      module.addComment0("#" * 60)
+      module.addComment0("#" * 60)
+      if hasDeferredFixup:
+        module.appendModule(self.states.deferredFixupModule)
+        self.states.deferredFixupModule = None
+      if hasDeferredEdge:
+        for edgeMod in self.states.deferredEdgeModules:
+          module.appendModule(edgeMod)
+        self.states.deferredEdgeModules = []
+      if hasDeferredPartials:
+        module.appendModule(self.states.deferredPartialsModule)
+        self.states.deferredPartialsModule = None
+      if hasDeferredGSU0:
+        module.appendModule(deferredGSU0)
+      if hasDeferredActivation:
+        module.appendModule(self.states.deferredActivationModules)
+        self.states.deferredActivationModules = None
+      module.add(kernelEndLabel)
+      if kernel["ProblemType"]["OutputAmaxD"]:
+        module.add(self.insertAmaxD(kernel))
+      module.add(SEndpgm(comment="Kernel End"))
+    else:
+      # If activation was deferred but no other deferred blocks exist, emit it before functionEnd
+      if hasDeferredActivation:
+        module.appendModule(self.states.deferredActivationModules)
+        self.states.deferredActivationModules = None
+      module.add(self.functionEnd(kernel, addLabel=True))
 
     # Add a label at the end of the asm for indexing.
     module.add(Label("ASM_End", "The end of the kernel"))
@@ -4977,7 +5035,8 @@ class KernelWriter(metaclass=abc.ABCMeta):
 
       # global write
       module.addComment1("not-LocalSplitU: global write")
-      module.add(self.notLocalSplitUGlobalWrite(kernel, tensorParametersA, tensorParametersB))
+      storeModule, _ = self.notLocalSplitUGlobalWrite(kernel, tensorParametersA, tensorParametersB)
+      module.add(storeModule)
 
     module.add(self.functionEnd(kernel, addLabel=True))
 
