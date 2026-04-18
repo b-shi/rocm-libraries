@@ -12528,7 +12528,7 @@ class KernelWriterAssembly(KernelWriter):
   # then calls globalWriteElements to generate the code for the new tiles.
   ##############################################################################
   def notLocalSplitUGlobalWrite(self, kernel, tPA, tPB):
-    if not self.do["PostLoop"]: return ""
+    if not self.do["PostLoop"]: return Module("notLocalSplitUGlobalWrite"), None
 
     (fullVws, elements, fullVws_1, elements_1) = self.notLocalFullTileElements(kernel)
     # print("len(elements)= ", len(elements_1))
@@ -12695,7 +12695,9 @@ class KernelWriterAssembly(KernelWriter):
             edgeModule.addComment0(" (would have been inline here in non-deferred version)")
             edgeModule.addComment0("=" * 60)
             edgeModule.add(writeLabels[beta][factorDim][vectorWidth]["ThenDeferredReturn"])
-            edgeModule.add(SBranch(labelName=endLabel.getLabelName(), comment="jump to end"))
+            with self.allocTmpSgpr(2, alignment=2) as tmpPair:
+              with self.allocTmpSgpr(1) as tmpOff:
+                edgeModule.add(SLongBranchPositive(endLabel, tmpPair, tmpOff, comment="jump to end"))
           else:
             currentInstLength, activationTypeStr = \
             self.globalWriteElementBatch(kernel, tPA, tPB, activation,
@@ -12756,7 +12758,9 @@ class KernelWriterAssembly(KernelWriter):
                 nonEdgeModule.addComment0(" (would have been inline here in non-deferred version)")
                 nonEdgeModule.addComment0("=" * 60)
                 nonEdgeModule.add(writeLabels[beta][factorDim][vectorWidth]["NonEdgeDeferredReturn"])
-                nonEdgeModule.add(SBranch(labelName=endLabel.getLabelName(), comment="jump to end"))
+                with self.allocTmpSgpr(2, alignment=2) as tmpPair:
+                  with self.allocTmpSgpr(1) as tmpOff:
+                    nonEdgeModule.add(SLongBranchPositive(endLabel, tmpPair, tmpOff, comment="jump to end"))
               else:
                 nonEdgeModule = Module("Non_Edge_B%u_FD%u_VW%u" % (beta, factorDim, vectorWidth))
                 currentInstLength, activationTypeStr = \
@@ -13298,8 +13302,9 @@ class KernelWriterAssembly(KernelWriter):
         # Keep original GW_B0 label inline as a stub with jump to deferred
         gsu0InlineLabel = Label(label=self.labels.getNameInc("GW_B0"), comment="")
         module.add(gsu0InlineLabel)
-        with self.allocTmpSgpr(3) as tmpSgprInfo:
-          module.add(SLongBranchPositive(gsu0DeferredLabel, tmpSgprInfo, comment="GSU0 reduction (deferred)"))
+        with self.allocTmpSgpr(2, alignment=2) as tmpPair:
+          with self.allocTmpSgpr(1) as tmpOff:
+            module.add(SLongBranchPositive(gsu0DeferredLabel, tmpPair, tmpOff, comment="GSU0 reduction (deferred)"))
         module.addComment0("=" * 60)
         module.addComment0(" GSU0 reduction block deferred to after persistent loop")
         module.addComment0(" (would have been inline here in non-deferred version)")

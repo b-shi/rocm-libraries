@@ -3909,7 +3909,6 @@ class KernelWriter(metaclass=abc.ABCMeta):
     #module.add(preLoop(self, kernel))
     module.add(mainLoop(self, kernel))
 
-
     # Deallocate registers used for GR/LR offsets
     for tileInfo in [atileInfo, btileInfo, mxsatileInfo, mxsbtileInfo]:
       if tileInfo != None:
@@ -3962,6 +3961,8 @@ class KernelWriter(metaclass=abc.ABCMeta):
       ####################################
       # NOT LocalSplitU
       ####################################
+
+
 
       # global write indices
       module.addComment1("not-LocalSplitU: global write indices")
@@ -5037,6 +5038,11 @@ class KernelWriter(metaclass=abc.ABCMeta):
       module.addComment1("not-LocalSplitU: global write")
       storeModule, _ = self.notLocalSplitUGlobalWrite(kernel, tensorParametersA, tensorParametersB)
       module.add(storeModule)
+
+    # Emit any deferred activation modules (set during globalWriteElements)
+    if hasattr(self.states, 'deferredActivationModules') and self.states.deferredActivationModules is not None:
+      module.appendModule(self.states.deferredActivationModules)
+      self.states.deferredActivationModules = None
 
     module.add(self.functionEnd(kernel, addLabel=True))
 
