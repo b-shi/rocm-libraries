@@ -31,7 +31,7 @@ from rocisa.container import DSModifiers, SDWAModifiers, VOP3PModifiers, \
                       MUBUFModifiers, SMEMModifiers, EXEC, VCC, RegisterContainer, \
                       DPPModifiers, vgpr, sgpr, accvgpr, mgpr, ContinuousRegister, \
                       HWRegContainer, GLOBALModifiers
-from rocisa.instruction import SGetPositivePCOffset, SLongBranch, SLongBranchPositive, SCLongBranchScc0, SCLongBranchScc1, SCLongBranchVccnz, \
+from rocisa.instruction import SGetPositivePCOffset, SLongBranch, SLongBranchPositive, SLongBranchNegative, SCLongBranchScc0, SCLongBranchScc1, SCLongBranchVccnz, \
                         SMulInt64to32, VCvtBF16toFP32
 from rocisa.functions import vectorStaticDivide, vectorStaticRemainder, vectorUInt32CeilDivideAndRemainder, \
                         vectorStaticDivideAndRemainder, scalarStaticDivideAndRemainder, scalarStaticCeilDivide, \
@@ -12689,7 +12689,8 @@ class KernelWriterAssembly(KernelWriter):
             # Inline stub: keep "Then" label, jump to deferred, return + jump to GW_End
             edgeModule.add(writeLabels[beta][factorDim][vectorWidth]["Then"])
             with self.allocTmpSgpr(3) as tmpSgprInfo:
-              edgeModule.add(SLongBranchPositive(writeLabels[beta][factorDim][vectorWidth]["ThenDeferred"], tmpSgprInfo, comment="edge store (deferred)"))
+              posLabel = self.labels.getNameInc("ThenDeferredDir")
+              edgeModule.add(SLongBranch(writeLabels[beta][factorDim][vectorWidth]["ThenDeferred"], tmpSgprInfo, posLabel, comment="edge store (deferred)"))
             edgeModule.addComment0("=" * 60)
             edgeModule.addComment0(" Edge store B%u FD%u VW%u deferred to after persistent loop" % (beta, factorDim, vectorWidth))
             edgeModule.addComment0(" (would have been inline here in non-deferred version)")
@@ -12697,7 +12698,8 @@ class KernelWriterAssembly(KernelWriter):
             edgeModule.add(writeLabels[beta][factorDim][vectorWidth]["ThenDeferredReturn"])
             with self.allocTmpSgpr(2, alignment=2) as tmpPair:
               with self.allocTmpSgpr(1) as tmpOff:
-                edgeModule.add(SLongBranchPositive(endLabel, tmpPair, tmpOff, comment="jump to end"))
+                posLabel = self.labels.getNameInc("ThenDeferredReturnDir")
+                edgeModule.add(SLongBranch(endLabel, tmpPair, tmpOff, posLabel, comment="jump to end"))
           else:
             currentInstLength, activationTypeStr = \
             self.globalWriteElementBatch(kernel, tPA, tPB, activation,
@@ -12752,7 +12754,8 @@ class KernelWriterAssembly(KernelWriter):
                 nonEdgeModule = Module("Non_Edge_B%u_FD%u_VW%u" % (beta, factorDim, vectorWidth))
                 nonEdgeModule.add(writeLabels[beta][factorDim][vectorWidth]["NonEdge"])
                 with self.allocTmpSgpr(3) as tmpSgprInfo:
-                  nonEdgeModule.add(SLongBranchPositive(writeLabels[beta][factorDim][vectorWidth]["NonEdgeDeferred"], tmpSgprInfo, comment="beta NonEdge store (deferred)"))
+                  posLabel = self.labels.getNameInc("NonEdgeDeferredDir")
+                  nonEdgeModule.add(SLongBranch(writeLabels[beta][factorDim][vectorWidth]["NonEdgeDeferred"], tmpSgprInfo, posLabel, comment="beta NonEdge store (deferred)"))
                 nonEdgeModule.addComment0("=" * 60)
                 nonEdgeModule.addComment0(" NonEdge store B%u FD%u VW%u deferred to after persistent loop" % (beta, factorDim, vectorWidth))
                 nonEdgeModule.addComment0(" (would have been inline here in non-deferred version)")
@@ -12760,7 +12763,8 @@ class KernelWriterAssembly(KernelWriter):
                 nonEdgeModule.add(writeLabels[beta][factorDim][vectorWidth]["NonEdgeDeferredReturn"])
                 with self.allocTmpSgpr(2, alignment=2) as tmpPair:
                   with self.allocTmpSgpr(1) as tmpOff:
-                    nonEdgeModule.add(SLongBranchPositive(endLabel, tmpPair, tmpOff, comment="jump to end"))
+                    posLabel = self.labels.getNameInc("NonEdgeDeferredReturnDir")
+                    nonEdgeModule.add(SLongBranch(endLabel, tmpPair, tmpOff, posLabel, comment="jump to end"))
               else:
                 nonEdgeModule = Module("Non_Edge_B%u_FD%u_VW%u" % (beta, factorDim, vectorWidth))
                 currentInstLength, activationTypeStr = \
@@ -13928,13 +13932,13 @@ class KernelWriterAssembly(KernelWriter):
         self.vgprPool.checkIn(cvtVgpr)
       if gsuLimit > 1 and gsuLimitIdx == 0:
         if deferGSU0:
-          # Branch back to return label, collect deferred module, restore main module
-          with self.allocTmpSgpr(3) as tmpSgprInfo:
-            posLabel = self.labels.getNameInc("GSU0DeferredReturnDir")
-            module.add(SLongBranch(gsu0ReturnLabel, tmpSgprInfo, posLabel, comment="return from deferred GSU0"))
+          # GSU0 store code is done. Append it to deferredGSU0 (placed after persistent loop),
+          # then restore `module` to savedModule (the inline stub region) so subsequent code
+          # (e.g. the SLongBranchPositive to KernelEnd) lands inline, not in the deferred block.
+          # The deferred block falls through to GW_End -> KernelEnd -> s_endpgm directly,
+          # so no explicit return branch back to inline is needed.
           deferredGSU0.appendModule(module)
           module = savedModule
-          # KernelEnd branch after GSU0 returns (at gsu0ReturnLabel, already placed inline)
           with self.allocTmpSgpr(3) as tmpSgprInfo:
             module.add(SLongBranchPositive(Label("KernelEnd", ""), tmpSgprInfo, comment="GSU0 done, skip to end"))
         else:
