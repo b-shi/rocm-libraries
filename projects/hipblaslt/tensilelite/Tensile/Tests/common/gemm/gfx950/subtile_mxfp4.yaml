@@ -364,6 +364,62 @@ BenchmarkProblems:
           - [Enum: relu]
 
   ########################################
+  # FP4 TN — all hipblaslt activations with ScaleAlphaVec
+  #
+  # Exercises every activation function supported by hipblaslt_all:
+  # none, relu, gelu, sigmoid, silu, clamp, dgelu, drelu.
+  # Small matrix selection and single problem size to keep runtime short.
+  ########################################
+  -
+    - # ProblemType
+      OperationType: GEMM
+      DataType: F4
+      DestDataType: b
+      ComputeDataType: s
+      HighPrecisionAccumulate: True
+      MXBlockA: 32
+      MXBlockB: 32
+      TransposeA: 1
+      TransposeB: 0
+      UseBeta: True
+      Batched: True
+      Activation: True
+      ActivationType: hipblaslt_all
+      UseBias: 1
+      BiasDataTypeList: [s]
+      UseScaleAlphaVec: 1
+
+    - InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+          - [16, 16, 128, 1,  1, 4, 4,  2, 2]  # MT 128x128
+          - [16, 16, 128, 1,  1, 6, 4,  2, 2]  # MT 192x128 (asymmetric)
+        - PrefetchGlobalRead: [0]
+        - PrefetchLocalRead: [0]
+        - DepthU: [256]
+        - ScheduleIterAlg: [3]
+        - DirectToLds: [1]
+        - StreamK: [3]
+        - StaggerU: [0]
+        - UseSubtileImpl: [1]
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: [128, 128, 1, 256]
+        - BiasTypeArgs: ['s']
+        - ActivationArgs:
+          - [Enum: none]
+          - [Enum: relu]
+          - [Enum: gelu]
+          - [Enum: sigmoid]
+          - [Enum: silu]
+          - [Enum: clamp]
+          - [Enum: dgelu]
+          - [Enum: drelu]
+
+  ########################################
   # FP4 TN — PGR=2, PLR=1 (scheduler path)
   #
   # The PGR=2 scheduler takes a different code path than PGR=0.
