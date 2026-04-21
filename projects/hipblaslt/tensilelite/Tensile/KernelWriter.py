@@ -35,7 +35,7 @@ from rocisa.instruction import BufferLoadB128, BufferLoadB192, BufferLoadB32, Bu
   DSStoreB32, DSStoreB64, DSStoreB8, DSStoreInstruction, FlatLoadB128, FlatLoadB192, FlatLoadB32, \
   FlatLoadB64, FlatStoreB128, FlatStoreB32, FlatStoreB64, Instruction, MacroInstruction, \
   MFMAInstruction, MXMFMAInstruction, SBarrier, SBranch, SCBranchSCC0, SCBranchSCC1, SCBranchVCCNZ, SCmpEQU32, SCmpLeU32, \
-  SMFMAInstruction, SNop, SSetPrior, SSetRegIMM32B32, SSubU32, SWaitCnt, SWaitAlu, \
+  SMFMAInstruction, SNop, SEndpgm, SSetPrior, SSetRegIMM32B32, SSubU32, SWaitCnt, SWaitAlu, \
   SLongBranchPositive, VFmaMixF32, VMadMixF32, VMovB32, VAndB32, VCmpEQU32, VCndMaskB32, VMovB64, Instruction
 from rocisa.register import RegisterPool
 from rocisa.enum import RegisterType, DataTypeEnum
@@ -3909,11 +3909,23 @@ class KernelWriter(metaclass=abc.ABCMeta):
     #module.add(preLoop(self, kernel))
     module.add(mainLoop(self, kernel))
 
-
     # Deallocate registers used for GR/LR offsets
     for tileInfo in [atileInfo, btileInfo, mxsatileInfo, mxsbtileInfo]:
       if tileInfo != None:
         tileInfo.deallocOffsetRegisters(self, kernel)
+
+    # For subtile kernels, free SGPRs that were only needed during the main loop
+    if kernel["UseSubtileImpl"]:
+      module.add(self.undefineSubtileMainLoopSgprs(kernel))
+      # Immediately allocate permanent SGPRs for subtile M/N guards.
+      # Must be done here (before endSummation) so they get indices from
+      # the freshly-freed swap/LocalWriteBaseAddr range.
+      self.states.subtileM32ValidBlocksSgpr = self.defineSgprIdx("SubtileMGuard", 1)
+      self.states.subtileN16ValidBlocksSgpr = self.defineSgprIdx("SubtileNGuard", 1)
+      module.add(RegSet("s", "sgprSubtileMGuard", self.states.subtileM32ValidBlocksSgpr))
+      module.add(RegSet("s", "sgprSubtileNGuard", self.states.subtileN16ValidBlocksSgpr))
+      self.states.nonPostLoopSgpr.append("SubtileMGuard")
+      self.states.nonPostLoopSgpr.append("SubtileNGuard")
 
     # Deallocate registers used for VGPR A/B/MXS tiles
     if pgr != 2:
@@ -3950,22 +3962,73 @@ class KernelWriter(metaclass=abc.ABCMeta):
       # NOT LocalSplitU
       ####################################
 
+
+
       # global write indices
       module.addComment1("not-LocalSplitU: global write indices")
       module.add(self.notLocalSplitUGlobalWriteIndices(kernel))
 
       # global write
       #module.addComment1("not-LocalSplitU: global write")
-      module.add(self.notLocalSplitUGlobalWrite(kernel, tensorParametersA, tensorParametersB))
+      storeModule, deferredGSU0 = self.notLocalSplitUGlobalWrite(kernel, tensorParametersA, tensorParametersB)
+      module.add(storeModule)
 
       self.vgprPool.checkIn(self.states.c.startVgprValu)
 
     # Deallocate registers used for C/D tiles after store code instructions are emitted
     dtileInfo.deallocVgprTileRegisters(self, kernel)
 
+    hasDeferredGSU0 = deferredGSU0 and len(deferredGSU0.items()) > 0
+    hasDeferredFixup = hasattr(self.states, 'deferredFixupModule') and self.states.deferredFixupModule is not None
+    hasDeferredEdge = hasattr(self.states, 'deferredEdgeModules') and self.states.deferredEdgeModules
+    hasDeferredPartials = hasattr(self.states, 'deferredPartialsModule') and self.states.deferredPartialsModule is not None
+    hasDeferredActivation = hasattr(self.states, 'deferredActivationModules') and self.states.deferredActivationModules is not None
+    hasAnyDeferred = hasDeferredGSU0 or hasDeferredFixup or hasDeferredEdge or hasDeferredPartials
 
-
-    module.add(self.functionEnd(kernel, addLabel=True))
+    if hasAnyDeferred:
+      loopComponent = Component.PersistentLoop.find(self)
+      module.add(loopComponent.closePersistentLoop(self, kernel))
+      # After persistent loop exits, skip over all deferred blocks
+      kernelEndLabel = Label("KernelEnd", "")
+      with self.allocTmpSgpr(3) as tmpSgprInfo:
+        module.add(SLongBranchPositive(kernelEndLabel, tmpSgprInfo, comment="persistent loop done, skip deferred blocks"))
+      module.addComment0("#" * 60)
+      module.addComment0("#" * 60)
+      module.addComment0("##")
+      module.addComment0("##  DEFERRED BLOCKS START")
+      module.addComment0("##  The following code blocks have been moved here from their")
+      module.addComment0("##  original inline positions to keep the optimized NonEdge")
+      module.addComment0("##  beta=0 store path close to the main loop.")
+      module.addComment0("##  Each block is reached via unconditional branch from its")
+      module.addComment0("##  original label stub and returns via branch-back.")
+      module.addComment0("##")
+      module.addComment0("#" * 60)
+      module.addComment0("#" * 60)
+      if hasDeferredFixup:
+        module.appendModule(self.states.deferredFixupModule)
+        self.states.deferredFixupModule = None
+      if hasDeferredEdge:
+        for edgeMod in self.states.deferredEdgeModules:
+          module.appendModule(edgeMod)
+        self.states.deferredEdgeModules = []
+      if hasDeferredPartials:
+        module.appendModule(self.states.deferredPartialsModule)
+        self.states.deferredPartialsModule = None
+      if hasDeferredGSU0:
+        module.appendModule(deferredGSU0)
+      if hasDeferredActivation:
+        module.appendModule(self.states.deferredActivationModules)
+        self.states.deferredActivationModules = None
+      module.add(kernelEndLabel)
+      if kernel["ProblemType"]["OutputAmaxD"]:
+        module.add(self.insertAmaxD(kernel))
+      module.add(SEndpgm(comment="Kernel End"))
+    else:
+      # If activation was deferred but no other deferred blocks exist, emit it before functionEnd
+      if hasDeferredActivation:
+        module.appendModule(self.states.deferredActivationModules)
+        self.states.deferredActivationModules = None
+      module.add(self.functionEnd(kernel, addLabel=True))
 
     # Add a label at the end of the asm for indexing.
     module.add(Label("ASM_End", "The end of the kernel"))
@@ -4973,7 +5036,13 @@ class KernelWriter(metaclass=abc.ABCMeta):
 
       # global write
       module.addComment1("not-LocalSplitU: global write")
-      module.add(self.notLocalSplitUGlobalWrite(kernel, tensorParametersA, tensorParametersB))
+      storeModule, _ = self.notLocalSplitUGlobalWrite(kernel, tensorParametersA, tensorParametersB)
+      module.add(storeModule)
+
+    # Emit any deferred activation modules (set during globalWriteElements)
+    if hasattr(self.states, 'deferredActivationModules') and self.states.deferredActivationModules is not None:
+      module.appendModule(self.states.deferredActivationModules)
+      self.states.deferredActivationModules = None
 
     module.add(self.functionEnd(kernel, addLabel=True))
 
@@ -7202,25 +7271,18 @@ class KernelWriter(metaclass=abc.ABCMeta):
           self.defineSgpr("LocalWriteAddrMXSA", 1)
       if kernel["ProblemType"]["MXBlockB"] and kernel["LocalWriteUseSgprMXSB"]:
           self.defineSgpr("LocalWriteAddrMXSB", 1)
-    else:
-      self.defineSgpr("LocalWriteBaseAddrA", 1)
-      self.defineSgpr("LocalWriteBaseAddrB", 1)
-      if kernel["ProblemType"]["MXBlockA"]:
-        self.defineSgpr("LocalWriteBaseAddrMXSA", 1)
-      if kernel["ProblemType"]["MXBlockB"]:
-        self.defineSgpr("LocalWriteBaseAddrMXSB", 1)
 
     # Allocate registers to swap between lds buffers
     if self.states.useCommonSgprSwap and not kernel["UseSubtileImpl"]:
       self.defineSgpr("SwapCommon", 1)
-    elif kernel["StoreSwapAddr"] or kernel["UseSubtileImpl"]:
-      if kernel["LocalWriteUseSgprA"] or kernel["UseSubtileImpl"]:
+    elif not kernel["UseSubtileImpl"] and (kernel["StoreSwapAddr"]):
+      if kernel["LocalWriteUseSgprA"]:
         self.defineSgpr("SwapA", 1)
-      if kernel["LocalWriteUseSgprB"] or kernel["UseSubtileImpl"]:
+      if kernel["LocalWriteUseSgprB"]:
         self.defineSgpr("SwapB", 1)
-      if kernel["ProblemType"]["MXBlockA"] and (kernel["LocalWriteUseSgprMXSA"] or kernel["UseSubtileImpl"]):
+      if kernel["ProblemType"]["MXBlockA"] and kernel["LocalWriteUseSgprMXSA"]:
           self.defineSgpr("SwapMXSA", 1)
-      if kernel["ProblemType"]["MXBlockB"] and (kernel["LocalWriteUseSgprMXSB"] or kernel["UseSubtileImpl"]):
+      if kernel["ProblemType"]["MXBlockB"] and kernel["LocalWriteUseSgprMXSB"]:
           self.defineSgpr("SwapMXSB", 1)
       if kernel["ProblemType"]["Sparse"] and kernel["LocalWriteUseSgprMetadata"]:
         self.defineSgpr("SwapMetadata", 1)
@@ -7236,36 +7298,51 @@ class KernelWriter(metaclass=abc.ABCMeta):
     if kernel["GlobalSplitU"] != 0:
       self.defineSgpr("GSU", 1)  # Can't move to the front because of the preload arguments
 
+    # Collect SGPRs to allocate via the deferred interleaved loop.
+    # Using a list allows allocation order to be controlled, minimising
+    # alignment holes (e.g. keeping the pool on a 4-aligned boundary
+    # immediately before any 4-aligned SrdWS allocation).
+    requiredUnalignedSgprVar = []
+    requiredAligned4SgprVar = []
+
     if kernel["StreamK"]:
-      # StreamK vars
-      # Specify list of SK Variables we need to allocate in a list first
-      # to allow allocation in a order to minimize allocation holes due to
-      # alignment
-      requiredUnalignedSKVar = [
+      requiredUnalignedSgprVar += [
         "StreamKIdx",
         "StreamKIter",
         "StreamKIterEnd",
         "StreamKLocalStart",
         "StreamKLocalEnd",
       ]
-      requiredAligned4SKVar = []
-
       if len(kernel["SpaceFillingAlgo"]):
-        requiredUnalignedSKVar.append("StreamKTileID")
-
+        requiredUnalignedSgprVar.append("StreamKTileID")
       if kernel["StreamKAtomic"] == 0:
-        requiredAligned4SKVar.append("SrdWS")
+        requiredAligned4SgprVar.append("SrdWS")
 
-      # Actual allocation of SGPRs
-      # Prioritize SGPRs what require alignment first
-      #
-      while len(requiredUnalignedSKVar) or len(requiredAligned4SKVar):
-        if self.sgprPool.size() % 4 == 0 and len(requiredAligned4SKVar):
-          var = requiredAligned4SKVar.pop()
-          self.defineSgpr(var, 4, 4)
-        elif len(requiredUnalignedSKVar):
-          var = requiredUnalignedSKVar.pop()
-          self.defineSgpr(var, 1)
+    if kernel["UseSubtileImpl"]:
+      requiredUnalignedSgprVar.append("LocalWriteBaseAddrA")
+      requiredUnalignedSgprVar.append("LocalWriteBaseAddrB")
+      if kernel["ProblemType"]["MXBlockA"]:
+        requiredUnalignedSgprVar.append("LocalWriteBaseAddrMXSA")
+      if kernel["ProblemType"]["MXBlockB"]:
+        requiredUnalignedSgprVar.append("LocalWriteBaseAddrMXSB")
+      requiredUnalignedSgprVar.append("SwapA")
+      requiredUnalignedSgprVar.append("SwapB")
+      if kernel["ProblemType"]["MXBlockA"]:
+        requiredUnalignedSgprVar.append("SwapMXSA")
+      if kernel["ProblemType"]["MXBlockB"]:
+        requiredUnalignedSgprVar.append("SwapMXSB")
+      if kernel["ProblemType"]["Sparse"] and kernel["LocalWriteUseSgprMetadata"]:
+        requiredUnalignedSgprVar.append("SwapMetadata")
+
+    # Actual allocation: prioritise 4-aligned SGPRs whenever the pool is
+    # already on a 4-aligned boundary, otherwise consume unaligned ones.
+    while len(requiredUnalignedSgprVar) or len(requiredAligned4SgprVar):
+      if self.sgprPool.size() % 4 == 0 and len(requiredAligned4SgprVar):
+        var = requiredAligned4SgprVar.pop()
+        self.defineSgpr(var, 4, 4)
+      elif len(requiredUnalignedSgprVar):
+        var = requiredUnalignedSgprVar.pop()
+        self.defineSgpr(var, 1)
 
     # These SGPRs aren't used right away, add them to spr pool temporarily
     if self.states.doShadowInit and kernel["BufferStore"]:
