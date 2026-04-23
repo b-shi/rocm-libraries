@@ -190,6 +190,122 @@ BenchmarkProblems:
           - Exact: [63,   63, 2,  512]   # batch=2, both odd
 
   ########################################
+  # F4HS TN — MX FP4 input, F16 output, DU = 2*MI_K = 256
+  #
+  # Reduced wavetile coverage; same problem size coverage as FP4 main group.
+  ########################################
+  -
+    - # ProblemType
+      OperationType: GEMM
+      DataType: F4
+      DestDataType: h
+      ComputeDataType: s
+      HighPrecisionAccumulate: True
+      MXBlockA: 32
+      MXBlockB: 32
+      TransposeA: 1
+      TransposeB: 0
+      UseBeta: True
+      Batched: True
+      ActivationFuncCall: True
+
+    - InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+          - [16, 16, 128, 1,  1, 2, 2,  1, 1]  # MT 32x32  (1x1 WG)
+          - [16, 16, 128, 1,  1, 4, 4,  2, 2]  # MT 128x128
+          - [16, 16, 128, 1,  1, 8, 8,  2, 2]  # MT 256x256
+          - [16, 16, 128, 1,  1, 6, 4,  2, 2]  # MT 192x128 (asymmetric)
+          - [16, 16, 128, 1,  1, 2, 6,  4, 1]  # MT 128x96  (4x1 WG)
+        - PrefetchGlobalRead: [0]
+        - PrefetchLocalRead: [0]
+        - DepthU: [256]                 # 2*MI_K = 2*128
+        - ScheduleIterAlg: [3]
+        - DirectToLds: [1]
+        - StreamK: [0, 3]
+        - StaggerU: [0]
+        - UseSubtileImpl: [1]
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          # Full-tile sizes (K = 1×DU, 2×DU)
+          - Exact: [128, 128, 1, 256]
+          - Exact: [256, 256, 1, 512]
+          # Edge cases: M,N = k*64 but not multiples of macro tile
+          - Exact: [64,  64,  1, 256]
+          - Exact: [192, 192, 1, 256]
+          - Exact: [320, 320, 1, 256]
+          # Asymmetric
+          - Exact: [192, 256, 1, 256]
+          - Exact: [256, 192, 1, 256]
+          # Non-multiple-of-32 M,N (multiples of 16)
+          - Exact: [48,   48, 1, 256]   # 3*16, both M,N non-mult-of-32
+          - Exact: [112, 176, 1, 256]   # 7*16, 11*16
+          # Even non-multiple-of-16 M,N
+          - Exact: [50,  100, 1, 256]   # 50=2*25, 100=4*25
+          - Exact: [66,   66, 1, 256]   # both even, neither mult-of-16
+          # Odd M,N
+          - Exact: [17,   33, 1, 256]   # both odd
+          - Exact: [63,   63, 1, 256]   # both odd, just below 64
+          # Batched (batch_count > 1)
+          - Exact: [128, 128, 2, 256]   # batch=2, full tile
+          - Exact: [192, 192, 3, 256]   # batch=3, edge case
+          - Exact: [50,  100, 2, 256]   # batch=2, non-mult-of-32
+
+  ########################################
+  # F4HS TN — bias epilogue, F16 output
+  #
+  # Covers even and odd wavetile sizes with f16 destination.
+  # StreamK=0 and SK=3. Full-tile and edge sizes.
+  ########################################
+  -
+    - # ProblemType
+      OperationType: GEMM
+      DataType: F4
+      DestDataType: h
+      ComputeDataType: s
+      HighPrecisionAccumulate: True
+      MXBlockA: 32
+      MXBlockB: 32
+      TransposeA: 1
+      TransposeB: 0
+      UseBeta: True
+      Batched: True
+      Activation: True
+      ActivationType: hipblaslt_all
+      UseBias: 1
+      BiasDataTypeList: [s, h]
+
+    - InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+          - [16, 16, 128, 1,  1, 4, 4,  2, 2]  # MT 128x128
+          - [16, 16, 128, 1,  1, 8, 8,  2, 2]  # MT 256x256
+          - [16, 16, 128, 1,  1, 6, 4,  2, 2]  # MT 192x128 (odd M wavetile)
+        - PrefetchGlobalRead: [0]
+        - PrefetchLocalRead: [0]
+        - DepthU: [256]
+        - ScheduleIterAlg: [3]
+        - DirectToLds: [1]
+        - StreamK: [0, 3]
+        - StaggerU: [0]
+        - UseSubtileImpl: [1]
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: [128, 128, 1, 256]
+          - Exact: [128, 128, 2, 256]   # batch=2, with bias
+          - Exact: [192, 192, 1, 256]
+        - BiasTypeArgs: ['s', 'h']
+        - ActivationArgs:
+          - [Enum: none]
+          - [Enum: relu]
+
+  ########################################
   # F4SS TN — MX FP4 input, F32 output, DU = 2*MI_K = 256
   #
   # Reduced wavetile coverage; same problem size coverage as FP4 main group.
