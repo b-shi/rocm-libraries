@@ -10,7 +10,7 @@
   AssignedDerivedParameters: true
   Batched: true
   BetaOnlyUseBias: false
-  BiasDataTypeList: [0, 7]
+  BiasDataTypeList: [0]
   BiasSrc: D
   ComplexConjugateA: false
   ComplexConjugateB: false
@@ -19,8 +19,8 @@
   DataTypeA: 21
   DataTypeAmaxD: 0
   DataTypeB: 21
-  DataTypeE: 7
-  DestDataType: 7
+  DataTypeE: 0
+  DestDataType: 0
   F32XdlMathOp: 0
   Gradient: false
   GroupedGemm: false
@@ -269,8 +269,8 @@
     NonDTLTailLoopMXSA: true
     NonDTLTailLoopMXSB: true
     NonTemporal: -1
-    NonTemporalA: 0
-    NonTemporalB: 4
+    NonTemporalA: 4
+    NonTemporalB: 0
     NonTemporalC: 0
     NonTemporalD: 4
     NonTemporalE: 0
@@ -593,8 +593,8 @@
     NonDTLTailLoopMXSA: true
     NonDTLTailLoopMXSB: true
     NonTemporal: -1
-    NonTemporalA: 0
-    NonTemporalB: 4
+    NonTemporalA: 4
+    NonTemporalB: 0
     NonTemporalC: 0
     NonTemporalD: 4
     NonTemporalE: 0
@@ -917,8 +917,8 @@
     NonDTLTailLoopMXSA: true
     NonDTLTailLoopMXSB: true
     NonTemporal: -1
-    NonTemporalA: 0
-    NonTemporalB: 4
+    NonTemporalA: 4
+    NonTemporalB: 0
     NonTemporalC: 0
     NonTemporalD: 4
     NonTemporalE: 0
@@ -1241,8 +1241,8 @@
     NonDTLTailLoopMXSA: true
     NonDTLTailLoopMXSB: true
     NonTemporal: -1
-    NonTemporalA: 0
-    NonTemporalB: 4
+    NonTemporalA: 4
+    NonTemporalB: 0
     NonTemporalC: 0
     NonTemporalD: 4
     NonTemporalE: 0
@@ -1565,8 +1565,8 @@
     NonDTLTailLoopMXSA: true
     NonDTLTailLoopMXSB: true
     NonTemporal: -1
-    NonTemporalA: 0
-    NonTemporalB: 4
+    NonTemporalA: 4
+    NonTemporalB: 0
     NonTemporalC: 0
     NonTemporalD: 4
     NonTemporalE: 0
@@ -1889,8 +1889,8 @@
     NonDTLTailLoopMXSA: true
     NonDTLTailLoopMXSB: true
     NonTemporal: -1
-    NonTemporalA: 0
-    NonTemporalB: 4
+    NonTemporalA: 4
+    NonTemporalB: 0
     NonTemporalC: 0
     NonTemporalD: 4
     NonTemporalE: 0
@@ -2213,8 +2213,8 @@
     NonDTLTailLoopMXSA: true
     NonDTLTailLoopMXSB: true
     NonTemporal: -1
-    NonTemporalA: 0
-    NonTemporalB: 4
+    NonTemporalA: 4
+    NonTemporalB: 0
     NonTemporalC: 0
     NonTemporalD: 4
     NonTemporalE: 0
@@ -2537,8 +2537,8 @@
     NonDTLTailLoopMXSA: true
     NonDTLTailLoopMXSB: true
     NonTemporal: -1
-    NonTemporalA: 0
-    NonTemporalB: 4
+    NonTemporalA: 4
+    NonTemporalB: 0
     NonTemporalC: 0
     NonTemporalD: 4
     NonTemporalE: 0
@@ -2861,8 +2861,8 @@
     NonDTLTailLoopMXSA: true
     NonDTLTailLoopMXSB: true
     NonTemporal: -1
-    NonTemporalA: 0
-    NonTemporalB: 4
+    NonTemporalA: 4
+    NonTemporalB: 0
     NonTemporalC: 0
     NonTemporalD: 4
     NonTemporalE: 0
@@ -3185,8 +3185,8 @@
     NonDTLTailLoopMXSA: true
     NonDTLTailLoopMXSB: true
     NonTemporal: -1
-    NonTemporalA: 0
-    NonTemporalB: 4
+    NonTemporalA: 4
+    NonTemporalB: 0
     NonTemporalC: 0
     NonTemporalD: 4
     NonTemporalE: 0
@@ -3509,8 +3509,8 @@
     NonDTLTailLoopMXSA: true
     NonDTLTailLoopMXSB: true
     NonTemporal: -1
-    NonTemporalA: 0
-    NonTemporalB: 4
+    NonTemporalA: 4
+    NonTemporalB: 0
     NonTemporalC: 0
     NonTemporalD: 4
     NonTemporalE: 0
@@ -3833,8 +3833,8 @@
     NonDTLTailLoopMXSA: true
     NonDTLTailLoopMXSB: true
     NonTemporal: -1
-    NonTemporalA: 0
-    NonTemporalB: 4
+    NonTemporalA: 4
+    NonTemporalB: 0
     NonTemporalC: 0
     NonTemporalD: 4
     NonTemporalE: 0
@@ -4157,8 +4157,8 @@
     NonDTLTailLoopMXSA: true
     NonDTLTailLoopMXSB: true
     NonTemporal: -1
-    NonTemporalA: 0
-    NonTemporalB: 4
+    NonTemporalA: 4
+    NonTemporalB: 0
     NonTemporalC: 0
     NonTemporalD: 4
     NonTemporalE: 0
@@ -4481,8 +4481,8 @@
     NonDTLTailLoopMXSA: true
     NonDTLTailLoopMXSB: true
     NonTemporal: -1
-    NonTemporalA: 0
-    NonTemporalB: 4
+    NonTemporalA: 4
+    NonTemporalB: 0
     NonTemporalC: 0
     NonTemporalD: 4
     NonTemporalE: 0
@@ -4805,8 +4805,8 @@
     NonDTLTailLoopMXSA: true
     NonDTLTailLoopMXSB: true
     NonTemporal: -1
-    NonTemporalA: 0
-    NonTemporalB: 4
+    NonTemporalA: 4
+    NonTemporalB: 0
     NonTemporalC: 0
     NonTemporalD: 4
     NonTemporalE: 0
@@ -5129,8 +5129,8 @@
     NonDTLTailLoopMXSA: true
     NonDTLTailLoopMXSB: true
     NonTemporal: -1
-    NonTemporalA: 0
-    NonTemporalB: 4
+    NonTemporalA: 4
+    NonTemporalB: 0
     NonTemporalC: 0
     NonTemporalD: 4
     NonTemporalE: 0
@@ -5453,8 +5453,8 @@
     NonDTLTailLoopMXSA: true
     NonDTLTailLoopMXSB: true
     NonTemporal: -1
-    NonTemporalA: 0
-    NonTemporalB: 4
+    NonTemporalA: 4
+    NonTemporalB: 0
     NonTemporalC: 0
     NonTemporalD: 4
     NonTemporalE: 0
@@ -5777,8 +5777,8 @@
     NonDTLTailLoopMXSA: true
     NonDTLTailLoopMXSB: true
     NonTemporal: -1
-    NonTemporalA: 0
-    NonTemporalB: 4
+    NonTemporalA: 4
+    NonTemporalB: 0
     NonTemporalC: 0
     NonTemporalD: 4
     NonTemporalE: 0
@@ -6101,8 +6101,8 @@
     NonDTLTailLoopMXSA: true
     NonDTLTailLoopMXSB: true
     NonTemporal: -1
-    NonTemporalA: 0
-    NonTemporalB: 4
+    NonTemporalA: 4
+    NonTemporalB: 0
     NonTemporalC: 0
     NonTemporalD: 4
     NonTemporalE: 0
@@ -6425,8 +6425,8 @@
     NonDTLTailLoopMXSA: true
     NonDTLTailLoopMXSB: true
     NonTemporal: -1
-    NonTemporalA: 0
-    NonTemporalB: 4
+    NonTemporalA: 4
+    NonTemporalB: 0
     NonTemporalC: 0
     NonTemporalD: 4
     NonTemporalE: 0
@@ -6749,8 +6749,8 @@
     NonDTLTailLoopMXSA: true
     NonDTLTailLoopMXSB: true
     NonTemporal: -1
-    NonTemporalA: 0
-    NonTemporalB: 4
+    NonTemporalA: 4
+    NonTemporalB: 0
     NonTemporalC: 0
     NonTemporalD: 4
     NonTemporalE: 0
@@ -7073,8 +7073,8 @@
     NonDTLTailLoopMXSA: true
     NonDTLTailLoopMXSB: true
     NonTemporal: -1
-    NonTemporalA: 0
-    NonTemporalB: 4
+    NonTemporalA: 4
+    NonTemporalB: 0
     NonTemporalC: 0
     NonTemporalD: 4
     NonTemporalE: 0
@@ -7397,8 +7397,8 @@
     NonDTLTailLoopMXSA: true
     NonDTLTailLoopMXSB: true
     NonTemporal: -1
-    NonTemporalA: 0
-    NonTemporalB: 4
+    NonTemporalA: 4
+    NonTemporalB: 0
     NonTemporalC: 0
     NonTemporalD: 4
     NonTemporalE: 0
@@ -7721,8 +7721,8 @@
     NonDTLTailLoopMXSA: true
     NonDTLTailLoopMXSB: true
     NonTemporal: -1
-    NonTemporalA: 0
-    NonTemporalB: 4
+    NonTemporalA: 4
+    NonTemporalB: 0
     NonTemporalC: 0
     NonTemporalD: 4
     NonTemporalE: 0
@@ -8045,8 +8045,8 @@
     NonDTLTailLoopMXSA: true
     NonDTLTailLoopMXSB: true
     NonTemporal: -1
-    NonTemporalA: 0
-    NonTemporalB: 4
+    NonTemporalA: 4
+    NonTemporalB: 0
     NonTemporalC: 0
     NonTemporalD: 4
     NonTemporalE: 0
@@ -8369,8 +8369,8 @@
     NonDTLTailLoopMXSA: true
     NonDTLTailLoopMXSB: true
     NonTemporal: -1
-    NonTemporalA: 0
-    NonTemporalB: 4
+    NonTemporalA: 4
+    NonTemporalB: 0
     NonTemporalC: 0
     NonTemporalD: 4
     NonTemporalE: 0
@@ -8693,8 +8693,8 @@
     NonDTLTailLoopMXSA: true
     NonDTLTailLoopMXSB: true
     NonTemporal: -1
-    NonTemporalA: 0
-    NonTemporalB: 4
+    NonTemporalA: 4
+    NonTemporalB: 0
     NonTemporalC: 0
     NonTemporalD: 4
     NonTemporalE: 0
@@ -9017,8 +9017,8 @@
     NonDTLTailLoopMXSA: true
     NonDTLTailLoopMXSB: true
     NonTemporal: -1
-    NonTemporalA: 0
-    NonTemporalB: 4
+    NonTemporalA: 4
+    NonTemporalB: 0
     NonTemporalC: 0
     NonTemporalD: 4
     NonTemporalE: 0
@@ -9341,8 +9341,8 @@
     NonDTLTailLoopMXSA: true
     NonDTLTailLoopMXSB: true
     NonTemporal: -1
-    NonTemporalA: 0
-    NonTemporalB: 4
+    NonTemporalA: 4
+    NonTemporalB: 0
     NonTemporalC: 0
     NonTemporalD: 4
     NonTemporalE: 0
@@ -9665,8 +9665,8 @@
     NonDTLTailLoopMXSA: true
     NonDTLTailLoopMXSB: true
     NonTemporal: -1
-    NonTemporalA: 0
-    NonTemporalB: 4
+    NonTemporalA: 4
+    NonTemporalB: 0
     NonTemporalC: 0
     NonTemporalD: 4
     NonTemporalE: 0
@@ -9989,8 +9989,8 @@
     NonDTLTailLoopMXSA: true
     NonDTLTailLoopMXSB: true
     NonTemporal: -1
-    NonTemporalA: 0
-    NonTemporalB: 4
+    NonTemporalA: 4
+    NonTemporalB: 0
     NonTemporalC: 0
     NonTemporalD: 4
     NonTemporalE: 0
@@ -10313,8 +10313,8 @@
     NonDTLTailLoopMXSA: true
     NonDTLTailLoopMXSB: true
     NonTemporal: -1
-    NonTemporalA: 0
-    NonTemporalB: 4
+    NonTemporalA: 4
+    NonTemporalB: 0
     NonTemporalC: 0
     NonTemporalD: 4
     NonTemporalE: 0
@@ -10637,8 +10637,8 @@
     NonDTLTailLoopMXSA: true
     NonDTLTailLoopMXSB: true
     NonTemporal: -1
-    NonTemporalA: 0
-    NonTemporalB: 4
+    NonTemporalA: 4
+    NonTemporalB: 0
     NonTemporalC: 0
     NonTemporalD: 4
     NonTemporalE: 0
@@ -10961,8 +10961,8 @@
     NonDTLTailLoopMXSA: true
     NonDTLTailLoopMXSB: true
     NonTemporal: -1
-    NonTemporalA: 0
-    NonTemporalB: 4
+    NonTemporalA: 4
+    NonTemporalB: 0
     NonTemporalC: 0
     NonTemporalD: 4
     NonTemporalE: 0
@@ -11285,8 +11285,8 @@
     NonDTLTailLoopMXSA: true
     NonDTLTailLoopMXSB: true
     NonTemporal: -1
-    NonTemporalA: 0
-    NonTemporalB: 4
+    NonTemporalA: 4
+    NonTemporalB: 0
     NonTemporalC: 0
     NonTemporalD: 4
     NonTemporalE: 0
@@ -11609,8 +11609,8 @@
     NonDTLTailLoopMXSA: true
     NonDTLTailLoopMXSB: true
     NonTemporal: -1
-    NonTemporalA: 0
-    NonTemporalB: 4
+    NonTemporalA: 4
+    NonTemporalB: 0
     NonTemporalC: 0
     NonTemporalD: 4
     NonTemporalE: 0
@@ -11933,8 +11933,8 @@
     NonDTLTailLoopMXSA: true
     NonDTLTailLoopMXSB: true
     NonTemporal: -1
-    NonTemporalA: 0
-    NonTemporalB: 4
+    NonTemporalA: 4
+    NonTemporalB: 0
     NonTemporalC: 0
     NonTemporalD: 4
     NonTemporalE: 0
@@ -12257,8 +12257,8 @@
     NonDTLTailLoopMXSA: true
     NonDTLTailLoopMXSB: true
     NonTemporal: -1
-    NonTemporalA: 0
-    NonTemporalB: 4
+    NonTemporalA: 4
+    NonTemporalB: 0
     NonTemporalC: 0
     NonTemporalD: 4
     NonTemporalE: 0
@@ -12581,8 +12581,8 @@
     NonDTLTailLoopMXSA: true
     NonDTLTailLoopMXSB: true
     NonTemporal: -1
-    NonTemporalA: 0
-    NonTemporalB: 4
+    NonTemporalA: 4
+    NonTemporalB: 0
     NonTemporalC: 0
     NonTemporalD: 4
     NonTemporalE: 0
@@ -12905,8 +12905,8 @@
     NonDTLTailLoopMXSA: true
     NonDTLTailLoopMXSB: true
     NonTemporal: -1
-    NonTemporalA: 0
-    NonTemporalB: 4
+    NonTemporalA: 4
+    NonTemporalB: 0
     NonTemporalC: 0
     NonTemporalD: 4
     NonTemporalE: 0
@@ -13229,8 +13229,8 @@
     NonDTLTailLoopMXSA: true
     NonDTLTailLoopMXSB: true
     NonTemporal: -1
-    NonTemporalA: 0
-    NonTemporalB: 4
+    NonTemporalA: 4
+    NonTemporalB: 0
     NonTemporalC: 0
     NonTemporalD: 4
     NonTemporalE: 0
@@ -13553,8 +13553,8 @@
     NonDTLTailLoopMXSA: true
     NonDTLTailLoopMXSB: true
     NonTemporal: -1
-    NonTemporalA: 0
-    NonTemporalB: 4
+    NonTemporalA: 4
+    NonTemporalB: 0
     NonTemporalC: 0
     NonTemporalD: 4
     NonTemporalE: 0
@@ -13877,8 +13877,8 @@
     NonDTLTailLoopMXSA: true
     NonDTLTailLoopMXSB: true
     NonTemporal: -1
-    NonTemporalA: 0
-    NonTemporalB: 4
+    NonTemporalA: 4
+    NonTemporalB: 0
     NonTemporalC: 0
     NonTemporalD: 4
     NonTemporalE: 0
@@ -14201,8 +14201,8 @@
     NonDTLTailLoopMXSA: true
     NonDTLTailLoopMXSB: true
     NonTemporal: -1
-    NonTemporalA: 0
-    NonTemporalB: 4
+    NonTemporalA: 4
+    NonTemporalB: 0
     NonTemporalC: 0
     NonTemporalD: 4
     NonTemporalE: 0
@@ -14525,8 +14525,8 @@
     NonDTLTailLoopMXSA: true
     NonDTLTailLoopMXSB: true
     NonTemporal: -1
-    NonTemporalA: 0
-    NonTemporalB: 4
+    NonTemporalA: 4
+    NonTemporalB: 0
     NonTemporalC: 0
     NonTemporalD: 4
     NonTemporalE: 0
@@ -14849,8 +14849,8 @@
     NonDTLTailLoopMXSA: true
     NonDTLTailLoopMXSB: true
     NonTemporal: -1
-    NonTemporalA: 0
-    NonTemporalB: 4
+    NonTemporalA: 4
+    NonTemporalB: 0
     NonTemporalC: 0
     NonTemporalD: 4
     NonTemporalE: 0
@@ -15173,8 +15173,8 @@
     NonDTLTailLoopMXSA: true
     NonDTLTailLoopMXSB: true
     NonTemporal: -1
-    NonTemporalA: 0
-    NonTemporalB: 4
+    NonTemporalA: 4
+    NonTemporalB: 0
     NonTemporalC: 0
     NonTemporalD: 4
     NonTemporalE: 0
@@ -15497,8 +15497,8 @@
     NonDTLTailLoopMXSA: true
     NonDTLTailLoopMXSB: true
     NonTemporal: -1
-    NonTemporalA: 0
-    NonTemporalB: 4
+    NonTemporalA: 4
+    NonTemporalB: 0
     NonTemporalC: 0
     NonTemporalD: 4
     NonTemporalE: 0
@@ -15821,8 +15821,8 @@
     NonDTLTailLoopMXSA: true
     NonDTLTailLoopMXSB: true
     NonTemporal: -1
-    NonTemporalA: 0
-    NonTemporalB: 4
+    NonTemporalA: 4
+    NonTemporalB: 0
     NonTemporalC: 0
     NonTemporalD: 4
     NonTemporalE: 0
@@ -16145,8 +16145,8 @@
     NonDTLTailLoopMXSA: true
     NonDTLTailLoopMXSB: true
     NonTemporal: -1
-    NonTemporalA: 0
-    NonTemporalB: 4
+    NonTemporalA: 4
+    NonTemporalB: 0
     NonTemporalC: 0
     NonTemporalD: 4
     NonTemporalE: 0
@@ -16469,8 +16469,8 @@
     NonDTLTailLoopMXSA: true
     NonDTLTailLoopMXSB: true
     NonTemporal: -1
-    NonTemporalA: 0
-    NonTemporalB: 4
+    NonTemporalA: 4
+    NonTemporalB: 0
     NonTemporalC: 0
     NonTemporalD: 4
     NonTemporalE: 0
@@ -16793,8 +16793,8 @@
     NonDTLTailLoopMXSA: true
     NonDTLTailLoopMXSB: true
     NonTemporal: -1
-    NonTemporalA: 0
-    NonTemporalB: 4
+    NonTemporalA: 4
+    NonTemporalB: 0
     NonTemporalC: 0
     NonTemporalD: 4
     NonTemporalE: 0
