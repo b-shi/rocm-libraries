@@ -1805,7 +1805,6 @@ def mainLoop(writer, kernel):
     vgprBudget = writer.states.regCaps["MaxVgpr"]
     vgprUsed = writer.vgprPool.size() - writer.vgprPool.available()
 
-    print("[Partition candidates]", MFMASchedulerConfig.get_partition_candidates(tiA, tiB))
     for numPartM, numPartN in MFMASchedulerConfig.get_partition_candidates(tiA, tiB):
         cfg = MFMASchedulerConfig(
             numMFMATilesM=tiA.localMMATileGrid[0],
@@ -1829,8 +1828,6 @@ def mainLoop(writer, kernel):
         if vgprUsed + numVgpr <= vgprBudget:
             break
 
-    
-    print(f"[Partition] selected ({numPartM}, {numPartN}), vgprUsed={vgprUsed}, vgprNeeded={numVgpr}, total={vgprUsed + numVgpr}/{vgprBudget}")
 
     # Allocation and instruction emit
     scheduler.allocVgprTiles(writer, tiA, tiB,
