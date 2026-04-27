@@ -2073,6 +2073,9 @@ class Solution(collections.abc.Mapping):
         if (not isaInfoMap[isa].asmCaps['HasWMMA']) and (readRegsA > 4 or readRegsB > 4):
           reject(state, "LocalReadVectorWidth results in attemping to read LDS larger than b128, reject")
           return ldsPadA, ldsPadB, ldsPadM
+        # SubtileImpl does not need LDS padding.
+        if state["UseSubtileImpl"]:
+          return 0, 0, 0
         if state["EnableMatrixInstruction"]:
           # for readRegs = 1 or 4, we need to double pad for MI16x16xNx1 to avoid bank conflict.
           if state["MatrixInstB"] == 1 and state["MatrixInstM"] == 16:
@@ -4030,8 +4033,7 @@ class Solution(collections.abc.Mapping):
 
     state["LdsNumBytes"] = ldsNumBytes
     ldsSize = ldsNumBytes
-    # UseSubtileImpl overwrite LDS size and has its own check.
-    if ldsSize > state["MaxLDS"] and not state["UseSubtileImpl"]:
+    if ldsSize > state["MaxLDS"]:
       reject(state, printRejectionReason, "Kernel Uses %u > %u bytes of LDS" % ( ldsSize, state["MaxLDS"]))
       state["ValidDepthU"] = False
       return
