@@ -4302,7 +4302,7 @@ class KernelWriterAssembly(KernelWriter):
                 else:
                   # (numLine * stride + DepthU) * bpe  — mirrors scale path structure
                   module.add(SAddU32(dst=sgpr(stmp+0), src0=sgpr(stmp+0), src1=extra_bytes, comment="+ DepthU (one K step)"))
-                  module.add(scalarMultiplyBpe(sgpr("Srd%s+2"%tc), sgpr(stmp+0), tP["bpeGR"], comment="buffer_load limit for %s (tile-boundary, avoids 32-bit overflow)"%tc))
+                  module.add(scalarMultiplyBpe("Srd%s+2"%tc, stmp+0, float(tP["bpeGR"]), comment="buffer_load limit for %s (tile-boundary, avoids 32-bit overflow)"%tc))
           module.addModuleAsFlatItems(self.s_mul_u64_u32(sgpr(tileStart), sgpr(tileStart+1), sgpr(tileStart+0), \
                     strideF, comment="tlu=0, scaled tile-offset by stride"))
 
@@ -5370,7 +5370,7 @@ class KernelWriterAssembly(KernelWriter):
   ##############################################################################
   def initC(self, kernel):
     module = Module("initC")
-    if self.states.lastValuMXSAB:
+    if not kernel["UseSubtileImpl"] and self.states.lastValuMXSAB:
       self.vgprPool.remove(0 , self.states.lastValuMXSAB, "ValuMXSAB")
       module.addComment1("initC: remove ValuMXSA/B vgpr buffer [%u...%u) from pool"%(self.states.mxsa.startVgprValu, self.states.lastValuMXSAB))
     self.vgprPool.remove(self.states.c.startVgprValu, self.states.c.numVgprValu, "ValuC")
@@ -7529,7 +7529,7 @@ class KernelWriterAssembly(KernelWriter):
       # ValuC+N). Determine their base vgpr so mapAcctoArchRegs can address
       # them correctly.
       spilledVgprBase = None
-      if kernel.get("UseSubtileImpl"):
+      if kernel.get("UseSubtileImpl") and hasattr(self.states.d, 'tileInfo') and isinstance(getattr(self.states.d.tileInfo, 'vgprTiles', None), list):
         # For subtile kernels, D-tile accumulators that overflow the accvgpr
         # pool are placed in arch vgprs allocated from the vgpr pool.
         # mapAcctoArchRegs needs to know the base address of those vgprs so it
@@ -14826,6 +14826,12 @@ class KernelWriterAssembly(KernelWriter):
               writeLabels[beta][factorDim][vectorWidth][globalWriteMode]["NonEdgeEnd"] = Label(self.labels.getNameInc("GW_B%u_FD%u_VW%u_%s_NonEdgeEnd" % (beta, factorDim, vectorWidth, globalWriteMode) ), "")
               writeLabels[beta][factorDim][vectorWidth][globalWriteMode]["Then"] = Label(self.labels.getNameInc("GW_B%u_FD%u_VW%u_%s_Then" % (beta, factorDim, vectorWidth, globalWriteMode) ), "")
               writeLabels[beta][factorDim][vectorWidth][globalWriteMode]["Else"] = Label(self.labels.getNameInc("GW_B%u_FD%u_VW%u_%s_Else" % (beta, factorDim, vectorWidth, globalWriteMode) ), "")
+              writeLabels[beta][factorDim][vectorWidth][globalWriteMode]["ThenDeferred"] = Label(self.labels.getNameInc("GW_B%u_FD%u_VW%u_%s_Then_Deferred" % (beta, factorDim, vectorWidth, globalWriteMode) ), "")
+              writeLabels[beta][factorDim][vectorWidth][globalWriteMode]["ThenDeferredReturn"] = Label(self.labels.getNameInc("GW_B%u_FD%u_VW%u_%s_Then_Deferred_Return" % (beta, factorDim, vectorWidth, globalWriteMode) ), "")
+              writeLabels[beta][factorDim][vectorWidth][globalWriteMode]["ElseDeferred"] = Label(self.labels.getNameInc("GW_B%u_FD%u_VW%u_%s_Else_Deferred" % (beta, factorDim, vectorWidth, globalWriteMode) ), "")
+              writeLabels[beta][factorDim][vectorWidth][globalWriteMode]["ElseDeferredReturn"] = Label(self.labels.getNameInc("GW_B%u_FD%u_VW%u_%s_Else_Deferred_Return" % (beta, factorDim, vectorWidth, globalWriteMode) ), "")
+              writeLabels[beta][factorDim][vectorWidth][globalWriteMode]["NonEdgeDeferred"] = Label(self.labels.getNameInc("GW_B%u_FD%u_VW%u_%s_NonEdge_Deferred" % (beta, factorDim, vectorWidth, globalWriteMode) ), "")
+              writeLabels[beta][factorDim][vectorWidth][globalWriteMode]["NonEdgeDeferredReturn"] = Label(self.labels.getNameInc("GW_B%u_FD%u_VW%u_%s_NonEdge_Deferred_Return" % (beta, factorDim, vectorWidth, globalWriteMode) ), "")
 
       # Generate beta modules for each global write mode
       activationLabelListBackup = activationLabelList

@@ -45,6 +45,7 @@ from .KernelWriterModules import *
 from .Component import Component, LraTileProperties
 from .Components.Signature import UserArgumentsInfo
 from .Components.CustomSchedule import customMainLoopSchedule
+from .Components.SubtileBasedKernel import *
 from .SolutionStructs import Solution, isPackedIndex
 from .SolutionStructs.Utilities import getMiInputType
 from .AsmMemoryInstruction import MemoryInstruction
@@ -2526,215 +2527,215 @@ class KernelWriter(metaclass=abc.ABCMeta):
     if not kernel["UseSubtileImpl"]:
       module.addComment1("global read addresses: tile offset assignment a")
       module.add(self.graTileAssignment(kernel, tensorParametersA))
-    if kernel["ProblemType"]["MXBlockA"]:
-      if not tdmA:
-        module.addComment1("global read addresses: tile offset assignment mxsa")
-        module.add(self.graTileAssignment(kernel, tensorParametersA["MX"]))
-    # Tile offset assignment Metadata
-    if kernel["ProblemType"]["Sparse"]:
-      module.addComment1("global read addresses: tile offset assignment metadata")
-      if kernel["DirectToVgprSparseMetadata"]:
-        # calculate tile assignment and store into each vgprGlobalReadOffsetMetadata
-        module.add(self.graMetadataTileAssignment(kernel, tPMRef))
+      if kernel["ProblemType"]["MXBlockA"]:
+        if not tdmA:
+          module.addComment1("global read addresses: tile offset assignment mxsa")
+          module.add(self.graTileAssignment(kernel, tensorParametersA["MX"]))
+      # Tile offset assignment Metadata
+      if kernel["ProblemType"]["Sparse"]:
+        module.addComment1("global read addresses: tile offset assignment metadata")
+        if kernel["DirectToVgprSparseMetadata"]:
+          # calculate tile assignment and store into each vgprGlobalReadOffsetMetadata
+          module.add(self.graMetadataTileAssignment(kernel, tPMRef))
+        else:
+          module.add(self.graTileAssignment(kernel, tPM))
+      # Tile offset assignment B(MXSB)
+      if kernel["ProblemType"]["MXBlockB"]:
+        if not tdmB:
+          module.addComment1("global read addresses: tile offset assignment mxsb")
+          module.add(self.graTileAssignment(kernel, tensorParametersB["MX"]))
+      if tdmB:
+        if not tdmInited:
+          module.add(self.tdmGlobalOffset(kernel, tensorParametersB))
+          module.add(self.initTDMDescriptor(kernel, tensorParametersB))
       else:
-        module.add(self.graTileAssignment(kernel, tPM))
-    # Tile offset assignment B(MXSB)
-    if kernel["ProblemType"]["MXBlockB"]:
-      if not tdmB:
-        module.addComment1("global read addresses: tile offset assignment mxsb")
-        module.add(self.graTileAssignment(kernel, tensorParametersB["MX"]))
-    if tdmB:
-      if not tdmInited:
-        module.add(self.tdmGlobalOffset(kernel, tensorParametersB))
-        module.add(self.initTDMDescriptor(kernel, tensorParametersB))
-    else:
-      module.addComment1("global read addresses: tile offset assignment b")
-      module.add(self.graTileAssignment(kernel, tensorParametersB))
+        module.addComment1("global read addresses: tile offset assignment b")
+        module.add(self.graTileAssignment(kernel, tensorParametersB))
 
-    # Unroll assignment A(MXSA)
-    if not tdmA:
-      module.addComment1("global read addresses: unroll assignment a")
-      module.add(self.graUnrollAssignment(kernel, tensorParametersA))
-    if kernel["ProblemType"]["MXBlockA"]:
+      # Unroll assignment A(MXSA)
       if not tdmA:
-        module.addComment1("global read addresses: unroll assignment mxsa")
-        module.add(self.graUnrollAssignment(kernel, tensorParametersA["MX"]))
-    # Unroll assignment Metadata
-    if kernel["ProblemType"]["Sparse"] and not kernel["DirectToVgprSparseMetadata"]:
-      module.addComment1("global read addresses: unroll assignment metadata")
-      module.add(self.graUnrollAssignment(kernel, tPM))
-    # Unroll assignment B(MXSB)
-    if kernel["ProblemType"]["MXBlockB"]:
-      if not tdmB:
-        module.addComment1("global read addresses: unroll assignment mxsb")
-        module.add(self.graUnrollAssignment(kernel, tensorParametersB["MX"]))
-    if not tdmB:
-      module.addComment1("global read addresses: unroll assignment b")
-      module.add(self.graUnrollAssignment(kernel, tensorParametersB))
-
-    # other free indices
-    if not (tdmA or tdmB):
-      if kernel["ProblemType"]["NumIndicesC"] > 2:
-        module.addComment1("global read addresses: other free assignments")
-        module.add(self.graOtherFreeAssignments())
-
-      # other summation indices
-      if self.states.otherSummations:
-        module.addComment1("global read addresses: other summation assignments")
-        module.add(self.graOtherSummationAssignments(kernel))
-
-    # Tile offsets A(MXSA)
-    if not tdmA:
-      module.addComment1("global read addresses: tile offsets a")
-      module.add(self.graTileOffsets(kernel, tensorParametersA))
-    if kernel["ProblemType"]["MXBlockA"]:
-      module.addComment1("global read addresses: tile offsets mxsa")
-      if not tdmA:
-        module.add(self.graTileOffsets(kernel, tensorParametersA["MX"]))
-    # Tile offsets Metadata
-    if kernel["ProblemType"]["Sparse"] and not kernel["DirectToVgprSparseMetadata"]:
-      module.addComment1("global read addresses: tile offsets metadata")
-      # Using A or B's margin to instead Metadata's margin
-      module.add(self.graTileOffsets(kernel, tPM, tPMRef["glvw"] if tPMRef["rtv"] else 1))
-    # Tile offsets B(MXSB)
-    if kernel["ProblemType"]["MXBlockB"]:
-      module.addComment1("global read addresses: tile offsets mxsb")
-      if not tdmB:
-        module.add(self.graTileOffsets(kernel, tensorParametersB["MX"]))
-    if not tdmB:
-      module.addComment1("global read addresses: tile offsets b")
-      module.add(self.graTileOffsets(kernel, tensorParametersB))
-
-    # Unroll offsets A(MXSA)
-    if not tdmA:
-      module.addComment1("global read addresses: unroll offsets a")
-      module.add(self.graUnrollOffsets(kernel, tensorParametersA))
-    if kernel["ProblemType"]["MXBlockA"]:
-      module.addComment1("global read addresses: unroll offsets mxsa")
-      if not tdmA:
-        module.add(self.graUnrollOffsets(kernel, tensorParametersA["MX"]))
-    # Unroll offsets Metadata
-    if kernel["ProblemType"]["Sparse"] and not kernel["DirectToVgprSparseMetadata"]:
-      module.addComment1("global read addresses: unroll offsets metadata")
-      module.add(self.graUnrollOffsets(kernel, tPM))
-    # Unroll offsets B(MXSB)
-    if kernel["ProblemType"]["MXBlockB"]:
-      module.addComment1("global read addresses: unroll offsets mxsb")
-      if not tdmB:
-        module.add(self.graUnrollOffsets(kernel, tensorParametersB["MX"]))
-
-    if not tdmB:
-      module.addComment1("global read addresses: unroll offsets b")
-      module.add(self.graUnrollOffsets(kernel, tensorParametersB))
-
-    # tile edges
-    if kernel["EdgeType"] == "ShiftPtr" and not tdmA and not tdmB:
-      if self.states.useBias == DataDirection.WRITE and (kernel["ProblemType"]["BiasSrc"] == "A" or kernel["ProblemType"]["BiasSrc"] == "B"):
-        # Not supported
-        assert not forceNoTileCode
-      # Shift here has two purposes:
-      #  1. Ensure the loads are in-bounds to prevent fault.
-      #     BufferLoad uses the buffer limit hardware and does not require bounds checking for this case
-      #  2. Shift-left a wide vector load to ensure it is completely in-bounds.
-      #     If this occurs we need to 'unshift' the C values (see shiftVectorComponents)
-      #     BufferLoad does support this shifting, but if GuaranteeNoPartial=1 then
-      #     it can be guaranteed that no shifting is required.
-      if not (kernel["BufferLoad"] and kernel["GuaranteeNoPartialA"]) and not forceNoTileCode and not kernel["UseGeneralizedNLCOneA"] \
-        and not tensorParametersA["isSwizzled"]:
-        module.addComment1("global read addresses: shift a")
-        module.add(self.graShift(kernel, tensorParametersA))
-        if tensorParametersA["is_sparse"] and kernel["DirectToVgprSparseMetadata"]:
-          module.addComment1("global read addresses: shift metadata")
-          module.add(self.graMetadataShift(kernel, tensorParametersA))
-        if kernel["ProblemType"]["MXBlockA"]:
-          module.addComment1("global read addresses: shift mxsa")
-          module.add(self.graShiftMX(kernel, tensorParametersA["MX"], tensorParametersA))
-
-      if not (kernel["BufferLoad"] and kernel["GuaranteeNoPartialMetadata"]) and not forceNoTileCode \
-        and kernel["ProblemType"]["Sparse"] and not kernel["DirectToVgprSparseMetadata"]:
-        module.addComment1("global read addresses: shift metadata")
-        # Using A's margin to instead Metadata's margin
-        module.add(self.graShift(kernel, tPM, tPMRef["glvw"] if tPMRef["rtv"] else 1))
-
-      if not (kernel["BufferLoad"] and  kernel["GuaranteeNoPartialB"]) and not forceNoTileCode and not kernel["UseGeneralizedNLCOneB"] \
-        and not tensorParametersB["isSwizzled"]:
-        module.addComment1("global read addresses: shift b")
-        module.add(self.graShift(kernel, tensorParametersB))
-        if tensorParametersB["is_sparse"] and kernel["DirectToVgprSparseMetadata"]:
-          module.addComment1("global read addresses: shift metadata")
-          module.add(self.graMetadataShift(kernel, tensorParametersB))
-        if kernel["ProblemType"]["MXBlockB"]:
-          module.addComment1("global read addresses: shift mxsb")
-          module.add(self.graShiftMX(kernel, tensorParametersB["MX"], tensorParametersB))
-
-    # addresses
-    def releaseTensorTmpGprs(tP):
-      self.vgprPool.checkIn(tP["gpr"]["lwoT"])
-      tP["gpr"]["lwoT"] = None
-      self.vgprPool.checkIn(tP["gpr"]["uReg2"])
-      tP["gpr"]["uReg2"] = None
-
-      self.vgprPool.checkIn(tP["gpr"]["uReg"])
-      tP["gpr"]["uReg"] = None
-      if "subIterReg" in tP["gpr"]:
-        if tP["gpr"]["subIterReg"] is not None:
-          self.vgprPool.checkIn(tP["gpr"]["subIterReg"])
-        tP["gpr"]["subIterReg"] = None
-
-    # addresses
-    if not forceNoTileCode:
-      # Addresses A(MXSA)
-      if not tdmA:
-        module.addComment1("global read addresses: addresses a")
-        module.add(self.graAddresses(kernel, tensorParametersA))
-      if not tdmA and kernel["ProblemType"]["MXBlockA"]:
-        module.addComment1("global read addresses: addresses mxsa")
-        module.add(self.graAddresses(kernel, tensorParametersA["MX"]))
-      # Addresses Metadata
+        module.addComment1("global read addresses: unroll assignment a")
+        module.add(self.graUnrollAssignment(kernel, tensorParametersA))
+      if kernel["ProblemType"]["MXBlockA"]:
+        if not tdmA:
+          module.addComment1("global read addresses: unroll assignment mxsa")
+          module.add(self.graUnrollAssignment(kernel, tensorParametersA["MX"]))
+      # Unroll assignment Metadata
       if kernel["ProblemType"]["Sparse"] and not kernel["DirectToVgprSparseMetadata"]:
-        module.addComment1("global read addresses: addresses metadata")
-        module.add(self.graAddresses(kernel, tPM))
-      # Addresses B(MXSB)
-      if not tdmB and kernel["ProblemType"]["MXBlockB"]:
-        module.addComment1("global read addresses: addresses mxsb")
-        module.add(self.graAddresses(kernel, tensorParametersB["MX"]))
+        module.addComment1("global read addresses: unroll assignment metadata")
+        module.add(self.graUnrollAssignment(kernel, tPM))
+      # Unroll assignment B(MXSB)
+      if kernel["ProblemType"]["MXBlockB"]:
+        if not tdmB:
+          module.addComment1("global read addresses: unroll assignment mxsb")
+          module.add(self.graUnrollAssignment(kernel, tensorParametersB["MX"]))
       if not tdmB:
-        module.addComment1("global read addresses: addresses b")
-        module.add(self.graAddresses(kernel, tensorParametersB))
+        module.addComment1("global read addresses: unroll assignment b")
+        module.add(self.graUnrollAssignment(kernel, tensorParametersB))
 
-    # workgroup SGPRs no longer needed
-    if not tdmA:
-      module.add(self.removeGROffsetsVariableSgprsFromPool(kernel))
+      # other free indices
+      if not (tdmA or tdmB):
+        if kernel["ProblemType"]["NumIndicesC"] > 2:
+          module.addComment1("global read addresses: other free assignments")
+          module.add(self.graOtherFreeAssignments())
 
-    # Final offsets A(MXSA)
-    if not tdmA:
-      module.addComment1("global read addresses: final offsets a")
-      module.add(self.graFinalOffsets(kernel, tensorParametersA))
-      # releaseTensorTmpGprs(tensorParametersA)
-    if not tdmA and kernel["ProblemType"]["MXBlockA"]:
-      module.addComment1("global read addresses: final offsets mxsa")
-      module.add(self.graFinalOffsets(kernel, tensorParametersA["MX"]))
-    if kernel["ProblemType"]["Sparse"]:
-      module.addComment1("global read addresses: final offsets metadata")
-      if kernel["DirectToVgprSparseMetadata"]:
-        module.add(self.graMetadataFinalOffsets(kernel, tPMRef))
-      else:
-        module.add(self.graFinalOffsets(kernel, tPM))
-    # Final offsets B(MXSB)
-    if not tdmB and kernel["ProblemType"]["MXBlockB"]:
-      module.addComment1("global read addresses: final offsets mxsb")
-      module.add(self.graFinalOffsets(kernel, tensorParametersB["MX"]))
-    if not tdmB:
-      module.addComment1("global read addresses: final offsets b")
-      module.add(self.graFinalOffsets(kernel, tensorParametersB))
-      # releaseTensorTmpGprs(tensorParametersB)
+        # other summation indices
+        if self.states.otherSummations:
+          module.addComment1("global read addresses: other summation assignments")
+          module.add(self.graOtherSummationAssignments(kernel))
 
-    self.dontAppendCode = False
-    self.dontAppendCode = self.dontAppendCode or forceNoTileCode
+      # Tile offsets A(MXSA)
+      if not tdmA:
+        module.addComment1("global read addresses: tile offsets a")
+        module.add(self.graTileOffsets(kernel, tensorParametersA))
+      if kernel["ProblemType"]["MXBlockA"]:
+        module.addComment1("global read addresses: tile offsets mxsa")
+        if not tdmA:
+          module.add(self.graTileOffsets(kernel, tensorParametersA["MX"]))
+      # Tile offsets Metadata
+      if kernel["ProblemType"]["Sparse"] and not kernel["DirectToVgprSparseMetadata"]:
+        module.addComment1("global read addresses: tile offsets metadata")
+        # Using A or B's margin to instead Metadata's margin
+        module.add(self.graTileOffsets(kernel, tPM, tPMRef["glvw"] if tPMRef["rtv"] else 1))
+      # Tile offsets B(MXSB)
+      if kernel["ProblemType"]["MXBlockB"]:
+        module.addComment1("global read addresses: tile offsets mxsb")
+        if not tdmB:
+          module.add(self.graTileOffsets(kernel, tensorParametersB["MX"]))
+      if not tdmB:
+        module.addComment1("global read addresses: tile offsets b")
+        module.add(self.graTileOffsets(kernel, tensorParametersB))
 
-    # Add increment code
-    gsuComponent = Component.GSU.find(self)
-    module.add(gsuComponent.setupNewTile(self, kernel, tensorParametersA, tensorParametersB, tPM))
+      # Unroll offsets A(MXSA)
+      if not tdmA:
+        module.addComment1("global read addresses: unroll offsets a")
+        module.add(self.graUnrollOffsets(kernel, tensorParametersA))
+      if kernel["ProblemType"]["MXBlockA"]:
+        module.addComment1("global read addresses: unroll offsets mxsa")
+        if not tdmA:
+          module.add(self.graUnrollOffsets(kernel, tensorParametersA["MX"]))
+      # Unroll offsets Metadata
+      if kernel["ProblemType"]["Sparse"] and not kernel["DirectToVgprSparseMetadata"]:
+        module.addComment1("global read addresses: unroll offsets metadata")
+        module.add(self.graUnrollOffsets(kernel, tPM))
+      # Unroll offsets B(MXSB)
+      if kernel["ProblemType"]["MXBlockB"]:
+        module.addComment1("global read addresses: unroll offsets mxsb")
+        if not tdmB:
+          module.add(self.graUnrollOffsets(kernel, tensorParametersB["MX"]))
+
+      if not tdmB:
+        module.addComment1("global read addresses: unroll offsets b")
+        module.add(self.graUnrollOffsets(kernel, tensorParametersB))
+
+      # tile edges
+      if kernel["EdgeType"] == "ShiftPtr" and not tdmA and not tdmB:
+        if self.states.useBias == DataDirection.WRITE and (kernel["ProblemType"]["BiasSrc"] == "A" or kernel["ProblemType"]["BiasSrc"] == "B"):
+          # Not supported
+          assert not forceNoTileCode
+        # Shift here has two purposes:
+        #  1. Ensure the loads are in-bounds to prevent fault.
+        #     BufferLoad uses the buffer limit hardware and does not require bounds checking for this case
+        #  2. Shift-left a wide vector load to ensure it is completely in-bounds.
+        #     If this occurs we need to 'unshift' the C values (see shiftVectorComponents)
+        #     BufferLoad does support this shifting, but if GuaranteeNoPartial=1 then
+        #     it can be guaranteed that no shifting is required.
+        if not (kernel["BufferLoad"] and kernel["GuaranteeNoPartialA"]) and not forceNoTileCode and not kernel["UseGeneralizedNLCOneA"] \
+          and not tensorParametersA["isSwizzled"]:
+          module.addComment1("global read addresses: shift a")
+          module.add(self.graShift(kernel, tensorParametersA))
+          if tensorParametersA["is_sparse"] and kernel["DirectToVgprSparseMetadata"]:
+            module.addComment1("global read addresses: shift metadata")
+            module.add(self.graMetadataShift(kernel, tensorParametersA))
+          if kernel["ProblemType"]["MXBlockA"]:
+            module.addComment1("global read addresses: shift mxsa")
+            module.add(self.graShiftMX(kernel, tensorParametersA["MX"], tensorParametersA))
+
+        if not (kernel["BufferLoad"] and kernel["GuaranteeNoPartialMetadata"]) and not forceNoTileCode \
+          and kernel["ProblemType"]["Sparse"] and not kernel["DirectToVgprSparseMetadata"]:
+          module.addComment1("global read addresses: shift metadata")
+          # Using A's margin to instead Metadata's margin
+          module.add(self.graShift(kernel, tPM, tPMRef["glvw"] if tPMRef["rtv"] else 1))
+
+        if not (kernel["BufferLoad"] and  kernel["GuaranteeNoPartialB"]) and not forceNoTileCode and not kernel["UseGeneralizedNLCOneB"] \
+          and not tensorParametersB["isSwizzled"]:
+          module.addComment1("global read addresses: shift b")
+          module.add(self.graShift(kernel, tensorParametersB))
+          if tensorParametersB["is_sparse"] and kernel["DirectToVgprSparseMetadata"]:
+            module.addComment1("global read addresses: shift metadata")
+            module.add(self.graMetadataShift(kernel, tensorParametersB))
+          if kernel["ProblemType"]["MXBlockB"]:
+            module.addComment1("global read addresses: shift mxsb")
+            module.add(self.graShiftMX(kernel, tensorParametersB["MX"], tensorParametersB))
+
+      # addresses
+      def releaseTensorTmpGprs(tP):
+        self.vgprPool.checkIn(tP["gpr"]["lwoT"])
+        tP["gpr"]["lwoT"] = None
+        self.vgprPool.checkIn(tP["gpr"]["uReg2"])
+        tP["gpr"]["uReg2"] = None
+
+        self.vgprPool.checkIn(tP["gpr"]["uReg"])
+        tP["gpr"]["uReg"] = None
+        if "subIterReg" in tP["gpr"]:
+          if tP["gpr"]["subIterReg"] is not None:
+            self.vgprPool.checkIn(tP["gpr"]["subIterReg"])
+          tP["gpr"]["subIterReg"] = None
+
+      # addresses
+      if not forceNoTileCode:
+        # Addresses A(MXSA)
+        if not tdmA:
+          module.addComment1("global read addresses: addresses a")
+          module.add(self.graAddresses(kernel, tensorParametersA))
+        if not tdmA and kernel["ProblemType"]["MXBlockA"]:
+          module.addComment1("global read addresses: addresses mxsa")
+          module.add(self.graAddresses(kernel, tensorParametersA["MX"]))
+        # Addresses Metadata
+        if kernel["ProblemType"]["Sparse"] and not kernel["DirectToVgprSparseMetadata"]:
+          module.addComment1("global read addresses: addresses metadata")
+          module.add(self.graAddresses(kernel, tPM))
+        # Addresses B(MXSB)
+        if not tdmB and kernel["ProblemType"]["MXBlockB"]:
+          module.addComment1("global read addresses: addresses mxsb")
+          module.add(self.graAddresses(kernel, tensorParametersB["MX"]))
+        if not tdmB:
+          module.addComment1("global read addresses: addresses b")
+          module.add(self.graAddresses(kernel, tensorParametersB))
+
+      # workgroup SGPRs no longer needed
+      if not tdmA:
+        module.add(self.removeGROffsetsVariableSgprsFromPool(kernel))
+
+      # Final offsets A(MXSA)
+      if not tdmA:
+        module.addComment1("global read addresses: final offsets a")
+        module.add(self.graFinalOffsets(kernel, tensorParametersA))
+        # releaseTensorTmpGprs(tensorParametersA)
+      if not tdmA and kernel["ProblemType"]["MXBlockA"]:
+        module.addComment1("global read addresses: final offsets mxsa")
+        module.add(self.graFinalOffsets(kernel, tensorParametersA["MX"]))
+      if kernel["ProblemType"]["Sparse"]:
+        module.addComment1("global read addresses: final offsets metadata")
+        if kernel["DirectToVgprSparseMetadata"]:
+          module.add(self.graMetadataFinalOffsets(kernel, tPMRef))
+        else:
+          module.add(self.graFinalOffsets(kernel, tPM))
+      # Final offsets B(MXSB)
+      if not tdmB and kernel["ProblemType"]["MXBlockB"]:
+        module.addComment1("global read addresses: final offsets mxsb")
+        module.add(self.graFinalOffsets(kernel, tensorParametersB["MX"]))
+      if not tdmB:
+        module.addComment1("global read addresses: final offsets b")
+        module.add(self.graFinalOffsets(kernel, tensorParametersB))
+        # releaseTensorTmpGprs(tensorParametersB)
+
+      self.dontAppendCode = False
+      self.dontAppendCode = self.dontAppendCode or forceNoTileCode
+
+      # Add increment code
+      gsuComponent = Component.GSU.find(self)
+      module.add(gsuComponent.setupNewTile(self, kernel, tensorParametersA, tensorParametersB, tPM))
 
     #TODO: TDM wave separated
     if tdmA and tdmB and prod(kernel["MIWaveGroup"]) > 1:
@@ -2765,103 +2766,104 @@ class KernelWriter(metaclass=abc.ABCMeta):
     # we can't init in shadow of this prefetch
     # since that would initC inside the other summation loops
 
-    if self.states.doShadowInit != 2:
-      module.add(self.initC(kernel))
-      if kernel["ProblemType"]["Gradient"] and kernel["ProblemType"]["UseBias"] and (kernel["ProblemType"]["BiasSrc"] == "A" or kernel["ProblemType"]["BiasSrc"] == "B"):
-        module.add(self.initSumUnroll(kernel))
+    if not kernel["UseSubtileImpl"]:
+      if self.states.doShadowInit != 2:
+        module.add(self.initC(kernel))
+        if kernel["ProblemType"]["Gradient"] and kernel["ProblemType"]["UseBias"] and (kernel["ProblemType"]["BiasSrc"] == "A" or kernel["ProblemType"]["BiasSrc"] == "B"):
+          module.add(self.initSumUnroll(kernel))
 
-    # open non-unrolled summation loops
-    if not forceNoTileCode:
-      for i in range(kernel["ProblemType"]["NumIndicesSummation"]-1):
-        module.addComment1("summation loop %u"%i)
-        module.add(self.calculateLoopNumIter(kernel, tensorParametersA, tensorParametersB, i))
-        if self.states.actualSummationLoops>1:
-          module.add(self.openLoop(kernel, tensorParametersA, tensorParametersB, i))
-      module.add(self.calculateLoopNumIter(kernel, tensorParametersA, tensorParametersB, self.states.unrollIdx))
+      # open non-unrolled summation loops
+      if not forceNoTileCode:
+        for i in range(kernel["ProblemType"]["NumIndicesSummation"]-1):
+          module.addComment1("summation loop %u"%i)
+          module.add(self.calculateLoopNumIter(kernel, tensorParametersA, tensorParametersB, i))
+          if self.states.actualSummationLoops>1:
+            module.add(self.openLoop(kernel, tensorParametersA, tensorParametersB, i))
+        module.add(self.calculateLoopNumIter(kernel, tensorParametersA, tensorParametersB, self.states.unrollIdx))
 
-    if not forceNoTileCode and self.states.staggerUCode:
-      module.add(self.declareStaggerParms(kernel))
-      # Calculate stagger A(MXSA)
-      if not tdmA:
-        module.add(self.calculateStagger(kernel, tensorParametersA))
-      if kernel["ProblemType"]["MXBlockA"]:
+      if not forceNoTileCode and self.states.staggerUCode:
+        module.add(self.declareStaggerParms(kernel))
+        # Calculate stagger A(MXSA)
         if not tdmA:
-          module.add(self.calculateStagger(kernel, tensorParametersA["MX"]))
-      if kernel["ProblemType"]["MXBlockB"]:
+          module.add(self.calculateStagger(kernel, tensorParametersA))
+        if kernel["ProblemType"]["MXBlockA"]:
+          if not tdmA:
+            module.add(self.calculateStagger(kernel, tensorParametersA["MX"]))
+        if kernel["ProblemType"]["MXBlockB"]:
+          if not tdmB:
+            module.add(self.calculateStagger(kernel, tensorParametersB["MX"]))
+        # Calculate stagger Metadata
+        if kernel["ProblemType"]["Sparse"] and not kernel["DirectToVgprSparseMetadata"]:
+          module.add(self.calculateStagger(kernel,tPM))
+        # Calculate stagger B(MXSB)
         if not tdmB:
-          module.add(self.calculateStagger(kernel, tensorParametersB["MX"]))
-      # Calculate stagger Metadata
+          module.add(self.calculateStagger(kernel, tensorParametersB))
+
+      # LRO and LWA as assigned
+      # init lds read pointers before each unrolled loop
+      module.addComment0("local read addresses: init pointers a")
+      module.add(self.localReadInitPointers(kernel, tensorParametersA, tensorParametersA))
+      if kernel["ProblemType"]["MXBlockA"]:
+        module.addComment0("local read addresses: init pointers mxsa")
+        module.add(self.localReadInitPointers(kernel, tensorParametersA, tensorParametersA["MX"]))
+      if kernel["ProblemType"]["MXBlockB"]:
+        module.addComment0("local read addresses: init pointers mxsb")
+        module.add(self.localReadInitPointers(kernel, tensorParametersA, tensorParametersB["MX"]))
       if kernel["ProblemType"]["Sparse"] and not kernel["DirectToVgprSparseMetadata"]:
-        module.add(self.calculateStagger(kernel,tPM))
-      # Calculate stagger B(MXSB)
-      if not tdmB:
-        module.add(self.calculateStagger(kernel, tensorParametersB))
+        module.addComment0("local read addresses: init pointers metadata")
+        module.add(self.localReadInitPointers(kernel, tensorParametersA, tPM))
+      module.addComment0("local read addresses: init pointers b")
+      module.add(self.localReadInitPointers(kernel, tensorParametersA, tensorParametersB))
+      if self.states.IncLdsBufSwitch:
+        # IncLdsBufSwitch case, need to initialize local write inc register
+        module.addComment0("local write addresses: reset inc")
+        module.add(self.localWriteResetOffsets(kernel,  False, tensorParametersA))
 
-    # LRO and LWA as assigned
-    # init lds read pointers before each unrolled loop
-    module.addComment0("local read addresses: init pointers a")
-    module.add(self.localReadInitPointers(kernel, tensorParametersA, tensorParametersA))
-    if kernel["ProblemType"]["MXBlockA"]:
-      module.addComment0("local read addresses: init pointers mxsa")
-      module.add(self.localReadInitPointers(kernel, tensorParametersA, tensorParametersA["MX"]))
-    if kernel["ProblemType"]["MXBlockB"]:
-      module.addComment0("local read addresses: init pointers mxsb")
-      module.add(self.localReadInitPointers(kernel, tensorParametersA, tensorParametersB["MX"]))
-    if kernel["ProblemType"]["Sparse"] and not kernel["DirectToVgprSparseMetadata"]:
-      module.addComment0("local read addresses: init pointers metadata")
-      module.add(self.localReadInitPointers(kernel, tensorParametersA, tPM))
-    module.addComment0("local read addresses: init pointers b")
-    module.add(self.localReadInitPointers(kernel, tensorParametersA, tensorParametersB))
-    if self.states.IncLdsBufSwitch:
-      # IncLdsBufSwitch case, need to initialize local write inc register
-      module.addComment0("local write addresses: reset inc")
-      module.add(self.localWriteResetOffsets(kernel,  False, tensorParametersA))
+      if self.do["executeToInitEnd"]:
+        module.add(self.functionEnd(kernel, addLabel=False))
 
-    if self.do["executeToInitEnd"]:
-      module.add(self.functionEnd(kernel, addLabel=False))
-
-    ####################################
-    # prefetch: unrolled loop prefix
-    ####################################
-    if kernel["PrefetchGlobalRead"]:
-      self.states.setMemTokenInsts = {"TensorLoadToLds": [self.states.ldsWriteTokenIdx]}
-      # if DirectToVgpr is enabled and swapGlobalRead is true, swap the order of global read (B->A)
-      tensorParameters1st = tensorParametersA
-      tensorParameters2nd = tensorParametersB
-      tdm1st, tdm2nd = kernel["enableTDMA"], kernel["enableTDMB"]
-      if self.isSwapGlobalReadOrderForDtvOrDtl(kernel, prefetch1=True):
-        tensorParameters1st, tensorParameters2nd = tensorParameters2nd, tensorParameters1st
-        tdm1st, tdm2nd = tdm2nd, tdm1st
-      pfi = 1 if kernel["PrefetchGlobalRead"] < 3 else kernel["PrefetchGlobalRead"] - 1
-      module.addComment1("prefetch: global -> local")
-      module.add(self.openSumAtLeastUnroll(kernel, prefetch=True, isOptNLL=isOptNLL))
-      moduleTmp = self.directToLdsM0Update(kernel, 0, tensorParameters1st)
-      module.add(replaceHolder(moduleTmp, 0))
-      module.add(self.globalReadDo(kernel, 0, tensorParameters1st))
-      if "MX" in tensorParameters1st:
-        moduleTmp = self.directToLdsM0Update(kernel, 0, tensorParameters1st["MX"], skipWait=True)
+      ####################################
+      # prefetch: unrolled loop prefix
+      ####################################
+      if kernel["PrefetchGlobalRead"]:
+        self.states.setMemTokenInsts = {"TensorLoadToLds": [self.states.ldsWriteTokenIdx]}
+        # if DirectToVgpr is enabled and swapGlobalRead is true, swap the order of global read (B->A)
+        tensorParameters1st = tensorParametersA
+        tensorParameters2nd = tensorParametersB
+        tdm1st, tdm2nd = kernel["enableTDMA"], kernel["enableTDMB"]
+        if self.isSwapGlobalReadOrderForDtvOrDtl(kernel, prefetch1=True):
+          tensorParameters1st, tensorParameters2nd = tensorParameters2nd, tensorParameters1st
+          tdm1st, tdm2nd = tdm2nd, tdm1st
+        pfi = 1 if kernel["PrefetchGlobalRead"] < 3 else kernel["PrefetchGlobalRead"] - 1
+        module.addComment1("prefetch: global -> local")
+        module.add(self.openSumAtLeastUnroll(kernel, prefetch=True, isOptNLL=isOptNLL))
+        moduleTmp = self.directToLdsM0Update(kernel, 0, tensorParameters1st)
         module.add(replaceHolder(moduleTmp, 0))
-        module.add(self.globalReadDo(kernel, 0, tensorParameters1st["MX"]))
-      if "MX" in tensorParameters2nd:
-        moduleTmp = self.directToLdsM0Update(kernel, 0, tensorParameters2nd["MX"], skipWait=True)
+        module.add(self.globalReadDo(kernel, 0, tensorParameters1st))
+        if "MX" in tensorParameters1st:
+          moduleTmp = self.directToLdsM0Update(kernel, 0, tensorParameters1st["MX"], skipWait=True)
+          module.add(replaceHolder(moduleTmp, 0))
+          module.add(self.globalReadDo(kernel, 0, tensorParameters1st["MX"]))
+        if "MX" in tensorParameters2nd:
+          moduleTmp = self.directToLdsM0Update(kernel, 0, tensorParameters2nd["MX"], skipWait=True)
+          module.add(replaceHolder(moduleTmp, 0))
+          module.add(self.globalReadDo(kernel, 0, tensorParameters2nd["MX"]))
+        skip2ndWaitForDtl = kernel["DirectToLds%s"%tensorParameters1st["tensorChar"]]
+        moduleTmp = self.directToLdsM0Update(kernel, 0, tensorParameters2nd, skip2ndWaitForDtl)
         module.add(replaceHolder(moduleTmp, 0))
-        module.add(self.globalReadDo(kernel, 0, tensorParameters2nd["MX"]))
-      skip2ndWaitForDtl = kernel["DirectToLds%s"%tensorParameters1st["tensorChar"]]
-      moduleTmp = self.directToLdsM0Update(kernel, 0, tensorParameters2nd, skip2ndWaitForDtl)
-      module.add(replaceHolder(moduleTmp, 0))
-      module.add(self.globalReadDo(kernel, 0, tensorParameters2nd))
-      tPA = tensorParametersA
-      tPB = tensorParametersB
-      if kernel["PrefetchGlobalRead"] == 2:
-        # PGR2 + DTV case, skip GR inc
-        if kernel["DirectToVgprA"]:
-          tPA = None
-        if kernel["DirectToVgprB"]:
-          tPB = None
-      module.add(self.globalReadIncrementAB(kernel, tPA, tPB, self.states.unrollIdx, pfi))
-      self.states.setMemTokenInsts = {}
-      self.states.ldsWriteTokenIdx = \
-        self.states.memTokenLdsBuffer1 if self.states.ldsWriteTokenIdx == self.states.memTokenLdsBuffer0 else self.states.memTokenLdsBuffer0
+        module.add(self.globalReadDo(kernel, 0, tensorParameters2nd))
+        tPA = tensorParametersA
+        tPB = tensorParametersB
+        if kernel["PrefetchGlobalRead"] == 2:
+          # PGR2 + DTV case, skip GR inc
+          if kernel["DirectToVgprA"]:
+            tPA = None
+          if kernel["DirectToVgprB"]:
+            tPB = None
+        module.add(self.globalReadIncrementAB(kernel, tPA, tPB, self.states.unrollIdx, pfi))
+        self.states.setMemTokenInsts = {}
+        self.states.ldsWriteTokenIdx = \
+          self.states.memTokenLdsBuffer1 if self.states.ldsWriteTokenIdx == self.states.memTokenLdsBuffer0 else self.states.memTokenLdsBuffer0
 
     module.addComment2("End setupNewTile")
 
@@ -5577,7 +5579,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
       module.add(self._wait(kernel, tensorParametersA, tensorParametersB, -1, 0, -1, " tailloopInNll: wait for local read"))
       module.add(self._syncThreads(kernel, "tailloopInNll: wait until LR done, sync LDS0", memoryToken=self.states.memTokenLdsBuffer0))
 
-    if self.states.lastValuMXSAB:
+    if not kernel["UseSubtileImpl"] and self.states.lastValuMXSAB:
       self.vgprPool.add(0 , self.states.lastValuMXSAB, "ValuMXSAB")
       module.addComment1("Tail: add ValuA/B vgpr buffer [%u...%u) to pool" % \
           (0, self.states.lastValuMXSAB))
@@ -9259,7 +9261,10 @@ class KernelWriter(metaclass=abc.ABCMeta):
     tensorParametersB = {}
     self._initKernel(kernel, tensorParametersA, tensorParametersB)
     self.stringIdx = 0
-    (error, kb) = self.kernelBody(kernel, tensorParametersA, tensorParametersB)
+    if not kernel["UseSubtileImpl"]:
+      (error, kb) = self.kernelBody(kernel, tensorParametersA, tensorParametersB)
+    else:
+      (error, kb) = self.kernelBodySubtile(kernel, tensorParametersA, tensorParametersB)
     fileString += str(kb)
 
     if error != 0:
