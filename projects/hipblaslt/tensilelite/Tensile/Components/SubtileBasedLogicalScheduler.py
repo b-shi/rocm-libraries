@@ -1184,14 +1184,18 @@ class LogicalScheduler:
     # ── Remove unnecessary LR deps ────────────────────────
 
     def remove_unnecessary_lr_deps(self):
-        """Remove GR→LR deps that are already covered by earlier sync points.
+        """Remove GR→LR collision deps already covered by an earlier sync.
 
-        Two redundancy checks:
-        1. MFMA-based: if the MFMA at the previous GR's position depends on a
-           same-tensor LR with a later exec order, the dep is redundant.
-        2. GR-based: if a previous GR (in execution order) already had the same
-           LR dep (same tensor, same or later exec order), the current GR's dep
-           is redundant because the previous GR already created that sync point.
+        A GR with an LR dep creates a sync point. 
+        We get the latest LR guaranted at this sync point (prevLRDep), which is the max of:
+         - the GR's own LR dep 
+         - the MFMA's same-tensor LR dep
+        
+        If the current GR's LR dep (currLRDep) has exec order <= prevLRDep, it is already guaranteed
+        and can be removed.
+
+        Exec order is (mt_offset, partition, subIterK_slot).
+        On wrap-around the exec order is shifted by MT-1.
         """
         self._ensure_pass(Pass.REMOVE_GR_DEPS)
 
@@ -1219,35 +1223,42 @@ class LogicalScheduler:
 
         gr_with_lr_deps.sort(key=lambda x: (x[0], x[1]))
 
-        prev_gr_pos = (gr_with_lr_deps[-1][0], gr_with_lr_deps[-1][1])
-        # Track the max LR exec order synced per tensor by previous GRs
-        prev_gr_lr_eo = {}
+        last_sync = (gr_with_lr_deps[-1][0], gr_with_lr_deps[-1][1])
+        # Per-tensor max LR exec order guaranteed at last_sync.
+        last_sync_eo = {}
+
+        def _update_sync_eo(pos, shift):
+            """Collect per-tensor max LR exec order at pos (MFMA deps)."""
+            eo_map = {}
+            mfma = mfma_by_pos.get(pos)
+            if mfma and mfma.deps:
+                for d in mfma.deps:
+                    if isinstance(d.ref, LRPlacement):
+                        t = d.ref.tensor
+                        d_eo = _dep_exec_order(d)
+                        if shift:
+                            d_eo = (d_eo[0] - 1, d_eo[1], d_eo[2])
+                        if t not in eo_map or d_eo > eo_map[t]:
+                            eo_map[t] = d_eo
+            return eo_map
+
+        # Seed from last position (previous MT → shift by -1).
+        last_sync_eo = _update_sync_eo(last_sync, shift=True)
 
         for pi, subIterK, gr, dep in gr_with_lr_deps:
-            eo = _dep_exec_order(dep)
+            curr_eo = _dep_exec_order(dep)
             tensor = dep.ref.tensor
-            removed = False
-            # Check 1: MFMA at previous GR position syncs on a later LR
-            mfma = mfma_by_pos.get(prev_gr_pos)
-            if mfma and mfma.deps:
-                same_tensor_deps = [d for d in mfma.deps
-                                    if isinstance(d.ref, LRPlacement)
-                                    and d.ref.tensor == tensor]
-                if same_tensor_deps:
-                    mfma_max_eo = max(_dep_exec_order(d)
-                                      for d in same_tensor_deps)
-                    if mfma_max_eo > eo:
-                        gr.deps.clear()
-                        removed = True
-            # Check 2: a previous GR already synced on same or later LR
-            if not removed and tensor in prev_gr_lr_eo:
-                if prev_gr_lr_eo[tensor] >= eo:
-                    gr.deps.clear()
-                    removed = True
 
-            if not removed:
-                prev_gr_lr_eo[tensor] = eo
-            prev_gr_pos = (pi, subIterK)
+            prev_lr_eo = last_sync_eo.get(tensor)
+            if prev_lr_eo is not None and curr_eo <= prev_lr_eo:
+                gr.deps.clear()
+                continue
+
+            last_sync = (pi, subIterK)
+            last_sync_eo = _update_sync_eo(last_sync, shift=False)
+            # The GR's own dep is also a sync point at this slot.
+            if tensor not in last_sync_eo or curr_eo > last_sync_eo[tensor]:
+                last_sync_eo[tensor] = curr_eo
 
         self._completed.add(Pass.REMOVE_LR_DEPS)
 
