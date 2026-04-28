@@ -81,8 +81,7 @@ def create_kernel(MT0=256, MT1=256, fp4=False, depthU=None):
     return kernel
 
 
-def make_cfg_256x256_fp4(depthU=256, k_gran=1, numPartM=1, numPartN=1,
-                         grSA_k=2, grSA_mn=8, grSB_k=2, grSB_mn=8):
+def make_cfg_256x256_fp4(depthU=256, k_gran=1, numPartM=1, numPartN=1):
     """Build FP4 config with scale tensors. k_gran applies to LR A/B."""
     kernel = create_kernel(256, 256, fp4=True, depthU=depthU)
     tiA = TileInfo('A', kernel)
@@ -99,8 +98,8 @@ def make_cfg_256x256_fp4(depthU=256, k_gran=1, numPartM=1, numPartN=1,
         grB=ReadGranularity(mn=1, k=2),
         lrSA=ReadGranularity(mn=2, k=2),
         lrSB=ReadGranularity(mn=2, k=2),
-        grSA=ReadGranularity(mn=grSA_mn, k=grSA_k),
-        grSB=ReadGranularity(mn=grSB_mn, k=grSB_k),
+        grSA=ReadGranularity(mn=scaleTiA.localMMATileGrid[0], k=scaleTiA.localMMATileGrid[1]),
+        grSB=ReadGranularity(mn=scaleTiB.localMMATileGrid[0], k=scaleTiB.localMMATileGrid[1]),
         numPartitionsM=numPartM,
         numPartitionsN=numPartN,
     )
@@ -699,7 +698,7 @@ class TestPlaceGRs:
 
     def test_1x1_k1_DU512(self):
         """256x256, DU512, FP4. GR k=2 → two k-chunks. grSA/SB k=4 → full MT."""
-        cfg = make_cfg_256x256_fp4(depthU=512, grSA_k=4, grSB_k=4)
+        cfg = make_cfg_256x256_fp4(depthU=512)
         sched = LogicalScheduler(cfg)
         slots = sched.place_GRs()
 
@@ -737,8 +736,7 @@ class TestPlaceGRs:
 
     def test_2x2_k1_DU512(self):
         """256x256, DU512, FP4, 2x2 partition. GR k=2 × 2 chunks + scale."""
-        cfg = make_cfg_256x256_fp4(depthU=512, numPartM=2, numPartN=2,
-                                    grSA_k=4, grSA_mn=8, grSB_k=4, grSB_mn=8)
+        cfg = make_cfg_256x256_fp4(depthU=512, numPartM=2, numPartN=2)
         sched = LogicalScheduler(cfg)
         sched.place_GRs()
         parts = sched._partitions
@@ -811,8 +809,7 @@ class TestAnnotateDeps:
 
     def test_2x2_DU512(self):
         """256x256, DU512, FP4, 2x2 partition. Per-partition deps."""
-        cfg = make_cfg_256x256_fp4(depthU=512, numPartM=2, numPartN=2,
-                                    grSA_k=4, grSA_mn=8, grSB_k=4, grSB_mn=8)
+        cfg = make_cfg_256x256_fp4(depthU=512, numPartM=2, numPartN=2)
         sched = LogicalScheduler(cfg)
         sched.annotate_deps()
         parts = sched._partitions
@@ -930,8 +927,7 @@ class TestRemoveCrossDeps:
 
     def test_2x2_DU512(self):
         """256x256, DU512, FP4, 2x2 partition. Spot checks."""
-        cfg = make_cfg_256x256_fp4(depthU=512, numPartM=2, numPartN=2,
-                                    grSA_k=4, grSA_mn=8, grSB_k=4, grSB_mn=8)
+        cfg = make_cfg_256x256_fp4(depthU=512, numPartM=2, numPartN=2)
         sched = LogicalScheduler(cfg)
         sched.remove_cross_deps()
         parts = sched._partitions
@@ -1265,8 +1261,8 @@ class TestFromTileInfo:
             grB=ReadGranularity(mn=1, k=2),
             lrSA=ReadGranularity(mn=2, k=2),
             lrSB=ReadGranularity(mn=2, k=2),
-            grSA=ReadGranularity(mn=8, k=2),
-            grSB=ReadGranularity(mn=8, k=2),
+            grSA=ReadGranularity(mn=scaleTiA.localMMATileGrid[0], k=scaleTiA.localMMATileGrid[1]),
+            grSB=ReadGranularity(mn=scaleTiB.localMMATileGrid[0], k=scaleTiB.localMMATileGrid[1]),
         )
 
         assert cfg.numMFMATilesM == 2  # 64/16/2
@@ -1541,7 +1537,7 @@ if __name__ == "__main__":
             numPartitionsN=1,
         )
     else:
-        kernel = create_kernel(256, 256, fp4=True)
+        kernel = create_kernel(128, 128, fp4=True,depthU=512)
         tiA = TileInfo('A', kernel)
         tiB = TileInfo('B', kernel)
         scaleTiA = TileInfo('MXSA', kernel)
@@ -1557,8 +1553,8 @@ if __name__ == "__main__":
             grB=ReadGranularity(mn=1, k=2),
             lrSA=ReadGranularity(mn=2, k=2),
             lrSB=ReadGranularity(mn=2, k=2),
-            grSA=ReadGranularity(mn=8, k=2),
-            grSB=ReadGranularity(mn=8, k=2),
+            grSA=ReadGranularity(mn=scaleTiA.localMMATileGrid[0], k=scaleTiA.localMMATileGrid[1]),
+            grSB=ReadGranularity(mn=scaleTiB.localMMATileGrid[0], k=scaleTiB.localMMATileGrid[1]),
         )
 
     print(f"Config: numMFMATilesM={cfg.numMFMATilesM}, "
