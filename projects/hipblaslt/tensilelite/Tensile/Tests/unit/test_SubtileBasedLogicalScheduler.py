@@ -15,6 +15,7 @@ Organized by pass:
   12. Integration    — Full pipeline with real instructions
 """
 
+import pytest
 from Tensile.Components.SubtileBasedKernel import TileInfo
 from Tensile.Components.SubtileBasedLogicalScheduler import (
     LogicalScheduler,
@@ -121,6 +122,44 @@ def make_cfg_bf16(MT0=256, MT1=256, depthU=64, numPartM=1, numPartN=1):
         grB=ReadGranularity(mn=1, k=2),
         numPartitionsM=numPartM,
         numPartitionsN=numPartN,
+    )
+
+
+def make_cfg_bf16_pgr0(MT0=256, MT1=256, depthU=64):
+    """Build BF16 config with pgr=0, plr=0."""
+    kernel = create_kernel(MT0, MT1, fp4=False, depthU=depthU)
+    tiA = TileInfo('A', kernel)
+    tiB = TileInfo('B', kernel)
+    return SchedulerConfig(
+        numMFMATilesM=tiA.localMMATileGrid[0],
+        numMFMATilesN=tiB.localMMATileGrid[0],
+        numSubIterK=tiA.localMMATileGrid[1],
+        lrA=ReadGranularity(mn=1, k=1),
+        lrB=ReadGranularity(mn=1, k=1),
+        grA=ReadGranularity(mn=1, k=2),
+        grB=ReadGranularity(mn=1, k=2),
+        pgr=0,
+        plr=0,
+    )
+
+
+def make_cfg_bf16_pgr1(MT0=256, MT1=256, depthU=64, numPartM=1, numPartN=1):
+    """Build BF16 config with pgr=1, plr=1."""
+    kernel = create_kernel(MT0, MT1, fp4=False, depthU=depthU)
+    tiA = TileInfo('A', kernel)
+    tiB = TileInfo('B', kernel)
+    return SchedulerConfig(
+        numMFMATilesM=tiA.localMMATileGrid[0],
+        numMFMATilesN=tiB.localMMATileGrid[0],
+        numSubIterK=tiA.localMMATileGrid[1],
+        lrA=ReadGranularity(mn=1, k=1),
+        lrB=ReadGranularity(mn=1, k=1),
+        grA=ReadGranularity(mn=1, k=2),
+        grB=ReadGranularity(mn=1, k=2),
+        numPartitionsM=numPartM,
+        numPartitionsN=numPartN,
+        pgr=1,
+        plr=1,
     )
 
 
@@ -771,6 +810,34 @@ class TestPlaceGRs:
             _assert_slot_grs(parts[pi][0], ['B'], f"P{pi} s0")
             _assert_gr(parts[pi][0], 'B', 0, 2, b_idx, b_idx+1, mt=2)
 
+    def test_pgr1_gr_before_corresponding_lr(self):
+        """PGR=1: GR(T, mt=X) must be placed strictly before first LR(T, mt=X)."""
+        cfg = make_cfg_bf16_pgr1()
+        sched = LogicalScheduler(cfg)
+        sched.place_GRs()
+        parts = sched._partitions
+        numK = cfg.numSubIterK
+
+        # Build per-(tensor, mt) earliest LR flat index
+        lr_first = {}
+        for pi, slots in enumerate(parts):
+            for slot in slots:
+                flat = pi * numK + slot.subIterK
+                for lr in slot.lrs:
+                    key = (lr.tensor, lr.mtIteration)
+                    if key not in lr_first or flat < lr_first[key]:
+                        lr_first[key] = flat
+
+        for pi, slots in enumerate(parts):
+            for slot in slots:
+                flat = pi * numK + slot.subIterK
+                for gr in slot.grs:
+                    key = (gr.tensor, gr.mtIteration)
+                    if key in lr_first:
+                        assert flat < lr_first[key], (
+                            f"GR({gr.tensor}, mt={gr.mtIteration}) at flat={flat} "
+                            f"must be before first LR at flat={lr_first[key]}")
+
 
 # ══════════════════════════════════════════════════════════════
 # Step 4: Annotate deps
@@ -825,10 +892,10 @@ class TestAnnotateDeps:
         assert ('LR', 'A', 3, 3, -1) in mfma_p0_s0
         assert len(mfma_p0_s0) == 4
 
-        # P3 MFMA(k=0): deps from earlier partitions
+        # P3 MFMA(k=0): deps on LRs that loaded subIterK=0 data for P3 tiles
         mfma_p3_s0 = _dep_refs(parts[3][0].mfma)
-        assert ('LR', 'A', 1, 2, 0) in mfma_p3_s0
-        assert ('LR', 'SA', 1, 0, 0) in mfma_p3_s0
+        assert ('LR', 'A', 0, 3, 0) in mfma_p3_s0
+        assert ('LR', 'SA', 0, 2, 0) in mfma_p3_s0
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1520,6 +1587,88 @@ if __name__ == "__main__":
     import io
 
     use_bf16 = "--bf16" in sys.argv
+    use_pgr0 = "--pgr0" in sys.argv
+    use_pgr1 = "--pgr1" in sys.argv
+
+    if use_pgr0 or use_pgr1:
+        if use_pgr0:
+            cfg = make_cfg_bf16_pgr0()
+        else:
+            cfg = make_cfg_bf16_pgr1()
+
+        print(f"Config: numMFMATilesM={cfg.numMFMATilesM}, "
+              f"numMFMATilesN={cfg.numMFMATilesN}, "
+              f"numSubIterK={cfg.numSubIterK}, "
+              f"hasScale={cfg.hasScale}, pgr={cfg.pgr}, plr={cfg.plr}")
+        print()
+
+        sched = LogicalScheduler(cfg)
+
+        interactive = "--interactive" in sys.argv or "-i" in sys.argv
+
+        steps = [
+            ("Place LRs",                     lambda: (sched.place_LRs(), sched.print_lr())),
+            ("Place GRs",                     lambda: (sched.place_GRs(), sched.print_gr())),
+            ("Annotate deps",                 lambda: (sched.annotate_deps(), sched.print_deps())),
+            ("Remove unnecessary GR deps",    lambda: (sched.remove_unnecessary_gr_deps(), sched.print_deps())),
+            ("Remove unnecessary LR deps",    lambda: (sched.remove_unnecessary_lr_deps(), sched.print_deps())),
+            ("Remove cross deps",             lambda: (sched.remove_cross_deps(), sched.print_remove_deps())),
+            ("Insert gr/lr inc",              lambda: (sched.insert_gr_lr_inc(), sched.print_group_lr_gr())),
+            ("Group LR/GR",                   lambda: (sched.group_lr_gr(), sched.print_group_lr_gr())),
+            ("Remove unnecessary wait_lr_sync", lambda: (sched.remove_unnecessary_wait_lr_sync(), sched.print_group_lr_gr())),
+            ("Emit",                          lambda: (sched.emit(), sched.print_emit())),
+            ("Emit (dependency order)",       lambda: (None, sched.print_emit_dep_order())),
+        ]
+
+        for i, (title, run) in enumerate(steps):
+            _, output = run()
+            print(f"{'=' * 60}")
+            print(f"  {title}")
+            print(f"{'=' * 60}")
+            print(output)
+            if interactive and i < len(steps) - 1:
+                input("Press Enter for next step...")
+
+        kernel = create_kernel(256, 256, fp4=False, depthU=64)
+        writer, tiA, tiB, scaleTiA, scaleTiB, dTileInfo = make_writer_and_tileinfos(kernel, fp4=False)
+
+        sched.allocVgprTiles(writer, tiA, tiB,
+                             scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB)
+
+        sched.populate_instructions(
+            writer, kernel,
+            tileInfoA=tiA, tileInfoB=tiB,
+            dtileInfo=dTileInfo,
+            scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB,
+        )
+
+        def _print_emitLoop(label, emitted_3d):
+            module = sched._emitLoop(writer, kernel, label, emitted_3d)
+            buf = io.StringIO()
+            for inst in module.flatitems():
+                buf.write(f"  {str(inst).rstrip()}\n")
+            return buf.getvalue()
+
+        loop_sections = [("MAINLOOP", sched._emitted_per_unroll[0])]
+        if use_pgr1:
+            loop_sections = [
+                ("PRELOOP",  sched._preloop_emitted),
+                ("MAINLOOP", sched._emitted_per_unroll[0]),
+                ("NGLL",     sched._ngll_per_unroll[0]),
+                ("NLL",      sched._nll_per_unroll[0]),
+            ]
+
+        for label, emitted_3d in loop_sections:
+            print(f"{'=' * 60}")
+            print(f"  {label} (emitLoop)")
+            print(f"{'=' * 60}")
+            print(_print_emitLoop(label, emitted_3d))
+            if interactive:
+                input("Press Enter for next step...")
+
+        sched.deallocVgprTiles(writer)
+
+        sys.exit(0)
 
     if use_bf16:
         kernel = create_kernel(384, 256, fp4=False, depthU=64)
@@ -1736,3 +1885,204 @@ class TestBuildNll:
                             cnts = src.wait_gr_counts
                             assert cnts.A == 0 and cnts.B == 0 and cnts.SA == 0 and cnts.SB == 0, \
                                 f"NLL WaitGR should have zeroed counts, got {cnts}"
+
+
+# ══════════════════════════════════════════════════════════════
+# PGR=0 / PLR=0 tests
+# ══════════════════════════════════════════════════════════════
+
+class TestPGR0Config:
+
+    def test_pgr0_requires_plr0(self):
+        with pytest.raises(AssertionError, match="pgr=0 requires plr=0"):
+            SchedulerConfig(
+                numMFMATilesM=8, numMFMATilesN=8, numSubIterK=2,
+                lrA=ReadGranularity(mn=1, k=1), lrB=ReadGranularity(mn=1, k=1),
+                grA=ReadGranularity(mn=1, k=2), grB=ReadGranularity(mn=1, k=2),
+                pgr=0, plr=1,
+            )
+
+    def test_pgr0_requires_single_partition(self):
+        with pytest.raises(AssertionError, match="pgr=0 requires numPartitions=1"):
+            SchedulerConfig(
+                numMFMATilesM=8, numMFMATilesN=8, numSubIterK=2,
+                lrA=ReadGranularity(mn=1, k=1), lrB=ReadGranularity(mn=1, k=1),
+                grA=ReadGranularity(mn=1, k=2), grB=ReadGranularity(mn=1, k=2),
+                pgr=0, plr=0, numPartitionsN=2,
+            )
+
+
+class TestPlaceLRs_PLR0:
+
+    def test_bf16_plr0_structure(self):
+        cfg = make_cfg_bf16_pgr0()
+        sched = LogicalScheduler(cfg)
+        partitions = sched.place_LRs()
+
+        assert len(partitions) == 1
+        slots = partitions[0]
+        numK = cfg.numSubIterK
+
+        for k in range(numK):
+            slot = slots[k]
+            assert slot.mfma is not None
+            assert slot.mfma.subIterK == k
+            for lr in slot.lrs:
+                assert lr.mtIteration == 0
+                assert lr.tiles.subIterK_start == k
+                assert lr.tiles.subIterK_end == k + 1
+
+    def test_bf16_plr0_tensors(self):
+        cfg = make_cfg_bf16_pgr0()
+        sched = LogicalScheduler(cfg)
+        partitions = sched.place_LRs()
+        slots = partitions[0]
+
+        for k in range(cfg.numSubIterK):
+            _assert_slot_lrs(slots[k], ['A', 'B'])
+
+    def test_bf16_plr0_print_lr(self):
+        cfg = make_cfg_bf16_pgr0()
+        sched = LogicalScheduler(cfg)
+        sched.place_LRs()
+        output = sched.print_lr()
+
+        assert "MT n," in output
+        assert "MT n+1" not in output
+
+
+class TestPlaceGRs_PGR0:
+
+    def test_bf16_pgr0_all_in_subIterK0(self):
+        cfg = make_cfg_bf16_pgr0()
+        sched = LogicalScheduler(cfg)
+        sched.place_LRs()
+        sched.place_GRs()
+        slots = sched._partitions[0]
+
+        for gr in slots[0].grs:
+            assert gr.subIterK_slot == 0
+            assert gr.mtIteration == 0
+
+        for k in range(1, cfg.numSubIterK):
+            assert len(slots[k].grs) == 0
+
+    def test_bf16_pgr0_covers_full_k(self):
+        cfg = make_cfg_bf16_pgr0()
+        sched = LogicalScheduler(cfg)
+        sched.place_LRs()
+        sched.place_GRs()
+        slots = sched._partitions[0]
+
+        gr_a = [gr for gr in slots[0].grs if gr.tensor == 'A']
+        all_k = set()
+        for gr in gr_a:
+            for k in range(gr.tiles.subIterK_start, gr.tiles.subIterK_end):
+                all_k.add(k)
+        assert all_k == set(range(cfg.numSubIterK))
+
+    def test_bf16_pgr0_print_gr(self):
+        cfg = make_cfg_bf16_pgr0()
+        sched = LogicalScheduler(cfg)
+        sched.place_LRs()
+        sched.place_GRs()
+        output = sched.print_gr()
+
+        assert "GR A (MT n," in output
+        assert "GR B (MT n," in output
+        assert "MT n+1" not in output
+        assert "MT n+2" not in output
+
+
+class TestAnnotateDeps_PGR0:
+
+    def _build(self):
+        cfg = make_cfg_bf16_pgr0()
+        sched = LogicalScheduler(cfg)
+        sched.place_LRs()
+        sched.place_GRs()
+        sched.annotate_deps()
+        return cfg, sched
+
+    def test_no_crash(self):
+        self._build()
+
+    def test_gr_has_no_deps(self):
+        _, sched = self._build()
+        slots = sched._partitions[0]
+        for slot in slots:
+            for gr in slot.grs:
+                assert gr.deps == []
+
+    def test_mfma_deps_on_lr_mt0(self):
+        _, sched = self._build()
+        slots = sched._partitions[0]
+        for slot in slots:
+            if slot.mfma:
+                for dep in slot.mfma.deps:
+                    assert isinstance(dep.ref, LRPlacement)
+                    assert dep.ref.mtIteration == 0
+
+    def test_lr_deps_on_gr_mt0(self):
+        _, sched = self._build()
+        slots = sched._partitions[0]
+        for slot in slots:
+            for lr in slot.lrs:
+                for dep in lr.deps:
+                    assert isinstance(dep.ref, GRPlacement)
+                    assert dep.ref.mtIteration == 0
+
+
+class TestEmit_PGR0:
+
+    def test_emit_succeeds(self):
+        cfg = make_cfg_bf16_pgr0()
+        sched = LogicalScheduler(cfg)
+        sched.emit()
+        assert sched._emitted is not None
+        assert len(sched._emitted) == 1
+        assert len(sched._emitted[0]) == cfg.numSubIterK
+
+    def test_gr_lr_inc_as_postOps(self):
+        cfg = make_cfg_bf16_pgr0()
+        sched = LogicalScheduler(cfg)
+        sched.emit()
+        # Each tensor's INC should be on its own placement (not merged)
+        slot0 = sched._partitions[-1][0]  # subIterK=0
+        slot1 = sched._partitions[-1][-1]  # subIterK=1
+
+        # lr_inc(A) on LR A, lr_inc(B) on LR B
+        lr_a = [lr for lr in slot1.lrs if lr.tensor == 'A'][0]
+        lr_b = [lr for lr in slot1.lrs if lr.tensor == 'B'][0]
+        assert any(op.kind == 'lr_inc' and op.tensor == 'A' for op in lr_a.postOps)
+        assert any(op.kind == 'lr_inc' and op.tensor == 'B' for op in lr_b.postOps)
+
+        # gr_inc(A) on GR A, gr_inc(B) on GR B
+        gr_a = [gr for gr in slot0.grs if gr.tensor == 'A'][0]
+        gr_b = [gr for gr in slot0.grs if gr.tensor == 'B'][0]
+        assert any(op.kind == 'gr_inc' and op.tensor == 'A' for op in gr_a.postOps)
+        assert any(op.kind == 'gr_inc' and op.tensor == 'B' for op in gr_b.postOps)
+
+
+class TestBuildLoopVariants_PGR0:
+
+    def test_preloop_empty(self):
+        cfg = make_cfg_bf16_pgr0()
+        sched = LogicalScheduler(cfg)
+        sched.emit()
+        preloop = sched.build_preloop()
+        assert preloop == [[[]]]
+
+    def test_ngll_empty(self):
+        cfg = make_cfg_bf16_pgr0()
+        sched = LogicalScheduler(cfg)
+        sched.emit()
+        ngll = sched.build_ngll()
+        assert ngll == [[[]]]
+
+    def test_nll_empty(self):
+        cfg = make_cfg_bf16_pgr0()
+        sched = LogicalScheduler(cfg)
+        sched.emit()
+        nll = sched.build_nll()
+        assert nll == [[[]]]
