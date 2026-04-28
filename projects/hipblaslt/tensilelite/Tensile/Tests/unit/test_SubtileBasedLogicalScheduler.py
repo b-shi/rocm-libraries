@@ -1095,12 +1095,13 @@ class TestGroupLrGr:
         assert lr_sa1.deps[0].ref is lr_b1
         assert lr_sb1.deps[0].ref is lr_sa1
 
-        # s1: GR chain B←SA←SB
+        # s1: GR chain B←SA←SB (collision deps removed — covered by
+        # MFMA@s0 which already syncs on the same LR SA/SB)
         gr_b1 = [gr for gr in s1.grs if gr.tensor == 'B'][0]
         gr_sa1 = [gr for gr in s1.grs if gr.tensor == 'SA'][0]
         gr_sb1 = [gr for gr in s1.grs if gr.tensor == 'SB'][0]
         assert gr_b1.preOps == []
-        assert gr_sa1.preOps[0].kind == 'wait_lr'
+        assert gr_sa1.preOps[0].kind == 'gr_inc'
         assert gr_sb1.deps[0].ref is gr_sa1
 
 

@@ -156,8 +156,7 @@ MAINLOOP (dependency paths):
         [ 1] lr         LR A  (MT n, subIterK [1]) [6-11]
       path 1:
         [ 2] gr         GR A (MT n+2, subIterK [0,1]) ids [4-5]
-        [ 5] sync       sync
-        [ 6] gr_inc     gr_inc(B)
+        [ 5] gr_inc     gr_inc(B)
         [ 3] gr         GR B (MT n+2, subIterK [0,1]) ids [0-2]
     subIterK=1:
       MFMA: [ 0] MFMAs (MT n, subIterK 1  ) A : [6-11] , B : [0-7] <- [4]
@@ -394,10 +393,9 @@ MAINLOOP (dependency paths):
         [ 4] lr         LR SB (MT n+1, subIterK [0,1]) [0-7]
       path 1:
         [ 5] gr         GR B (MT n+2, subIterK [0,1]) ids [1-7]
-        [15] sync       sync
-        [16] gr_inc     gr_inc(SA)
+        [15] gr_inc     gr_inc(SA)
         [ 6] gr         GR SA (MT n+2, subIterK [0,1]) ids [0-7]
-        [17] gr_inc     gr_inc(SB)
+        [16] gr_inc     gr_inc(SB)
         [ 7] gr         GR SB (MT n+2, subIterK [0,1]) ids [0-7]
 """
 
