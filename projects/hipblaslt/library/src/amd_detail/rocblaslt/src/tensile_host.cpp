@@ -2702,7 +2702,7 @@ bool useRocRoller(rocblaslt_handle handle, const RocblasltContractionProblem& pr
     bool isShuffledScale
         = (prob.scaleAType
                == RocblasltContractionProblem::ScalingFormat::Block_32_UE8M0_32_8_EXT
-           || prob.scaleBType
+           && prob.scaleBType
                   == RocblasltContractionProblem::ScalingFormat::Block_32_UE8M0_32_8_EXT);
     if(isFp4A && isFp4B && isShuffledScale)
         return false;
