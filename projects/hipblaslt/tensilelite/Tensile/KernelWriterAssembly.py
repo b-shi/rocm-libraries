@@ -31,7 +31,7 @@ from rocisa.container import DSModifiers, SDWAModifiers, VOP3PModifiers, \
                       MUBUFModifiers, SMEMModifiers, EXEC, VCC, RegisterContainer, \
                       DPPModifiers, vgpr, sgpr, accvgpr, mgpr, ContinuousRegister, \
                       HWRegContainer, GLOBALModifiers
-from rocisa.instruction import SGetPositivePCOffset, SLongBranchPositive, SCLongBranchScc0, SCLongBranchScc1, SCLongBranchVccnz, \
+from rocisa.instruction import SGetPositivePCOffset, SLongBranch, SLongBranchPositive, SLongBranchNegative, SCLongBranchScc0, SCLongBranchScc1, SCLongBranchVccnz, \
                         SMulInt64to32, VCvtBF16toFP32
 from rocisa.functions import vectorStaticDivide, vectorStaticRemainder, vectorUInt32CeilDivideAndRemainder, \
                         vectorStaticDivideAndRemainder, scalarStaticDivideAndRemainder, scalarStaticCeilDivide, \
@@ -558,6 +558,20 @@ class KernelWriterAssembly(KernelWriter):
     self.removeSgprVarFromPool("WrapUA")
     self.removeSgprVarFromPool("WrapUB")
 
+    return module
+
+  def undefineSubtileMainLoopSgprs(self, kernel):
+    """Undefine SGPRs used only during the main loop that are not needed in the post-loop.
+    Called for subtile kernels after deallocOffsetRegisters and before endSummation/post-loop."""
+    module = Module("UndefineSubtileMainLoopSgprs")
+    sgprsToUndefine = [
+      "LocalWriteBaseAddrA", "LocalWriteBaseAddrB",
+      "LocalWriteBaseAddrMXSA", "LocalWriteBaseAddrMXSB",
+      "SwapA", "SwapB", "SwapMXSA", "SwapMXSB",
+    ]
+    for name in sgprsToUndefine:
+      if name in self.sgprs:
+        module.add(self.undefineSgpr(name))
     return module
 
   def removeGROffsetsVariableSgprsFromPool(self, kernel):
@@ -1280,7 +1294,6 @@ class KernelWriterAssembly(KernelWriter):
 
     def macroAndSetVgprImplSubtile():
       module.add(RegSet("v", "vgprSerial", self.states.startVgprSerial))
-      print(self.vgprPool.size())
       #self.vgprPool.remove(self.states.startVgprSerial, 1)
       #module.addComment0("Need %u vgprs for GR A"%(self.states.a.tileInfo.numGRPerSubtile))
       return
@@ -3960,19 +3973,28 @@ class KernelWriterAssembly(KernelWriter):
     module = Module("computeLoadSrd")
     use64bShadowLimit = self.states.use64bShadowLimitMX if tc in ["MXSA", "MXSB"] else self.states.use64bShadowLimit
     isMX = tc in ("MXSA", "MXSB")
-    useFixedSrd2 = False # True means use fixed Srd+2 value. No need to calculate tensor2dSize, ShadowLimit
+    # UseSubtileImpl uses a tile-boundary fixed Srd+2 for both MX scale and data A/B.
+    # This avoids 32-bit overflow when computing the full tensor2dSize (N*K or M*K > 2^32).
+    useSubtile = bool(kernel.get("UseSubtileImpl"))
+    useFixedSrd2 = useSubtile
+    isPreShuffledAB = tc in ("A", "B") and kernel["ProblemType"].get("SwizzleTensor%s" % tc, False)
+    isSwizzled = isMX or isPreShuffledAB
     if isMX:
       tcab = "A" if tc == "MXSA" else "B"
       mxBlock = kernel["ProblemType"]["MXBlock%s"%tcab]
-      mxSwizzleSize0 = 32 # M,N direction
-      mxSwizzleSize1 = 256 # K direction
-      mxSwizzleBlockSize = mxSwizzleSize0 * mxSwizzleSize1 // mxBlock
-      # UseSubtileImpl uses swizzled (pre-shuffled) scale layout; a simpler fixed
-      # tile-boundary limit replaces the full tensor2dSize computation.
-      # Non-subtile MX kernels use the standard tensor2dSize path (same as rebase).
-      if kernel.get("UseSubtileImpl"):
-        useFixedSrd2 = True
-    allocateTensor2dSize = use64bShadowLimit and not isMX
+      swizzleSize0 = 32 # M,N direction
+      swizzleSize1 = 256 # K direction
+      swizzleBlockSize = swizzleSize0 * swizzleSize1 // mxBlock
+    else:
+      if isSwizzled:
+        swizzleSize0 = 16 # M,N direction
+        swizzleSize1 = 32 # K direction for MXFP4 (TODO: use bpe to support different dataTypes)
+      else:
+        swizzleSize0 = 1 # M,N direction
+        swizzleSize1 = 1 # K direction
+      swizzleBlockSize = swizzleSize0 * swizzleSize1
+
+    allocateTensor2dSize = use64bShadowLimit and not useFixedSrd2
     numDim = len(indices)
     with self.allocTmpSgpr(2 + 2 + (0 if allocateTensor2dSize else 2)) as tmpSgprInfo:
       stmp = tmpSgprInfo.idx
@@ -3996,10 +4018,10 @@ class KernelWriterAssembly(KernelWriter):
         #tP['ia'][1]
 
         # This is guaranteed to fit in 32-bit since the WG*MT is a number of elements in some unsigned direction:
-        if isMX and kernel.get("UseSubtileImpl"):
-          # UseSubtileImpl MX swizzled (pre-shuffle) case: tile start uses roundup(MT/mxSwizzleSize0)
-          mt = roundUp(kernel[tP["mt"]] / mxSwizzleSize0)
-          module.addModuleAsFlatItems(self.s_mul_u64_u32(sgpr(tileStart+0), sgpr(tileStart+1), sgpr(tP["wg"]), mt, comment="WorkGroup[01] * roundup(MT/%u)"%mxSwizzleSize0))
+        if useFixedSrd2:
+          # UseSubtileImpl fixedSrd2 case (including swizzle and nonSwizzle): tile start uses roundup(MT/swizzleSize0)
+          mt = roundUp(kernel[tP["mt"]] / swizzleSize0)
+          module.addModuleAsFlatItems(self.s_mul_u64_u32(sgpr(tileStart+0), sgpr(tileStart+1), sgpr(tP["wg"]), mt, comment="WorkGroup[01] * roundup(MT/%u)"%swizzleSize0))
         else:
           module.addModuleAsFlatItems(self.s_mul_u64_u32(sgpr(tileStart+0), sgpr(tileStart+1), sgpr(tP["wg"]), kernel[tP["mt"]], comment="WorkGroup[01] * MT"))
 
@@ -4048,20 +4070,40 @@ class KernelWriterAssembly(KernelWriter):
           module.add(SMovB32(dst=sgpr(tileStart+1), src=0))
         strideF = self.strideRef(tc, tP['tileIdx'])
         if not self.isConstUnitStride(strideF):
-          if isMX and kernel.get("UseSubtileImpl"):
-            # UseSubtileImpl MX swizzled (pre-shuffle) case: SRD+2 limit uses tile-boundary formula
+          if useFixedSrd2:
+            # Tile-boundary SRD+2 for UseSubtileImpl (unified for MX scale and data A/B).
+            # Avoids 32-bit overflow from computing full tensor2dSize when N*K or M*K > 2^32.
+            #
+            # tileStart is in block units (roundUp(MT/swizzleSize0)).
+            #   numLine = min(roundUp(size/swizzleSize0) - tileStart_blk, roundUp(MT/swizzleSize0)) - 1
+            #   Srd+2   = numLine * stride_bytes + swizzleBlockSize*(DepthU/swizzleSize1)
+            #
+            # Key: numLine/numElems <= MT (compile-time), so the multiply stays in 32 bits.
+            mt_units    = mt  # roundUp(MT/swizzleSize0), compile-time
+            extra_bytes = swizzleBlockSize * (kernel["DepthU"] // swizzleSize1)
+
             for i in range(0, numDim):
               idx = indices[i]
               if idx == kernel["ProblemType"]["Index0"] or idx == kernel["ProblemType"]["Index1"]:
                 size = self.sizeRef(idx)
-                module.add(SAddU32(dst=sgpr(stmp+0), src0=size, src1=(mxSwizzleSize0 - 1), comment="size + %u - 1"%mxSwizzleSize0))
-                module.add(SLShiftRightB32(dst=sgpr(stmp+0), src=sgpr(stmp+0), shiftHex=log2(mxSwizzleSize0), comment="roundup(size/%u)"%mxSwizzleSize0))
-                module.add(SSubU32(dst=sgpr(stmp+0), src0=sgpr(stmp+0), src1=sgpr(tileStart+0), comment="numBlkToEnd = roundUp(size/%u) - (WorkGroup[01] * roundup(MT/%u))"%(mxSwizzleSize0,mxSwizzleSize0)))
-                module.add(SMinU32(dst=sgpr(stmp+0), src0=sgpr(stmp+0), src1=mt, comment="min (numBlkToEnd, roundup(MT/%u))"%(mxSwizzleSize0)))
-                module.add(SSubU32(dst=sgpr(stmp+0), src0=sgpr(stmp+0), src1=1, comment="numLine = min (numBlkToEnd, roundup(MT/%u)) - 1"%(mxSwizzleSize0)))
+                if isSwizzled:
+                  # tileStart already in block units (WG * roundUp(MT/swizzleSize0))
+                  module.add(SAddU32(dst=sgpr(stmp+0), src0=size, src1=(swizzleSize0 - 1), comment="size + %u - 1"%swizzleSize0))
+                  module.add(SLShiftRightB32(dst=sgpr(stmp+0), src=sgpr(stmp+0), shiftHex=log2(swizzleSize0), comment="roundup(size/%u)"%swizzleSize0))
+                  module.add(SSubU32(dst=sgpr(stmp+0), src0=sgpr(stmp+0), src1=sgpr(tileStart+0), comment="numBlkToEnd = roundUp(size/%u) - tileStart_blk"%swizzleSize0))
+                else:
+                  # tileStart in element units (WG * MT); no block rounding needed
+                  module.add(SSubU32(dst=sgpr(stmp+0), src0=size, src1=sgpr(tileStart+0), comment="numToEnd = size - WG*MT"))
+                module.add(SMinU32(dst=sgpr(stmp+0), src0=sgpr(stmp+0), src1=mt_units, comment="min (numBlkToEnd, roundup(MT/%u))"%swizzleSize0))
+                module.add(SSubU32(dst=sgpr(stmp+0), src0=sgpr(stmp+0), src1=1, comment="numLine = min - 1 (0-based index)"))
                 module.addModuleAsFlatItems(self.s_mul_u64_u32(sgpr(stmp+0), sgpr(stmp+1), sgpr(stmp+0), \
-                          strideF, comment="scaled by stride"))
-                module.add(SAddU32(dst=sgpr("Srd%s+2"%tc), src0=sgpr(stmp+0), src1=mxSwizzleBlockSize * (kernel["DepthU"]//mxSwizzleSize1), comment="buffer_load limit for %s"%tc))
+                          strideF, comment="numLine * stride"))
+                if isMX:
+                  module.add(SAddU32(dst=sgpr("Srd%s+2"%tc), src0=sgpr(stmp+0), src1=extra_bytes, comment="buffer_load limit for %s"%tc))
+                else:
+                  # (numLine * stride + DepthU) * bpe  — mirrors scale path structure
+                  module.add(SAddU32(dst=sgpr(stmp+0), src0=sgpr(stmp+0), src1=extra_bytes, comment="+ DepthU (one K step)"))
+                  module.add(scalarMultiplyBpe(sgpr("Srd%s+2"%tc), sgpr(stmp+0), tP["bpeGR"], comment="buffer_load limit for %s (tile-boundary, avoids 32-bit overflow)"%tc))
           module.addModuleAsFlatItems(self.s_mul_u64_u32(sgpr(tileStart), sgpr(tileStart+1), sgpr(tileStart+0), \
                     strideF, comment="tlu=0, scaled tile-offset by stride"))
 
@@ -4084,9 +4126,8 @@ class KernelWriterAssembly(KernelWriter):
         module.add(SMovB64(dst=sgpr(tileStart, 2), src=0, comment="set default tileStart"))
 
       #Calculate tensor 2d size
-      # For UseSubtileImpl MX kernels, useFixedSrd2=True so tensor2dSize is not needed.
-      # For non-subtile MX kernels and all non-MX kernels, always initialize tensor2dSize.
-      if not isMX or not kernel.get("UseSubtileImpl"):
+      # For UseSubtileImpl kernels (MX and non-MX), useFixedSrd2=True so tensor2dSize is not needed.
+      if not useFixedSrd2:
         if use64bShadowLimit or ((not use64bShadowLimit) and tensor2dSize0 % 2 == 0):
           module.add(SMovB64(dst=sgpr(tensor2dSize0, 2), src=0x1, comment="Init tensor size"))
         else:
@@ -8448,7 +8489,8 @@ class KernelWriterAssembly(KernelWriter):
               (fullVws, elements, fullVws_1, elements_1) = self.notLocalFullTileElements(kernel)
               alpha = False
               beta = False
-              module.add(self.globalWriteElements(kernel, tPA, tPB, [fullVws[0]], [fullVws_1[0]], [elements[0]], [elements_1[0]], True, applyAlpha=alpha, betas=[beta], edge=False))
+              storeModule, _ = self.globalWriteElements(kernel, tPA, tPB, [fullVws[0]], [fullVws_1[0]], [elements[0]], [elements_1[0]], True, applyAlpha=alpha, betas=[beta], edge=False)
+              module.add(storeModule)
 
               self.cleanupGlobalWrite(kernel)
               module.addSpaceLine()
@@ -11522,6 +11564,19 @@ class KernelWriterAssembly(KernelWriter):
     else:
       useSize = [False for _ in srdTcList]
 
+    # For subtile StreamK kernels (StreamK==3, no atomic), the SGPR pool is exhausted
+    # after endSummation. Temporarily expose SrdWS (s60-s63) as Available scratch so
+    # that allocTmpSgpr calls within this function (and the SK component call below)
+    # can borrow those slots. Restore SrdWS as InUse at the end.
+    srdWsAvailableCtx = (
+        kernel.get("StreamK", 0) == 3
+        and kernel.get("StreamKAtomic", 1) == 0
+        and "SrdWS" in self.sgprs
+        and "SrdWS" not in self.states.freeSgprVarPool
+    )
+    if srdWsAvailableCtx:
+      self.addSgprVarToPool("SrdWS")
+
     # Keep tmp SGPR usage lean for the common path (same as develop).
     # BAddrInterleave needs additional temporaries for baseCol computation; allocate
     # those *only when enabled* so marginal kernels don't overflow MaxSgpr.
@@ -11658,6 +11713,8 @@ class KernelWriterAssembly(KernelWriter):
           addrSrcSgpr = "Srd" # update src Sgpr for the second or later iterations
 
     if noMultipleBuffer:
+      if srdWsAvailableCtx:
+        self.removeSgprVarFromPool("SrdWS")
       return module
 
     gsuComponent = Component.GSU.find(self)
@@ -11677,6 +11734,9 @@ class KernelWriterAssembly(KernelWriter):
           else:
             module.add(SMulI32(dst=sgpr(packedSizes), src0=sgpr(packedSizes), \
                       src1=self.sizeRef(idx), comment="first packed size"))
+
+    if srdWsAvailableCtx:
+      self.removeSgprVarFromPool("SrdWS")
 
     return module
 
@@ -12468,17 +12528,18 @@ class KernelWriterAssembly(KernelWriter):
   # then calls globalWriteElements to generate the code for the new tiles.
   ##############################################################################
   def notLocalSplitUGlobalWrite(self, kernel, tPA, tPB):
-    if not self.do["PostLoop"]: return ""
+    if not self.do["PostLoop"]: return Module("notLocalSplitUGlobalWrite"), None
 
     (fullVws, elements, fullVws_1, elements_1) = self.notLocalFullTileElements(kernel)
     # print("len(elements)= ", len(elements_1))
     noGSUBranch = (kernel["GlobalSplitU"] == 0 and kernel["StreamK"] != 3)
     module = Module("notLocalSplitUGlobalWrite")
-    module.add(self.globalWriteElements(kernel, tPA, tPB, fullVws, fullVws_1, elements, elements_1, noGSUBranch=noGSUBranch))
+    storeModule, deferredGSU0 = self.globalWriteElements(kernel, tPA, tPB, fullVws, fullVws_1, elements, elements_1, noGSUBranch=noGSUBranch)
+    module.add(storeModule)
 
     self.cleanupGlobalWrite(kernel)
 
-    return module
+    return module, deferredGSU0
 
   ##############################################################################
   # LocalSplitU: Global Write
@@ -12520,7 +12581,8 @@ class KernelWriterAssembly(KernelWriter):
 
     noGSUBranch = (kernel["GlobalSplitU"] == 0 and kernel["StreamK"] != 3)
     module = Module("localSplitUGlobalWrite")
-    module.add(self.globalWriteElements(kernel, tPA, tPB, vectorWidths, vectorWidths_1, elements_f0, elements_f1, noGSUBranch=noGSUBranch))
+    storeModule, _ = self.globalWriteElements(kernel, tPA, tPB, vectorWidths, vectorWidths_1, elements_f0, elements_f1, noGSUBranch=noGSUBranch)
+    module.add(storeModule)
     self.cleanupGlobalWrite(kernel)
     self.vgprPool.checkIn(self.accVgprLdsReduction)
     return module
@@ -12572,6 +12634,11 @@ class KernelWriterAssembly(KernelWriter):
                           isInsertActFunctionCallAddrCalc, toActModuleList, writeLabels, endLabel,
                           vectorDataTypes, factorDims):
     betaModules = Module("Betas")
+    # Base deferral condition — per-factorDim bias check is applied below.
+    # ScaleAlphaVec has similar LDS barriers that block deferral unconditionally.
+    allowDeferBase = (
+      kernel.get("UseSubtileImpl")
+    )
     currentInstLength = 0
     for betaIdx in reversed(range(len(betas))):
       beta = betas[betaIdx]
@@ -12590,15 +12657,58 @@ class KernelWriterAssembly(KernelWriter):
           else:
             continue
           # edge module
+          # B0 FD0 edge paths are barrier-free — safe to defer.
+          # FD0 edge paths are safe to defer (edge check is workgroup-uniform,
+          # all waves take the same path so all waves hit the same barrier).
+          isMultipleBuffer = kernel["_GlobalAccumulation"] in ("MultipleBufferSingleKernel", "MultipleBuffer")
+          deferEdge = (
+            edge
+            and allowDeferBase
+            and (
+              factorDim == 0  # FD0: safe to defer (workgroup-uniform edge check)
+              or (not isMultipleBuffer and self.states.useBias == DataDirection.NONE)  # no bias: safe
+            )
+          )
           edgeModule = Module("Edge_B%u_FD%u_VW%u" % (beta, factorDim, vectorWidth))
-          currentInstLength, activationTypeStr = \
-          self.globalWriteElementBatch(kernel, tPA, tPB, activation,
-                                        applyAlpha, beta, edge, atomic,
-                                        vectorWidth, element, activationLabelList,
-                                        tmpVgpr, cvtVgprStruct, activationSetPCStruct, activationEnumStrList,
-                                        actPCMaxTempSgpr, isInsertActFunctionCallAddrCalc, toActModuleList,
-                                        edgeModule, writeLabels[beta][factorDim][vectorWidth]["Then"], endLabel,
-                                        currentInstLength, betaIdx, fdIdx, vectorDataTypes, factorDims)
+          if deferEdge:
+            # Generate Edge store into a deferred module
+            edgeDeferredModule = Module("Edge_B%u_FD%u_VW%u_DeferredBlock" % (beta, factorDim, vectorWidth))
+            # Use ThenDeferredReturn as endLabel so the batch jumps back to inline directly
+            currentInstLength, activationTypeStr = \
+            self.globalWriteElementBatch(kernel, tPA, tPB, activation,
+                                          applyAlpha, beta, edge, atomic,
+                                          vectorWidth, element, activationLabelList,
+                                          tmpVgpr, cvtVgprStruct, activationSetPCStruct, activationEnumStrList,
+                                          actPCMaxTempSgpr, isInsertActFunctionCallAddrCalc, toActModuleList,
+                                          edgeDeferredModule, writeLabels[beta][factorDim][vectorWidth]["ThenDeferred"],
+                                          writeLabels[beta][factorDim][vectorWidth]["ThenDeferredReturn"],
+                                          currentInstLength, betaIdx, fdIdx, vectorDataTypes, factorDims)
+            if not hasattr(self.states, 'deferredEdgeModules'):
+              self.states.deferredEdgeModules = []
+            self.states.deferredEdgeModules.append(edgeDeferredModule)
+            # Inline stub: keep "Then" label, jump to deferred, return + jump to GW_End
+            edgeModule.add(writeLabels[beta][factorDim][vectorWidth]["Then"])
+            with self.allocTmpSgpr(3) as tmpSgprInfo:
+              posLabel = self.labels.getNameInc("ThenDeferredDir")
+              edgeModule.add(SLongBranch(writeLabels[beta][factorDim][vectorWidth]["ThenDeferred"], tmpSgprInfo, posLabel, comment="edge store (deferred)"))
+            edgeModule.addComment0("=" * 60)
+            edgeModule.addComment0(" Edge store B%u FD%u VW%u deferred to after persistent loop" % (beta, factorDim, vectorWidth))
+            edgeModule.addComment0(" (would have been inline here in non-deferred version)")
+            edgeModule.addComment0("=" * 60)
+            edgeModule.add(writeLabels[beta][factorDim][vectorWidth]["ThenDeferredReturn"])
+            with self.allocTmpSgpr(2, alignment=2) as tmpPair:
+              with self.allocTmpSgpr(1) as tmpOff:
+                posLabel = self.labels.getNameInc("ThenDeferredReturnDir")
+                edgeModule.add(SLongBranch(endLabel, tmpPair, tmpOff, posLabel, comment="jump to end"))
+          else:
+            currentInstLength, activationTypeStr = \
+            self.globalWriteElementBatch(kernel, tPA, tPB, activation,
+                                          applyAlpha, beta, edge, atomic,
+                                          vectorWidth, element, activationLabelList,
+                                          tmpVgpr, cvtVgprStruct, activationSetPCStruct, activationEnumStrList,
+                                          actPCMaxTempSgpr, isInsertActFunctionCallAddrCalc, toActModuleList,
+                                          edgeModule, writeLabels[beta][factorDim][vectorWidth]["Then"], endLabel,
+                                          currentInstLength, betaIdx, fdIdx, vectorDataTypes, factorDims)
           # Edge conditions and branches
           if edge == True:
             # Else label
@@ -12619,32 +12729,87 @@ class KernelWriterAssembly(KernelWriter):
               edgeModule.add(writeLabels[beta][factorDim][vectorWidth]["NonEdgeEnd"], pos=0)
               currentInstLength += 1
               # Non edge module
-              nonEdgeModule = Module("Non_Edge_B%u_FD%u_VW%u" % (beta, factorDim, vectorWidth))
-              currentInstLength, activationTypeStr = \
-              self.globalWriteElementBatch(kernel, tPA, tPB, activation,
-                                            applyAlpha, beta, False, atomic,
-                                            vectorWidth, element, activationLabelList,
-                                            tmpVgpr, cvtVgprStruct, activationSetPCStruct, activationEnumStrList,
-                                            actPCMaxTempSgpr, isInsertActFunctionCallAddrCalc, toActModuleList,
-                                            nonEdgeModule, writeLabels[beta][factorDim][vectorWidth]["NonEdge"], endLabel,
-                                            currentInstLength, betaIdx, fdIdx, vectorDataTypes, factorDims)
+              # Keep B0 FD0 NonEdge inline (optimized store path with permute).
+              # Defer other NonEdge paths when no bias and no MultipleBuffer.
+              deferNonEdge = (
+                allowDeferBase
+                and not (not beta and factorDim == 0)  # B0 FD0: keep inline
+                and not isMultipleBuffer
+                and self.states.useBias == DataDirection.NONE
+              )
+              if deferNonEdge:
+                nonEdgeDeferredModule = Module("NonEdge_B%u_FD%u_VW%u_DeferredBlock" % (beta, factorDim, vectorWidth))
+                currentInstLength, activationTypeStr = \
+                self.globalWriteElementBatch(kernel, tPA, tPB, activation,
+                                              applyAlpha, beta, False, atomic,
+                                              vectorWidth, element, activationLabelList,
+                                              tmpVgpr, cvtVgprStruct, activationSetPCStruct, activationEnumStrList,
+                                              actPCMaxTempSgpr, isInsertActFunctionCallAddrCalc, toActModuleList,
+                                              nonEdgeDeferredModule, writeLabels[beta][factorDim][vectorWidth]["NonEdgeDeferred"],
+                                              writeLabels[beta][factorDim][vectorWidth]["NonEdgeDeferredReturn"],
+                                              currentInstLength, betaIdx, fdIdx, vectorDataTypes, factorDims)
+                if not hasattr(self.states, 'deferredEdgeModules'):
+                  self.states.deferredEdgeModules = []
+                self.states.deferredEdgeModules.append(nonEdgeDeferredModule)
+                nonEdgeModule = Module("Non_Edge_B%u_FD%u_VW%u" % (beta, factorDim, vectorWidth))
+                nonEdgeModule.add(writeLabels[beta][factorDim][vectorWidth]["NonEdge"])
+                with self.allocTmpSgpr(3) as tmpSgprInfo:
+                  posLabel = self.labels.getNameInc("NonEdgeDeferredDir")
+                  nonEdgeModule.add(SLongBranch(writeLabels[beta][factorDim][vectorWidth]["NonEdgeDeferred"], tmpSgprInfo, posLabel, comment="beta NonEdge store (deferred)"))
+                nonEdgeModule.addComment0("=" * 60)
+                nonEdgeModule.addComment0(" NonEdge store B%u FD%u VW%u deferred to after persistent loop" % (beta, factorDim, vectorWidth))
+                nonEdgeModule.addComment0(" (would have been inline here in non-deferred version)")
+                nonEdgeModule.addComment0("=" * 60)
+                nonEdgeModule.add(writeLabels[beta][factorDim][vectorWidth]["NonEdgeDeferredReturn"])
+                with self.allocTmpSgpr(2, alignment=2) as tmpPair:
+                  with self.allocTmpSgpr(1) as tmpOff:
+                    posLabel = self.labels.getNameInc("NonEdgeDeferredReturnDir")
+                    nonEdgeModule.add(SLongBranch(endLabel, tmpPair, tmpOff, posLabel, comment="jump to end"))
+              else:
+                nonEdgeModule = Module("Non_Edge_B%u_FD%u_VW%u" % (beta, factorDim, vectorWidth))
+                currentInstLength, activationTypeStr = \
+                self.globalWriteElementBatch(kernel, tPA, tPB, activation,
+                                              applyAlpha, beta, False, atomic,
+                                              vectorWidth, element, activationLabelList,
+                                              tmpVgpr, cvtVgprStruct, activationSetPCStruct, activationEnumStrList,
+                                              actPCMaxTempSgpr, isInsertActFunctionCallAddrCalc, toActModuleList,
+                                              nonEdgeModule, writeLabels[beta][factorDim][vectorWidth]["NonEdge"], endLabel,
+                                              currentInstLength, betaIdx, fdIdx, vectorDataTypes, factorDims)
               edgeModule.add(nonEdgeModule, pos=0)
               # NOTE: isEdgeTarget of normal and adaptive kernels are different
               #   Normal kernel: to Then/Else label, followed by edge store
               #   Adaptive kernel: to NonEdgeEnd label, followed by Size0 % vectorWidth check
               isEdgeTarget = writeLabels[beta][factorDim][vectorWidth]
-              # If module, checking Size1 % MT1 > 0
+              # When UseSubtileImpl is active (and not a multi-buffer GSU accumulation),
+              # use subtile-aligned edge check: remainder must be a multiple of the
+              # subtile block size (32 for M, 16 for N) rather than requiring a full tile.
+              useSubtileEdgeCheck = (
+                kernel.get("UseSubtileImpl")
+                and kernel["_GlobalAccumulation"] not in ("MultipleBufferSingleKernel", "MultipleBuffer")
+              )
+              # If module, checking Size1 % MT1 > 0  (or subtile alignment for N)
+              # Force long branch when Edge code is deferred
               isLongBranch = True if currentInstLength >= 16384 else False
               with self.allocTmpSgpr(4) as tmpSgprInfo:
-                checkIsEdge = edgeModule.add(self.checkIsEdge(kernel, tmpSgprInfo, \
-                  isEdgeTarget["Then"] if kernel["AdaptiveGemm"] == 0 else isEdgeTarget["NonEdgeEnd"], \
+                if useSubtileEdgeCheck:
+                  checkIsEdge = edgeModule.add(self.checkIsEdgeSubtile(kernel, tmpSgprInfo, \
+                    isEdgeTarget["Then"] if kernel["AdaptiveGemm"] == 0 else isEdgeTarget["NonEdgeEnd"], \
+                    isSize1=True, isLongBranch=isLongBranch), pos=0)
+                else:
+                  checkIsEdge = edgeModule.add(self.checkIsEdge(kernel, tmpSgprInfo, \
+                    isEdgeTarget["Then"] if kernel["AdaptiveGemm"] == 0 else isEdgeTarget["NonEdgeEnd"], \
                     kernel["MacroTile1"], isSize1=True, isLongBranch=isLongBranch), pos=0)
                 currentInstLength += countInstruction(checkIsEdge)
-              # If module, checking Size0 % MT0 > 0
+              # If module, checking Size0 % MT0 > 0  (or subtile alignment for M)
               isLongBranch = True if currentInstLength >= 16384 else False
               with self.allocTmpSgpr(4) as tmpSgprInfo:
-                checkIsEdge = edgeModule.add(self.checkIsEdge(kernel, tmpSgprInfo, \
-                  isEdgeTarget["Else"] if kernel["AdaptiveGemm"] == 0 else isEdgeTarget["NonEdgeEnd"], \
+                if useSubtileEdgeCheck:
+                  checkIsEdge = edgeModule.add(self.checkIsEdgeSubtile(kernel, tmpSgprInfo, \
+                    isEdgeTarget["Else"] if kernel["AdaptiveGemm"] == 0 else isEdgeTarget["NonEdgeEnd"], \
+                    isSize1=False, isLongBranch=isLongBranch), pos=0)
+                else:
+                  checkIsEdge = edgeModule.add(self.checkIsEdge(kernel, tmpSgprInfo, \
+                    isEdgeTarget["Else"] if kernel["AdaptiveGemm"] == 0 else isEdgeTarget["NonEdgeEnd"], \
                     kernel["MacroTile0"], isLongBranch=isLongBranch), pos=0)
                 currentInstLength += countInstruction(checkIsEdge)
           betaModule.add(edgeModule, pos=0)
@@ -12721,6 +12886,224 @@ class KernelWriterAssembly(KernelWriter):
     return module
 
   ##############################################################################
+  # checkIsEdgeSubtile
+  # Used when UseSubtileImpl is active. Checks whether the wave's M/N rows
+  # are subtile-aligned so the NonEdge paired-store path can be used.
+  #
+  # Non-last workgroups always take the NonEdge path (their tile is full).
+  # For the last workgroup in each dimension, we check that the partial
+  # remainder is subtile-aligned:
+  #   isSize1=False: (SizeI % MT0) % blockSizeM == 0  → NonEdge  (else → edge)
+  #                  blockSizeM = 16 for fp32 dest, 32 for 16-bit dest
+  #   isSize1=True : (SizeJ % MT1) % 16 == 0          → NonEdge  (else → edge)
+  #
+  # tmpSgpr must have at least 4 free SGPRs (same as checkIsEdge).
+  # isEdgeTarget is the label to branch to when the tile IS an edge.
+  ##############################################################################
+  def checkIsEdgeSubtile(self, kernel, tmpSgprInfo, isEdgeTarget, isSize1=False, isLongBranch=False):
+    assert(isinstance(isEdgeTarget, Label))
+    isEdgeTargetLabel = isEdgeTarget.getLabelName()
+    module = Module("checkIsEdgeSubtile")
+    dim = "N (isSize1)" if isSize1 else "M"
+    module.addComment1("Edge/NonEdge store path check (%s): subtile-aligned remainder -> NonEdge paired store; unaligned -> Edge scalar store" % dim)
+    tmpS0  = tmpSgprInfo.idx
+    tmpS1  = tmpS0 + 1
+    tmpS23 = tmpS1 + 1
+
+    sizeBoundary = [0, 0]
+    sizeBoundary[0] = \
+        sgpr("PackedSize0") if len(kernel["PackedC0IndicesX"]) > 1 \
+        else self.sizeRef(kernel["ProblemType"]["Index0"])
+    sizeBoundary[1] = \
+        sgpr("PackedSize1") if len(kernel["PackedC1IndicesX"]) > 1 \
+        else self.sizeRef(kernel["ProblemType"]["Index1"])
+
+    if not isSize1:
+      divisor   = kernel["MacroTile0"]
+      # The M-alignment granularity must be waveGroupM so that every wave in the tile
+      # has either 0 or a full waveGroupM valid rows.  Using only mBlockSize (32 for bf16)
+      # is insufficient when waveGroupM is not a multiple of mBlockSize (e.g., MIWT3 → 48).
+      waveGroupM = kernel["MIWaveTile"][0] * kernel["MatrixInstM"]
+      alignSize  = waveGroupM
+      wgSgpr    = "WorkGroup0"
+      nwgSgpr   = "NumWorkGroups0"
+      # tmpS0 = SizeI % MT0  (the trailing-row count for the last WG)
+      module.add(scalarStaticDivideAndRemainder(tmpS1, tmpS0, sizeBoundary[0], divisor,
+                                               ContinuousRegister(tmpS23, 2), 2))
+      # tmpS1 = nwg0 - 1
+      module.add(SAddU32(dst=sgpr(tmpS1), src0=hex(-1), src1=sgpr(nwgSgpr)))
+      # SCC = 1 if this is the last WG in dim 0
+      module.add(SCmpGeU32(src0=sgpr(wgSgpr), src1=sgpr(tmpS1), comment="wg0 >= nwg0-1 ?"))
+    else:
+      divisor   = kernel["MacroTile1"]
+      # N-dimension: use 16-row alignment (one MIWaveTile row = 16 cols for bf16)
+      alignSize  = 16
+      wgSgpr    = "WorkGroup1"
+      nwgSgpr   = "NumWorkGroups1"
+      # tmpS0 = SizeJ % MT1
+      module.add(scalarStaticDivideAndRemainder(tmpS1, tmpS0, sizeBoundary[1], divisor,
+                                               ContinuousRegister(tmpS23, 2), 2))
+      # tmpS1 = nwg1 - 1
+      module.add(SAddU32(dst=sgpr(tmpS1), src0=hex(-1), src1=sgpr(nwgSgpr)))
+      # SCC = 1 if this is the last WG in dim 1
+      module.add(SCmpGeU32(src0=sgpr(wgSgpr), src1=sgpr(tmpS1), comment="wg1 >= nwg1-1 ?"))
+
+    # myRem = last WG ? (SizeX % divisor) : 0
+    # Non-last WGs always take NonEdge (full tile), so myRem = 0 keeps them out of the edge branch.
+    module.add(SCSelectB32(dst=sgpr(tmpS0), src0=sgpr(tmpS0), src1=0,
+                           comment="myRem = last WG ? rem : 0"))
+
+    # Check alignment: myRem % alignSize != 0 → edge.
+    # alignSize is a compile-time value.  For power-of-2 use AND; for non-power-of-2
+    # (e.g., waveGroupM=48 from MIWT3), enumerate the valid multiples and branch-chain.
+    if alignSize & (alignSize - 1) == 0:
+      # Power of 2: use AND for fast modulo
+      module.add(SAndB32(dst=sgpr(tmpS0), src0=sgpr(tmpS0), src1=alignSize - 1,
+                         comment="myRem %% %d (subtile alignment check)" % alignSize))
+      module.add(self.getSCMPKInstruction("GTU32", tmpS0, 0,
+                                         comment="not subtile-aligned → edge"))
+      if isLongBranch:
+        module.add(self.longBranchScc1(isEdgeTarget, posNeg=1, tmpSgprInfo=tmpSgprInfo,
+                                       comment="jump to edge if not subtile-aligned"))
+      else:
+        module.add(SCBranchSCC1(labelName=isEdgeTargetLabel,
+                                comment="jump to edge if not subtile-aligned"))
+    else:
+      # Non-power-of-2: enumerate valid aligned multiples {0, alignSize, 2*alignSize, ...}.
+      # myRem is in [0, divisor-1]; divisor = alignSize * numWaves. At most numWaves values to check.
+      # Strategy: branch to Edge if NOT any valid multiple.
+      # We emit: for each valid k: if myRem==k*alignSize goto NonEdge
+      #          fall-through → Edge
+      if not isSize1:
+        numWaves = kernel["MIWaveGroup"][0]
+      else:
+        numWaves = kernel["MIWaveGroup"][1]
+      nonEdgeLabel = Label(self.labels.getNameInc("subtile_nonedge_aligned"),
+                           "myRem is a valid multiple of alignSize=%d" % alignSize)
+      for k in range(numWaves):
+        multiple = k * alignSize
+        module.add(self.getSCMPKInstruction("EQU32", tmpS0, multiple,
+                                           comment="myRem == %d (aligned multiple k=%d)?" % (multiple, k)))
+        module.add(SCBranchSCC1(labelName=nonEdgeLabel.getLabelName(),
+                                comment="aligned → NonEdge"))
+      # Not any valid multiple → Edge
+      if isLongBranch:
+        module.add(self.longBranchScc0(isEdgeTarget, posNeg=1, tmpSgprInfo=tmpSgprInfo,
+                                       comment="not subtile-aligned (alignSize=%d) → edge" % alignSize))
+      else:
+        module.add(SBranch(labelName=isEdgeTargetLabel,
+                           comment="not subtile-aligned (alignSize=%d) → edge" % alignSize))
+      module.add(nonEdgeLabel)
+    return module
+
+  ##############################################################################
+  # _emitSubtileGuards
+  # Compute both M and N OOB guard SGPRs for the UseSubtileImpl NonEdge path.
+  # Results are stored in self.states.subtileM32ValidBlocksSgpr and
+  # self.states.subtileN16ValidBlocksSgpr for use by _emitSubtileOobGuard.
+  #
+  # waveId (serial >> 6) is read once and used for both dimensions:
+  #   waveIdM = waveId & (numWavesM - 1)          lower bits (M is innermost)
+  #   waveIdN = waveId >> log2(numWavesM)          upper bits (N is outermost)
+  #
+  # M algorithm:
+  #   validM          = SizeI - WG0 * MT0
+  #   waveBase        = waveIdM * waveGroupM
+  #   remainder       = max(validM - waveBase, 0)
+  #   numValidMBlocks = min(ceil(remainder / mBlockSize), MIWaveTile[0])
+  #   mBlockSize = 32 for 16-bit dest, 16 for fp32 dest.
+  #
+  # N algorithm:
+  #   validN            = SizeJ - WG1 * MT1
+  #   waveBaseN         = waveIdN * waveGroupN      (skipped if numWavesN == 1)
+  #   validN_wave       = max(validN - waveBaseN, 0)
+  #   clamped           = min(validN_wave, waveGroupN)
+  #   numValid16NBlocks = clamped >> 4
+  ##############################################################################
+  def _emitSubtileGuards(self, kernel, edgeModule):
+    numWavesM     = kernel["MIWaveGroup"][0]
+    numWavesN     = kernel["MIWaveGroup"][1]
+    log2numWavesM = int(log(numWavesM, 2))
+    mBlockSize    = 16 if kernel["ProblemType"]["DestDataType"].isSingle() else 32
+    mBlockShift   = int(log(mBlockSize, 2))
+    waveGroupM    = kernel["MIWaveTile"][0] * kernel["MatrixInstM"]
+    waveGroupN    = kernel["MIWaveTile"][1] * kernel["MatrixInstN"]
+    mt0, mt1      = kernel["MacroTile0"], kernel["MacroTile1"]
+
+    # Use pre-allocated permanent guard SGPRs (allocated at start of post-loop).
+    assert self.states.subtileM32ValidBlocksSgpr is not None, \
+      "SubtileMGuard must be pre-allocated before _emitSubtileGuards"
+    tmpM       = self.sgprPool.checkOut(1, "subtileWaveIdM")
+    tmpN       = self.sgprPool.checkOut(1, "subtileWaveIdN")
+
+    edgeModule.addComment1("UseSubtileImpl NonEdge guards: numValidD1Steps (MatrixInstM=%d) and numValid16NBlocks" % kernel["MatrixInstM"])
+
+    # Read waveId once; extract M (lower bits) and N (upper bits) before AND destroys waveId.
+    edgeModule.add(VReadfirstlaneB32(dst=sgpr(tmpM), src=vgpr("Serial"),
+                                     comment="lane 0 serial of this wave"))
+    edgeModule.add(SLShiftRightB32(dst=sgpr(tmpM), src=sgpr(tmpM),
+                                   shiftHex=6, comment="waveId = serial >> 6"))
+    if numWavesN > 1:
+      edgeModule.add(SLShiftRightB32(dst=sgpr(tmpN), src=sgpr(tmpM),
+                                     shiftHex=log2numWavesM,
+                                     comment="waveIdN = waveId >> log2(numWavesM=%d)" % numWavesM))
+    # MIWaveGroup[0] is always a power of 2, so AND is correct for modulo.
+    edgeModule.add(SAndB32(dst=sgpr(tmpM), src0=sgpr(tmpM), src1=numWavesM - 1,
+                           comment="waveIdM = waveId & (numWavesM-1=%d)" % (numWavesM - 1)))
+
+    # --- M guard ---
+    # Each d1 step in the C-load batch corresponds to MatrixInstM rows.
+    # We compute numValidD1Steps = min(ceil(max(validM-waveBase,0)/MatrixInstM), MIWaveTile[0]).
+    # The guard check is (numValidD1Steps > d1): true iff this wave's d1-th block has valid rows.
+    miM      = kernel["MatrixInstM"]
+    miMShift = int(log(miM, 2))
+    edgeModule.addComment0("M-guard: numValidD1Steps = min(ceil(max(validM-waveBase,0)/%d), MIWaveTile[0]=%d)" % (miM, kernel["MIWaveTile"][0]))
+    edgeModule.add(SMulI32(dst=sgpr("SubtileMGuard"), src0=sgpr("WorkGroup0"), src1=mt0,
+                           comment="WG0 * MT0"))
+    edgeModule.add(SSubU32(dst=sgpr("SubtileMGuard"), src0=sgpr("SizeI"), src1=sgpr("SubtileMGuard"),
+                           comment="validM = SizeI - WG0*MT0"))
+    edgeModule.add(SMulI32(dst=sgpr(tmpM), src0=sgpr(tmpM), src1=waveGroupM,
+                           comment="waveBase = waveIdM * waveGroupM(%d)" % waveGroupM))
+    edgeModule.add(SSubU32(dst=sgpr("SubtileMGuard"), src0=sgpr("SubtileMGuard"), src1=sgpr(tmpM),
+                           comment="validM - waveBase; SCC=1 if OOB"))
+    edgeModule.add(SCSelectB32(dst=sgpr("SubtileMGuard"), src0=0, src1=sgpr("SubtileMGuard"),
+                               comment="remainder = 0 if OOB"))
+    edgeModule.add(SAddU32(dst=sgpr("SubtileMGuard"), src0=sgpr("SubtileMGuard"), src1=miM - 1,
+                           comment="ceil: remainder + (%d-1)" % miM))
+    edgeModule.add(SLShiftRightB32(dst=sgpr("SubtileMGuard"), src=sgpr("SubtileMGuard"), shiftHex=miMShift,
+                                   comment="numValidD1Steps = ceil(remainder / %d)" % miM))
+    # Clamp: guard comparison is (numValidD1Steps > d1); d1 < MIWaveTile[0] always.
+    edgeModule.add(SMinU32(dst=sgpr("SubtileMGuard"), src0=sgpr("SubtileMGuard"), src1=kernel["MIWaveTile"][0],
+                           comment="clamp to MIWaveTile[0]=%d" % kernel["MIWaveTile"][0]))
+    self.sgprPool.checkIn(tmpM)
+
+    # --- N guard ---
+    edgeModule.addComment0("N-guard: numValid16NBlocks = min(max(validN-waveBaseN,0), waveGroupN=%d) >> 4" % waveGroupN)
+    edgeModule.add(SMulI32(dst=sgpr("SubtileNGuard"), src0=sgpr("WorkGroup1"), src1=mt1,
+                           comment="WG1 * MT1"))
+    edgeModule.add(SSubU32(dst=sgpr("SubtileNGuard"),
+                           src0=self.sizeRef(kernel["ProblemType"]["Index1"]),
+                           src1=sgpr("SubtileNGuard"),
+                           comment="validN = SizeJ - WG1*MT1"))
+    if numWavesN > 1:
+      edgeModule.add(SMulI32(dst=sgpr(tmpN), src0=sgpr(tmpN), src1=waveGroupN,
+                             comment="waveBaseN = waveIdN * waveGroupN(%d)" % waveGroupN))
+      edgeModule.add(SSubU32(dst=sgpr("SubtileNGuard"), src0=sgpr("SubtileNGuard"), src1=sgpr(tmpN),
+                             comment="validN - waveBaseN; SCC=1 if OOB"))
+      edgeModule.add(SCSelectB32(dst=sgpr("SubtileNGuard"), src0=0, src1=sgpr("SubtileNGuard"),
+                                 comment="validN_wave = 0 if OOB"))
+    # clamped = min(validN_wave, waveGroupN); SCC=1 on borrow → keep validN_wave, else waveGroupN.
+    edgeModule.add(SSubU32(dst=sgpr(tmpN), src0=sgpr("SubtileNGuard"), src1=waveGroupN,
+                           comment="validN_wave - waveGroupN; SCC=1 if validN_wave < waveGroupN"))
+    edgeModule.add(SCSelectB32(dst=sgpr("SubtileNGuard"), src0=sgpr("SubtileNGuard"), src1=waveGroupN,
+                               comment="min(validN_wave, waveGroupN)"))
+    edgeModule.add(SLShiftRightB32(dst=sgpr("SubtileNGuard"), src=sgpr("SubtileNGuard"), shiftHex=4,
+                                   comment="numValid16NBlocks = clamped >> 4"))
+    self.sgprPool.checkIn(tmpN)
+
+    self.states.subtileMBlockSize = mBlockSize
+
+  ##############################################################################
   # checkIsEdge
   # tmpSgpr must have at least 4 free SGPR
   # isEdgeTarget is the branch target if Size % divisor > 0
@@ -12729,6 +13112,8 @@ class KernelWriterAssembly(KernelWriter):
     assert(isinstance(isEdgeTarget, Label))
     isEdgeTargetLabel = isEdgeTarget.getLabelName()
     module = Module("checkIsEdge")
+    dim = "N (isSize1)" if isSize1 else "M"
+    module.addComment1("Edge/NonEdge store path check (%s): Size %% %d > 0 -> Edge store; else -> NonEdge store" % (dim, divisor))
     tmpS0  = tmpSgprInfo.idx
     tmpS1  = tmpS0 + 1
     tmpS23 = tmpS1 + 1
@@ -12850,8 +13235,9 @@ class KernelWriterAssembly(KernelWriter):
                           betas=None, # if left unspecified, then let global parameter decide
                           edge=True # defaults to using edge write
                           ):
-    if not self.do["PostLoop"]: return Module("GlobalWriteElements (Empty)")
+    if not self.do["PostLoop"]: return Module("GlobalWriteElements (Empty)"), Module("DeferredGSU0 (Empty)")
     module = Module("GlobalWriteElements")
+    deferredGSU0 = Module("DeferredGSU0")
 
     module.addComment2("Global Write Elements")
     if kernel["ProblemType"]["OutputAmaxD"]:
@@ -12882,10 +13268,22 @@ class KernelWriterAssembly(KernelWriter):
       vectorWidths_1 = [vectorWidths_1[0], vectorWidths_1[-1]]
       elements_1     = [elements_1[0], elements_1[-1]]
 
+    # GSU0 always sets useBias=NONE (no bias in workspace writes), so no barrier issue.
+    deferGSU0 = (
+      kernel.get("UseSubtileImpl")
+      and kernel.get("StreamK", 0) > 0
+    )
+    gsu0DeferredLabel = None
+    gsu0ReturnLabel = None
+
     gsuLimit = 1 if noGSUBranch or self.debugConfig.splitGSU else 2
     if gsuLimit > 1:
       gsuLabel = Label(label=self.labels.getNameInc("GSU"), comment="")
       if kernel["StreamK"]:
+        if deferGSU0:
+          gsu0DeferredLabel = Label(label=self.labels.getNameInc("GW_B0_Deferred"), comment="")
+          gsu0ReturnLabel = Label(label=self.labels.getNameInc("GW_B0_Deferred_Return"), comment="")
+        # Keep original GSU check unchanged — falls through to GSU0, branches to gsuLabel for GSU1
         module.add(SCmpEQU64(src0=sgpr("AddressFlags", 2), src1=hex(0), comment="Check for synchronizer"))
         module.add(SCBranchSCC0(labelName=gsuLabel.getLabelName(), comment="Branch to stream-k store code"))
         module.add(SCmpEQU32(src0=sgpr("skTiles"), src1=1, comment="split == 1 ?"))
@@ -12903,6 +13301,23 @@ class KernelWriterAssembly(KernelWriter):
 
     gsuLimitRange = range(0, gsuLimit) # generate GSU1 and GSUM label
     for gsuLimitIdx in gsuLimitRange:
+      # Redirect GSU0 output to deferred module, keeping original label as stub
+      if deferGSU0 and gsuLimitIdx == 0:
+        # Keep original GW_B0 label inline as a stub with jump to deferred
+        gsu0InlineLabel = Label(label=self.labels.getNameInc("GW_B0"), comment="")
+        module.add(gsu0InlineLabel)
+        with self.allocTmpSgpr(2, alignment=2) as tmpPair:
+          with self.allocTmpSgpr(1) as tmpOff:
+            module.add(SLongBranchPositive(gsu0DeferredLabel, tmpPair, tmpOff, comment="GSU0 reduction (deferred)"))
+        module.addComment0("=" * 60)
+        module.addComment0(" GSU0 reduction block deferred to after persistent loop")
+        module.addComment0(" (would have been inline here in non-deferred version)")
+        module.addComment0("=" * 60)
+        module.add(gsu0ReturnLabel)
+        # Redirect code generation to deferred module
+        savedModule = module
+        module = Module("GSU0_DeferredBlock")
+        module.add(gsu0DeferredLabel)
       if gsuLimit > 1:
         betas = betasBackup
         if gsuLimitIdx == 0:
@@ -13308,6 +13723,12 @@ class KernelWriterAssembly(KernelWriter):
             writeLabels[beta][factorDim][vectorWidth]["NonEdgeEnd"] = Label(self.labels.getNameInc("GW_B%u_FD%u_VW%u_NonEdgeEnd" % (beta, factorDim, vectorWidth) ), "")
             writeLabels[beta][factorDim][vectorWidth]["Then"] = Label(self.labels.getNameInc("GW_B%u_FD%u_VW%u_Then" % (beta, factorDim, vectorWidth) ), "")
             writeLabels[beta][factorDim][vectorWidth]["Else"] = Label(self.labels.getNameInc("GW_B%u_FD%u_VW%u_Else" % (beta, factorDim, vectorWidth) ), "")
+            writeLabels[beta][factorDim][vectorWidth]["ThenDeferred"] = Label(self.labels.getNameInc("GW_B%u_FD%u_VW%u_Then_Deferred" % (beta, factorDim, vectorWidth) ), "")
+            writeLabels[beta][factorDim][vectorWidth]["ThenDeferredReturn"] = Label(self.labels.getNameInc("GW_B%u_FD%u_VW%u_Then_Deferred_Return" % (beta, factorDim, vectorWidth) ), "")
+            writeLabels[beta][factorDim][vectorWidth]["ElseDeferred"] = Label(self.labels.getNameInc("GW_B%u_FD%u_VW%u_Else_Deferred" % (beta, factorDim, vectorWidth) ), "")
+            writeLabels[beta][factorDim][vectorWidth]["ElseDeferredReturn"] = Label(self.labels.getNameInc("GW_B%u_FD%u_VW%u_Else_Deferred_Return" % (beta, factorDim, vectorWidth) ), "")
+            writeLabels[beta][factorDim][vectorWidth]["NonEdgeDeferred"] = Label(self.labels.getNameInc("GW_B%u_FD%u_VW%u_NonEdge_Deferred" % (beta, factorDim, vectorWidth) ), "")
+            writeLabels[beta][factorDim][vectorWidth]["NonEdgeDeferredReturn"] = Label(self.labels.getNameInc("GW_B%u_FD%u_VW%u_NonEdge_Deferred_Return" % (beta, factorDim, vectorWidth) ), "")
       endLabel = Label(self.labels.getNameInc("GW_End"), "")
 
       # Layout
@@ -13483,7 +13904,12 @@ class KernelWriterAssembly(KernelWriter):
         activationModules = self.generateActivationModules(
             kernel, activation, activationLabelList, activationEnumStrList,
             activationSetPCStruct, tmpVgpr, actPCGwvwVgpr, actTempSgpr)
-        module.appendModule(activationModules)
+        # Defer activation blocks to end of kernel when other blocks are deferred
+        # (called via s_setpc/s_swappc, position-independent).
+        if kernel.get("UseSubtileImpl"):
+          self.states.deferredActivationModules = activationModules
+        else:
+          module.appendModule(activationModules)
         self.sgprPool.checkIn(activationSetPCStruct.sgprOffsetActivation)
         self.sgprPool.checkIn(activationSetPCStruct.sgprOffsetBack)
 
@@ -13505,13 +13931,24 @@ class KernelWriterAssembly(KernelWriter):
       if cvtVgpr is not None:
         self.vgprPool.checkIn(cvtVgpr)
       if gsuLimit > 1 and gsuLimitIdx == 0:
-        with self.allocTmpSgpr(3) as tmpSgprInfo:
-          module.add(SLongBranchPositive(Label("KernelEnd", ""), tmpSgprInfo))
+        if deferGSU0:
+          # GSU0 store code is done. Append it to deferredGSU0 (placed after persistent loop),
+          # then restore `module` to savedModule (the inline stub region) so subsequent code
+          # (e.g. the SLongBranchPositive to KernelEnd) lands inline, not in the deferred block.
+          # The deferred block falls through to GW_End -> KernelEnd -> s_endpgm directly,
+          # so no explicit return branch back to inline is needed.
+          deferredGSU0.appendModule(module)
+          module = savedModule
+          with self.allocTmpSgpr(3) as tmpSgprInfo:
+            module.add(SLongBranchPositive(Label("KernelEnd", ""), tmpSgprInfo, comment="GSU0 done, skip to end"))
+        else:
+          with self.allocTmpSgpr(3) as tmpSgprInfo:
+            module.add(SLongBranchPositive(Label("KernelEnd", ""), tmpSgprInfo))
 
     kernel["GlobalSplitU"] = gsuBackup
     kernel["_GlobalAccumulation"] = gsuAccumBackup
     self.states.bpeCexternal = bpeCexternalBackup
-    return module
+    return module, deferredGSU0
 
   def getMBSKGSUTotal(self, kernel):
     if kernel["MbskPrefetchMethod"]:
@@ -13572,6 +14009,19 @@ class KernelWriterAssembly(KernelWriter):
       # NumElementsPerBatchStore to cap the batch size (e.g. for very large macro-tiles
       # where a smaller batch reduces register pressure or improves store pipelining).
       numElementsPerBatch = len(element)
+
+    # Cap batch size to align on MIWaveTile[0] (M-tile) boundaries.
+    # The acc-to-VGPR mapping interleaves M and N tiles, so a batch that
+    # partially covers an N-column still touches the full acc range of that
+    # column.  Aligning to MIWaveTile[0] ensures batches break on N-column
+    # boundaries, avoiding accesses beyond the ValuC range.
+    if kernel.get("UseSubtileImpl") and kernel.get("EnableMatrixInstruction"):
+      miwt0 = kernel["MIWaveTile"][0]
+      totalElems = kernel["MIWaveTile"][0] * kernel["MIWaveTile"][1]
+      if numElementsPerBatch >= totalElems:
+        numElementsPerBatch = totalElems
+      elif miwt0 > 1 and numElementsPerBatch >= miwt0:
+        numElementsPerBatch = (numElementsPerBatch // miwt0) * miwt0
 
     assert(self.states.c.numVgprValu % gwvw == 0) # sanity check
 
@@ -13756,6 +14206,24 @@ class KernelWriterAssembly(KernelWriter):
     #edgeModule.addComment("storeStats, %d, %d, %d"% (edge, numSgprs, numElementsPerBatch))
     # so if we don't have *GPR resources to handle a larger batch then need
     # to mark overflowedResources rather than generate a kernel that won't work.
+
+    # UseSubtileImpl NonEdge guard: compute numValidMBlocks / numValidNBlocks so
+    # stores can skip OOB wave groups.  Active for any NonEdge UseSubtileImpl path
+    # that is not multi-buffer GSU accumulation.
+    isSubtileNonEdge = (
+      not edge
+      and kernel.get("UseSubtileImpl")
+      and kernel["_GlobalAccumulation"] not in ("MultipleBufferSingleKernel", "MultipleBuffer")
+    )
+    if isSubtileNonEdge:
+      self._emitSubtileGuards(kernel, edgeModule)
+    else:
+      # Don't clear permanent guard SGPRs — they persist across batches
+      if "SubtileMGuard" not in self.sgprs:
+        self.states.subtileM32ValidBlocksSgpr = None
+        self.states.subtileN16ValidBlocksSgpr = None
+        self.states.subtileMBlockSize = 0
+
     # Activation
     actLoopEndLabel, actLoopLabelModules, actLoopEnumStrList = self.initActivationLoop(kernel, beta)
     actLoopModuleList = []
@@ -13816,7 +14284,15 @@ class KernelWriterAssembly(KernelWriter):
         actLoopModuleCodeLength.append(countInstruction(actLoopModule))
 
     #################
-    # Free after final vgpr vcalculation
+    # Free after final vgpr calculation
+    # Only free locally-allocated guard SGPRs, not permanent ones (SubtileMGuard).
+    if self.states.subtileM32ValidBlocksSgpr is not None and "SubtileMGuard" not in self.sgprs:
+      self.sgprPool.checkIn(self.states.subtileM32ValidBlocksSgpr)
+      self.sgprPool.checkIn(self.states.subtileN16ValidBlocksSgpr)
+      self.states.subtileM32ValidBlocksSgpr = None
+      self.states.subtileN16ValidBlocksSgpr = None
+      self.states.subtileMBlockSize = 0
+
     if tmpVgprDynamic:
       self.vgprPool.checkIn(tmpVgprDynamic.idx)
 
@@ -13851,9 +14327,11 @@ class KernelWriterAssembly(KernelWriter):
       edgeModule.add(actLoopEndLabel)
 
     if len(factorDims) == 1:
-      if currentInstLength >= 16384:
+      isDeferredReturn = "Deferred" in endLabel.getLabelName()
+      if currentInstLength >= 16384 or isDeferredReturn:
+        posLabel = self.labels.getNameInc("DeferredReturnDir")
         with self.allocTmpSgpr(3) as tmpSgprInfo:
-          edgeModule.add(SLongBranchPositive(endLabel, tmpSgprInfo, comment="jump to end"))
+          edgeModule.add(SLongBranch(endLabel, tmpSgprInfo, posLabel, comment="jump to end"))
       else:
         edgeModule.add(SBranch(labelName=endLabel.getLabelName(), comment="jump to end"))
     else:

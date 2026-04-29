@@ -169,6 +169,19 @@ def generate_roundtrip_kernel(cfg, wave_id=0):
     writer.sgprs["LocalWriteDTLOffsetA"] = writer.sgprPool.checkOut(1, "LocalWriteDTLOffsetA", preventOverflow=False)
     writer.sgprs["LocalWriteBaseAddrB"] = writer.sgprPool.checkOut(1, "LocalWriteBaseAddrB", preventOverflow=False)
     writer.sgprs["LocalWriteDTLOffsetB"] = writer.sgprPool.checkOut(1, "LocalWriteDTLOffsetB", preventOverflow=False)
+    writer.sgprs["SwapA"] = writer.sgprPool.checkOut(1, "SwapA", preventOverflow=False)
+    writer.sgprs["SwapB"] = writer.sgprPool.checkOut(1, "SwapB", preventOverflow=False)
+
+    # LDS allocation must match production formula (KernelWriter.py):
+    # align A and B sizes to readSize (2*subtileSize) for DTL 2xsubtile reads
+    readSize = 2 * tileInfoA.subtileSize
+    numASubtiles = tileInfoA.globalSubtileGrid[0] * tileInfoA.globalSubtileGrid[1]
+    numBSubtiles = tileInfoB.globalSubtileGrid[0] * tileInfoB.globalSubtileGrid[1]
+    sizeA = ((numASubtiles * tileInfoA.subtileSize + readSize - 1) // readSize) * readSize
+    sizeB = ((numBSubtiles * tileInfoB.subtileSize + readSize - 1) // readSize) * readSize
+    lds_size = sizeA + sizeB
+    writer.ldsTotalSize = lds_size
+
     tileInfoA.allocVgprTileRegisters(writer, kernel)
     tileInfoB.allocVgprTileRegisters(writer, kernel)
 
@@ -229,15 +242,6 @@ def generate_roundtrip_kernel(cfg, wave_id=0):
         ("strideB",     4, "by_value",      "u32"),
     )
 
-    # LDS allocation must match production formula (KernelWriter.py):
-    # align A and B sizes to readSize (2*subtileSize) for DTL 2xsubtile reads
-    readSize = 2 * tileInfoA.subtileSize
-    numASubtiles = tileInfoA.globalSubtileGrid[0] * tileInfoA.globalSubtileGrid[1]
-    numBSubtiles = tileInfoB.globalSubtileGrid[0] * tileInfoB.globalSubtileGrid[1]
-    sizeA = ((numASubtiles * tileInfoA.subtileSize + readSize - 1) // readSize) * readSize
-    sizeB = ((numBSubtiles * tileInfoB.subtileSize + readSize - 1) // readSize) * readSize
-    lds_size = sizeA + sizeB
-
     kernel_asm = generate_kernel_asm(inner_asm, writer, args, lds_size)
 
     num_tiles_a = len(tileInfoA.vgprTiles)
@@ -276,33 +280,13 @@ def compute_expected_output(cfg, tileInfoA, tileInfoB, kernel, input_A, input_B,
         else:
             wave_offset_factor = wave_id // mi_wave_group[0]
 
-        # With interleaved LDS layout, the wave partition offset in LDS is
-        # subtileSize bytes, which corresponds to subtileSize/depthUBytes rows.
-        depthUBytes = cfg.depth_u * BPE
-        rows_per_partition = tileInfo.subtileSize // depthUBytes
-        wave_row_offset = wave_offset_factor * rows_per_partition
+        # Non-interleaved layout: each wave partition covers a contiguous
+        # block of localMMATileGrid[0] MMA tiles (each 16 rows).
+        wave_row_offset = wave_offset_factor * tileInfo.localMMATileGrid[0] * 16
 
         # Build reverse map: vgprTile index -> (mmaId0, mmaId1)
-        # The LDS layout uses interleaving in the row dimension:
-        # The interleave factor matches the number of waves sharing the dimension
-        # (1 for loadRatioGR>=2.0, 2 for 1.0, 4 for 0.5).
-        # So the effective mmaId0 = sId0 * subtileShape[0] * interleave_factor.
-        if tileInfo.loadRatioGR >= 2.0:
-            interleave_factor = 1
-        elif tileInfo.loadRatioGR == 1.0:
-            interleave_factor = 2
-        else:  # loadRatioGR == 0.5
-            interleave_factor = 4
-        tile_to_mma = {}
-        for linearId, subtile in enumerate(tileInfo.localSubtiles):
-            for mfmaIdx, tileIdx in enumerate(subtile.localReadMap):
-                sId0, sId1 = tileInfo.getLocalSubtileIdFromLinearId(linearId)
-                # Decode mfmaIdx into (mfmaR, mfmaC) within subtile shape
-                mfmaR = mfmaIdx % tileInfo.subtileShape[0]
-                mfmaC = mfmaIdx // tileInfo.subtileShape[0]
-                mmaId0 = sId0 * tileInfo.subtileShape[0] * interleave_factor + mfmaR
-                mmaId1 = sId1 * tileInfo.subtileShape[1] + mfmaC
-                tile_to_mma[tileIdx] = (mmaId0, mmaId1)
+        # Non-interleaved layout: interleave_factor = 1 for all configs.
+        tile_to_mma = _build_tile_to_mma(tileInfo)
 
         for tileIdx in range(len(tileInfo.vgprTiles)):
             if tileIdx not in tile_to_mma:

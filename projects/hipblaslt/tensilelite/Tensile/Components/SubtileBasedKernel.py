@@ -8,6 +8,20 @@ from typing import Dict, List, NamedTuple, Optional, Tuple, Type
 from ..Common import printWarning, roundUp, print2, DebugConfig, DataDirection, \
   INDEX_CHARS, IsaVersion
 
+
+from rocisa.code import Module, TextBlock, StructuredModule, KernelBody, Label
+from rocisa.label import LabelManager
+
+from rocisa.container import MUBUFModifiers, vgpr, sgpr, accvgpr, mgpr
+from rocisa.enum import InstType, SelectBit, CacheScope
+from rocisa.instruction import MFMAInstruction
+
+import math
+from copy import deepcopy
+from dataclasses import dataclass, field
+from typing import Dict, List, NamedTuple, Optional, Tuple, Type
+from contextlib import contextmanager
+from collections import deque
 from rocisa import rocIsa, countInstruction, countGlobalRead, \
   countLocalRead, countLocalWrite, countDSStoreB256, getMFMAs
 from rocisa.asmpass import rocIsaPass, rocIsaPassOption
@@ -538,8 +552,6 @@ def _applyWavePartitionLROffset(module, writer, kernel, tileInfo):
   waveId = writer.vgprPool.checkOut(1)
   module.add(VLShiftRightB32(dst=vgpr(waveId), shiftHex=hex(wavesize.bit_length()-1), src=vgpr("Serial"), comment="waveId"))
 
-  # Interleaved needed to be compatible with tensilelite storeC code.
-  interleaved = False#True
   if tileInfo.loadRatioGR == 1.0:
     # W0 W2
     # W1 W3
@@ -549,9 +561,9 @@ def _applyWavePartitionLROffset(module, writer, kernel, tileInfo):
     else:
       module.add(VLShiftRightB32(dst=vgpr(waveId), shiftHex=hex(1), src=vgpr(waveId), comment="%s: waveId / 2"%tc))
 
-    sInterval = tileInfo.subtileSize if interleaved else MT * subIterKBytes // 2
+    sInterval = MT * subIterKBytes // 2
   elif tileInfo.loadRatioGR == 0.5:
-    sInterval = tileInfo.subtileSize if interleaved else MT * subIterKBytes // 4
+    sInterval = MT * subIterKBytes // 4
   else:
     raise NotImplementedError("Unsupported loadRatioGR for wave partition: %s"%str(tileInfo.loadRatioGR))
 
@@ -1245,25 +1257,37 @@ def globalReadScalePtrUpdates(tc, writer, kernel):
 def emitSingleBufferLoad(tileInfo, kernel, sId0, sId1):
   """Emit buffer_load instructions for a single subtile (sId0, sId1).
 
+  When loadRatioGR > 1, multiple local subtiles share the same global read.
+  Only the first subtile in each group emits the load; others return empty.
+
   Args:
       tileInfo: TileInfo for the tensor component
       sId0:     Subtile row index
       sId1:     Subtile column index (K-dimension)
   """
   module = Module()
-  tc = tileInfo.tc
 
+  subtileInfo = tileInfo.localSubtiles[tileInfo.getLocalSubtileLinearId(sId0, sId1)]
+  grBaseId = subtileInfo.globalReadMap[0]
+
+  # TODO: Still needed for PGR=0 path but not needed by scheduler
+  # When loadRatioGR > 1, multiple subtiles share one global read.
+  # Only emit the load for the first subtile of each group.
+  if tileInfo.loadRatioGR > 1:
+    linearId = tileInfo.getLocalSubtileLinearId(sId0, sId1)
+    firstInGroup = int(grBaseId * tileInfo.loadRatioGR)
+    if linearId != firstInGroup:
+      return module
+
+  tc = tileInfo.tc
   isGlc = bool(kernel["NonTemporal%s"%tc] & 0x1)
   isSlc = bool(kernel["NonTemporal%s"%tc] & 0x2)
   isNT  = bool(kernel["NonTemporal%s"%tc] & 0x4)
 
-  subtileInfo = tileInfo.localSubtiles[tileInfo.getLocalSubtileLinearId(sId0, sId1)]
   regList = tileInfo.localSubtilesRegister[subtileInfo.regListId]
 
   offsetK = sId1 * int(tileInfo.mmaTileShape[1] * tileInfo.subtileShape[1] * tileInfo.bpe)
-  # TODO: grBaseId is probably not needed..
-  grBaseId = subtileInfo.globalReadMap[0]
-  
+
   subtileOffset = math.ceil(tileInfo.loadRatioGR*tileInfo.subtileSize)
   WriteBaseAddr = "LocalWriteBaseAddr%s"%tc
   # Emit number of buffer loads equal to number of loads needed to load a subtile
@@ -1297,21 +1321,14 @@ def globalReadDoSubtile(tc, writer, kernel):
 
   tileInfo = writer.states.a.tileInfo if tc == 'A' else writer.states.b.tileInfo
 
-  grTracker = set()
   for j in range(tileInfo.localSubtileGrid[1]):
     for i in range(tileInfo.localSubtileGrid[0]):
-      grIds = tileInfo.localSubtiles[tileInfo.getLocalSubtileLinearId(i ,j)].globalReadMap
-      if not set(grIds).issubset(grTracker):
-        for grId in grIds:
-          grTracker.add(grId)
-        module.addComment0("Emit load for %s subtile: [%u, %u]"%(tc, i, j))
-        module.add(emitSubtileBufferLoad(tc, writer, kernel, [i, j]))
-      else:
-        module.addComment0("Emit load for %s subtile: [%u, %u] - already covered"%(tc, i, j))
+      module.addComment0("Emit load for %s subtile: [%u, %u]"%(tc, i, j))
+      module.add(emitSubtileBufferLoad(tc, writer, kernel, [i, j]))
 
   return module
 
-def emitSingleDsRead(tileInfo, sId0, sId1, subIterK, dstTile, interleaved = False):
+def emitSingleDsRead(tileInfo, sId0, sId1, subIterK, dstTile):
   """Emit a single DSLoadB128 for one MMA tile within a subtile.
 
   Args:
@@ -1326,15 +1343,7 @@ def emitSingleDsRead(tileInfo, sId0, sId1, subIterK, dstTile, interleaved = Fals
   addrVgpr = tileInfo.sharedVgprLROffset[mfmaId]
 
   offsetStride = tileInfo.subtileSize
-  if interleaved:
-    if tileInfo.loadRatioGR == 2.0:
-      offset = sId0*offsetStride
-    elif tileInfo.loadRatioGR == 0.5:
-      offset = sId0*4*offsetStride
-    else:
-      offset = sId0*2*offsetStride
-  else:
-    offset = sId0*offsetStride
+  offset = sId0*offsetStride
 
   offset = offset + sId1 * tileInfo.globalSubtileGrid[0] * offsetStride
 
@@ -1523,9 +1532,6 @@ def globalReadPtrUpdates(tc, writer, kernel):
   inc = int(tileInfo.localSubtileGrid[1] * tileInfo.mmaTileShape[1] * tileInfo.subtileShape[1] * tileInfo.bpe)
   module.add(SAddU32(dst=sgpr("Srd%s"%tc), src0=sgpr("Srd%s"%tc), src1=inc))
   module.add(SAddCU32(dst=sgpr("Srd%s+1"%tc), src0=sgpr("Srd%s+1"%tc), src1=0))
-
-  # TODOBS: commented out for now, need to re-enable
-  module.add(SSubU32(dst=sgpr("Srd%s+2"%tc), src0=sgpr("Srd%s+2"%tc), src1=inc))
 
   return module
 
@@ -1776,115 +1782,63 @@ def mainLoop(writer, kernel):
   pgr = kernel["PrefetchGlobalRead"]
   assert pgr in (0, 2), "SubtileBasedKernel only supports PGR=0 and PGR=2, got PGR=%d" % pgr
 
-  # new path for PGR=2 pipelining with SubtileBasedScheduler
+  # PGR=2 pipelining with LogicalScheduler
   if pgr == 2:
-    from Tensile.Components.SubtileBasedScheduler import SubtileBasedScheduler, SchedulerConfig, PrefetchMode, VGPRTileReUseStrategy
+    from Tensile.Components.SubtileBasedLogicalScheduler import (
+        LogicalScheduler, SchedulerConfig as MFMASchedulerConfig,
+        ReadGranularity)
     tiA = writer.states.a.tileInfo
     tiB = writer.states.b.tileInfo
     scaleTiA = writer.states.mxsa.tileInfo if kernel["ProblemType"].get("MXBlockA", 0) else None
     scaleTiB = writer.states.mxsb.tileInfo if kernel["ProblemType"].get("MXBlockB", 0) else None
-    # Use a single partition for now. TODO
-    cfg = SchedulerConfig(tiA.localSubtileGrid[0], tiB.localSubtileGrid[0],
-    #cfg = SchedulerConfig(tiA.localSubtileGrid[0]//2, tiB.localSubtileGrid[0]//2,
-                          PrefetchMode.HALF_PREFETCH, VGPRTileReUseStrategy.ACROSS_SUBGROUP)
-    scheduler = SubtileBasedScheduler(tiA, tiB, cfg,
-                                      scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB)
-    # scheduler.printSchedule()
-    scheduler.allocVgprTiles(writer)
 
-    # Preloop (includes SKIP_IF_EQ(1,NLL) and SKIP_IF_LE(2,NGLL))
-    if scheduler.hasScale:
-      # Preloop LR writes directly to scale set 0 (no double-buffer flip).
-      # scaleSet=0 for MFMA (no MFMAs in preloop), scaleLRSet=0 for LR writes.
-      module.add(scheduler._emitLoop(writer, kernel, "PRELOOP", scheduler.preloopSteps,
-                                     scaleSet=0, scaleLRSet=0))
-    else:
-      module.add(scheduler._emitLoop(writer, kernel, "PRELOOP", scheduler.preloopSteps))
+    lrAGran = ReadGranularity(mn=1, k=1)
+    lrBGran = ReadGranularity(mn=1, k=1)
+    # Based on current subtile shape. loadRatioGR == 2.0 has 2x2 granularity.
+    grAGran = ReadGranularity(mn=1, k=2) if tiA.loadRatioGR <= 1.0 else ReadGranularity(mn=2, k=2)
+    grBGran = ReadGranularity(mn=1, k=2) if tiB.loadRatioGR <= 1.0 else ReadGranularity(mn=2, k=2)
+    lrSAGran = ReadGranularity(mn=2, k=2) if scaleTiA else None
+    lrSBGran = ReadGranularity(mn=2, k=2) if scaleTiB else None
+    grSAGran = ReadGranularity(mn=scaleTiA.localMMATileGrid[0], k=scaleTiA.localMMATileGrid[1]) if scaleTiA else None
+    grSBGran = ReadGranularity(mn=scaleTiB.localMMATileGrid[0], k=scaleTiB.localMMATileGrid[1]) if scaleTiB else None
 
-    # Mainloop
-    skipMainloop = Label("SkipMainloop", "")
-    loopBegin = Label("LoopBeginL", "")
-    module.addComment0("MAINLOOP")
-    numPartitions = len(scheduler.partitions)
+    vgprBudget = writer.states.regCaps["MaxVgpr"]
+    vgprUsed = writer.vgprPool.size() - writer.vgprPool.available()
 
-    # With scale double buffering, the scale set rotates per partition inside _emitLoop.
-    # After one iteration (N partitions), the set flips if N is odd → need 2x unrolling.
-    # If N is even, the set returns to starting position → no unrolling needed.
-    needsScaleUnroll = scheduler.hasScale and (numPartitions % 2 == 1)
+    for numPartM, numPartN in MFMASchedulerConfig.get_partition_candidates(tiA, tiB):
+        cfg = MFMASchedulerConfig(
+            numMFMATilesM=tiA.localMMATileGrid[0],
+            numMFMATilesN=tiB.localMMATileGrid[0],
+            numSubIterK=tiA.localMMATileGrid[1],
+            lrA=lrAGran,
+            lrB=lrBGran,
+            grA=grAGran,
+            grB=grBGran,
+            lrSA=lrSAGran,
+            lrSB=lrSBGran,
+            grSA=grSAGran,
+            grSB=grSBGran,
+            numPartitionsM=numPartM,
+            numPartitionsN=numPartN,
+        )
+        scheduler = LogicalScheduler(cfg)
+        scheduler.build()
 
-    if needsScaleUnroll:
-      # 2x unrolled mainloop for odd partition count.
-      # Copy 1 starts at scaleSet=0, ends at scaleSet=1 (after odd number of flips).
-      # Copy 2 starts at scaleSet=1, ends at scaleSet=0.
-      ngllOddLabel = Label("NGLLOdd", "")
-      module.add(loopBegin)
-      module.add(scheduler._emitLoop(writer, kernel, "MAINLOOP_C1", scheduler.mainloopSteps,
-                                     scaleSet=0))
-      module.add(SSubU32(dst=sgpr("LoopCounterL"), src0=sgpr("LoopCounterL"), src1=1,
-                         comment="dec counterL (copy 1)"))
-      module.add(SCmpEQU32(src0=sgpr("LoopCounterL"), src1=2,
-                           comment="counterL == 2? (odd exit)"))
-      module.add(SCBranchSCC1(labelName=ngllOddLabel.getLabelName(),
-                              comment="odd counterL → NGLL with S1"))
-      module.add(scheduler._emitLoop(writer, kernel, "MAINLOOP_C2", scheduler.mainloopSteps,
-                                     scaleSet=1))
-      module.add(SSubU32(dst=sgpr("LoopCounterL"), src0=sgpr("LoopCounterL"), src1=1,
-                         comment="dec counterL (copy 2)"))
-      module.add(SCmpEQU32(src0=sgpr("LoopCounterL"), src1=2,
-                           comment="counterL == 2? (even exit)"))
-      module.add(SCBranchSCC0(labelName=loopBegin.getLabelName(),
-                              comment="restart mainloop"))
-    else:
-      # No unrolling needed: either no scales, or even partition count (sets return to start).
-      module.add(loopBegin)
-      module.add(scheduler._emitLoop(writer, kernel, "MAINLOOP", scheduler.mainloopSteps,
-                                     scaleSet=0))
-      module.add(SSubU32(dst=sgpr("LoopCounterL"), src0=sgpr("LoopCounterL"), src1=1,
-                         comment="dec counterL"))
-      module.add(SCmpEQU32(src0=sgpr("LoopCounterL"), src1=2,
-                           comment="counterL == 2?"))
-      module.add(SCBranchSCC0(labelName=loopBegin.getLabelName(),
-                              comment="restart mainloop"))
+        numVgpr = scheduler.getNumVgpr(tiA, tiB, scaleTiA, scaleTiB)
+        if vgprUsed + numVgpr <= vgprBudget:
+            break
 
-    # NGLL + NLL
-    module.add(skipMainloop)
-    module.addComment0("NGLL")
-    module.add(Label("SkipToNGLL", ""))
-    if scheduler.hasScale:
-      endLabel = Label("SkipToEnd", "")
-      nllSet = 1 if numPartitions % 2 == 1 else 0
 
-      # Even path (or only path when no unrolling): mainloop ended at scaleSet=0.
-      module.add(scheduler._emitLoop(writer, kernel, "NGLL", scheduler.ngllSteps,
-                                     scaleSet=0))
-      module.addComment0("NLL")
-      module.add(scheduler._emitLoop(writer, kernel, "NLL", scheduler.nllSteps, scaleSet=nllSet))
+    # Allocation and instruction emit
+    scheduler.allocVgprTiles(writer, tiA, tiB,
+                             scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB)
+    dtileInfo = writer.states.d.tileInfo
+    scheduler.populate_instructions(
+        writer, kernel,
+        tileInfoA=tiA, tileInfoB=tiB, dtileInfo=dtileInfo,
+        scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB)
 
-      if needsScaleUnroll:
-        module.add(SBranch(labelName=endLabel.getLabelName(), comment="skip odd NGLL path"))
-
-        # Odd path: after Copy 1 (ended at scaleSet=1).
-        module.addComment0("NGLL (odd)")
-        module.add(ngllOddLabel)
-        module.add(scheduler._emitLoop(writer, kernel, "NGLL_odd", scheduler.ngllSteps,
-                                       scaleSet=1))
-        module.addComment0("NLL (odd)")
-        nllSetOdd = 0 if numPartitions % 2 == 1 else 1
-        module.add(scheduler._emitLoop(writer, kernel, "NLL_odd", scheduler.nllSteps, scaleSet=nllSetOdd))
-
-      # NLLEarly: reached when counterL<=1 (preloop skip, no NGLL).
-      # Preloop LR wrote scale set 0, so MFMA reads set 0.
-      module.add(SBranch(labelName=endLabel.getLabelName(), comment="skip NLLEarly"))
-      module.addComment0("NLLEarly")
-      module.add(Label("SkipToNLLEarly", ""))
-      module.add(scheduler._emitLoop(writer, kernel, "NLLEarly", scheduler.nllSteps, scaleSet=0))
-      module.add(endLabel)
-    else:
-      module.add(scheduler._emitLoop(writer, kernel, "NGLL", scheduler.ngllSteps))
-      module.addComment0("NLL")
-      module.add(Label("SkipToNLL", ""))
-      module.add(scheduler._emitLoop(writer, kernel, "NLL", scheduler.nllSteps))
-
+    module.add(scheduler.emitAllLoops(writer, kernel))
     scheduler.deallocVgprTiles(writer)
 
   else:

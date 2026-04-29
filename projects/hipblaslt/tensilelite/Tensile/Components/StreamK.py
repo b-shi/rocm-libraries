@@ -29,7 +29,7 @@ from rocisa.instruction import SAddCU32, SAddI32, SAddU32, SAndB32, SBarrier, \
     SCmpGtU32, SCmpLeU32, SCmpLtU32, SCmpGeU32, SLShiftLeftB32, SLShiftLeftB64, SLShiftRightB32, SLoadB32, \
     SMaxI32, SMinU32, SMovB32, SMovB64, SMulI32, SNop, SSleep, SStoreB32, SSubU32, \
     SWaitCnt, VAddF32, VAddF64, VAddPKF16, VAddU32, VLShiftRightB32, VMovB32, \
-    VReadfirstlaneB32, VCvtBF16toFP32, BufferStoreB32
+    VReadfirstlaneB32, VCvtBF16toFP32, BufferStoreB32, SLongBranch, SLongBranchPositive
 from rocisa.functions import scalarStaticDivideAndRemainder, sMagicDiv2, \
     vectorStaticMultiply, BranchIfNotZero, scalarUInt24DivideAndRemainder, scalarUInt32DivideAndRemainder
 
@@ -574,7 +574,34 @@ class StreamK(Component):
                 writer.sgprPool.checkIn(tmpSgpr)
 
                 fixupEdge = [False] # Test no edge variant
-                module.add(self.fixupStep(writer, kernel, vectorWidths, elements, fixupEdge, tmpVgpr, cvtVgprStruct, sCtaIdx))
+                # Fixup writes to workspace (no bias LDS barriers), safe to defer.
+                deferFixup = (
+                    kernel.get("UseSubtileImpl")
+                )
+                if deferFixup:
+                    fixupDeferredLabel = Label(label=writer.labels.getNameInc("Fixup_E0_Deferred"), comment="")
+                    fixupReturnLabel = Label(label=writer.labels.getNameInc("Fixup_E0_Deferred_Return"), comment="")
+                    # Keep original Fixup_E0 label inline as a stub
+                    fixupInlineLabel = Label(label=writer.labels.getNameInc("Fixup_E%u" % 0), comment="")
+                    module.add(fixupInlineLabel)
+                    with writer.allocTmpSgpr(3) as tmpSgprInfo:
+                        module.add(SLongBranchPositive(fixupDeferredLabel, tmpSgprInfo, comment="jump to deferred fixup block"))
+                    module.addComment0("=" * 60)
+                    module.addComment0(" Fixup block deferred to after persistent loop")
+                    module.addComment0(" (would have been inline here in non-deferred version)")
+                    module.addComment0("=" * 60)
+                    module.add(fixupReturnLabel)
+                    # Collect fixup code in deferred module
+                    fixupModule = Module("Fixup_DeferredBlock")
+                    fixupModule.add(fixupDeferredLabel)
+                    fixupModule.add(self.fixupStep(writer, kernel, vectorWidths, elements, fixupEdge, tmpVgpr, cvtVgprStruct, sCtaIdx))
+                    with writer.allocTmpSgpr(3) as tmpSgprInfo:
+                        posLabel = writer.labels.getNameInc("FixupDeferredReturnDir")
+                        fixupModule.add(SLongBranch(fixupReturnLabel, tmpSgprInfo, posLabel, comment="return from deferred fixup block"))
+                    writer.states.deferredFixupModule = fixupModule
+                else:
+                    fixupModule = None
+                    module.add(self.fixupStep(writer, kernel, vectorWidths, elements, fixupEdge, tmpVgpr, cvtVgprStruct, sCtaIdx))
 
                 if kernel["StreamK"] >= 2:
                     sSkExtraIters = writer.sgprPool.checkOut(1, "extraIters")
@@ -625,10 +652,36 @@ class StreamK(Component):
             with self.allocTmpSgpr(4) as tmpSgprInfo:
                 module.add(writer.checkIsEdge(kernel, tmpSgprInfo, partialsLabels[True], partialsLabels[True]))
 
-        for edge in edges:
-            module.add(partialsLabels[edge])
-            module.add(self.computeWorkspaceSrd(writer, kernel, sgpr("StreamKIdx")))
-            module.add(self.partialsWriteProcedure(writer, kernel, vectorWidths, elements, False, False, edge, tmpVgpr, cvtVgprStruct, endLabel))
+        # WritePartials writes to workspace (no bias LDS barriers), safe to defer.
+        deferPartials = (
+            kernel.get("UseSubtileImpl")
+        )
+        if deferPartials:
+            partialsDeferredLabel = Label(label=writer.labels.getNameInc("GW_Partials_E0_Deferred"), comment="")
+            partialsReturnLabel = Label(label=writer.labels.getNameInc("GW_Partials_E0_Deferred_Return"), comment="")
+            # Inline stub
+            for edge in edges:
+                module.add(partialsLabels[edge])
+            with writer.allocTmpSgpr(3) as tmpSgprInfo:
+                module.add(SLongBranchPositive(partialsDeferredLabel, tmpSgprInfo, comment="writePartials (deferred)"))
+            module.addComment0("=" * 60)
+            module.addComment0(" WritePartials block deferred to after persistent loop")
+            module.addComment0(" (would have been inline here in non-deferred version)")
+            module.addComment0("=" * 60)
+            module.add(partialsReturnLabel)
+            module.add(SBranch(labelName=endLabel.getLabelName(), comment="jump to end"))
+            # Deferred block
+            partialsModule = Module("Partials_DeferredBlock")
+            partialsModule.add(partialsDeferredLabel)
+            for edge in edges:
+                partialsModule.add(self.computeWorkspaceSrd(writer, kernel, sgpr("StreamKIdx")))
+                partialsModule.add(self.partialsWriteProcedure(writer, kernel, vectorWidths, elements, False, False, edge, tmpVgpr, cvtVgprStruct, partialsReturnLabel))
+            writer.states.deferredPartialsModule = partialsModule
+        else:
+            for edge in edges:
+                module.add(partialsLabels[edge])
+                module.add(self.computeWorkspaceSrd(writer, kernel, sgpr("StreamKIdx")))
+                module.add(self.partialsWriteProcedure(writer, kernel, vectorWidths, elements, False, False, edge, tmpVgpr, cvtVgprStruct, endLabel))
 
         return module
 
@@ -779,6 +832,15 @@ class StreamK(Component):
         else:
             numElementsPerBatch = len(elements[edgeI]) # max, do 'em all
 
+        # Cap batch size to align on MIWaveTile[0] boundaries (see refineOccupancy).
+        if kernel.get("UseSubtileImpl") and kernel.get("EnableMatrixInstruction"):
+            miwt0 = kernel["MIWaveTile"][0]
+            totalElems = kernel["MIWaveTile"][0] * kernel["MIWaveTile"][1]
+            if numElementsPerBatch >= totalElems:
+                numElementsPerBatch = totalElems
+            elif miwt0 > 1 and numElementsPerBatch >= miwt0:
+                numElementsPerBatch = (numElementsPerBatch // miwt0) * miwt0
+
         # assert(writer.states.numVgprValuC % gwvw == 0) # sanity check
 
         numElementsPerBatch = numElementsPerBatch if not kernel["NumElementsPerBatchStore"] else min(kernel["NumElementsPerBatchStore"],numElementsPerBatch)
@@ -881,7 +943,12 @@ class StreamK(Component):
                 module.add(skipFlagSet)
             module.add(SWaitCnt(kmcnt=0, comment="wait for flag")) # TODO just for testing
 
-        module.add(SBranch(labelName=endLabel.getLabelName(), comment="jump to end"))
+        if "Deferred" in endLabel.getLabelName():
+            posLabel = writer.labels.getNameInc("PartialsDeferredReturnDir")
+            with writer.allocTmpSgpr(3) as tmpSgprInfo:
+                module.add(SLongBranch(endLabel, tmpSgprInfo, posLabel, comment="jump to end"))
+        else:
+            module.add(SBranch(labelName=endLabel.getLabelName(), comment="jump to end"))
 
         # Finish one write path, reset currPreLoopVmcntCase to Undefined
         # self.currPreLoopVmcntCase = PreLoopVmcntCase.Undefined
