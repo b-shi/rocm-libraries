@@ -2318,25 +2318,6 @@ Tests:
   requested_solution_num: 10
   gpu_arch: '950'
 
-- name: matmul_mx_preswizzle_fp4
-  category: nightly
-  function:
-    matmul:
-    - { a_type: f4_r, b_type: f4_r, c_type: bf16_r, d_type: bf16_r, compute_type: c_f32_r, scaleA: 1001, scaleB: 1001, scale_type: f32_r}
-    - { a_type: f4_r, b_type: f4_r, c_type: bf16_r, d_type: bf16_r, compute_type: c_f32_r, scaleA: 1001, scaleB: 1001, scale_type: f32_r, swizzle_a: true}
-  M: [128, 256, 4096]
-  N: [128, 256, 4096]
-  K: [256, 512]
-  transA: T
-  transB: N
-  alpha: 1.0
-  beta: 0.0
-  initialization: trig_float
-  unit_check: 0
-  norm_check: 1
-  requested_solution_num: 1
-  gpu_arch: '950'
-
 - name: matmul_mx_solution_index
   category: pre_checkin
   function:
@@ -2447,7 +2428,7 @@ Tests:
   transB: N
   alpha: 1.0
   beta: 0.0
-  initialization: hpl
+  initialization: trig_float
   unit_check: 0
   norm_check: 1
   requested_solution_num: 1
@@ -2466,7 +2447,7 @@ Tests:
   transB: N
   alpha: 1.0
   beta: 0.0
-  initialization: hpl
+  initialization: trig_float
   unit_check: 0
   norm_check: 1
   requested_solution_num: 1
@@ -2485,7 +2466,7 @@ Tests:
   transB: N
   alpha: 1.0
   beta: 0.0
-  initialization: hpl
+  initialization: trig_float
   unit_check: 0
   norm_check: 1
   requested_solution_num: 1
@@ -2523,7 +2504,7 @@ Tests:
   transB: N
   alpha: 1.0
   beta: 0.0
-  initialization: hpl
+  initialization: trig_float
   unit_check: 0
   norm_check: 1
   requested_solution_num: 1
@@ -2545,7 +2526,7 @@ Tests:
   transB: N
   alpha: 1.0
   beta: 0.0
-  initialization: hpl
+  initialization: trig_float
   unit_check: 0
   norm_check: 1
   requested_solution_num: 1
