@@ -2703,6 +2703,17 @@ void initTensileGemmData(rocblaslt_handle       handle,
 #ifdef HIPBLASLT_USE_ROCROLLER
 bool useRocRoller(rocblaslt_handle handle, const RocblasltContractionProblem& prob)
 {
+    // Do not use rocRoller for FP4 A + FP4 B with pre-swizzled (shuffled) scale layout
+    bool isFp4A = (prob.a_type == static_cast<hipDataType>(HIP_R_4F_E2M1_EXT));
+    bool isFp4B = (prob.b_type == static_cast<hipDataType>(HIP_R_4F_E2M1_EXT));
+    bool isShuffledScale
+        = (prob.scaleAType
+               == RocblasltContractionProblem::ScalingFormat::Block_32_UE8M0_32_8_EXT
+           && prob.scaleBType
+                  == RocblasltContractionProblem::ScalingFormat::Block_32_UE8M0_32_8_EXT);
+    if(isFp4A && isFp4B && isShuffledScale)
+        return false;
+
     return handle->useRocRoller == 1
            || (handle->useRocRoller == -1
                && (isBlockScaling(prob.scaleAType) || isBlockScaling(prob.scaleBType)));
