@@ -77,6 +77,9 @@ class DataInitName(Enum):
   TrigIndCos = 24
   TrigIndAbsSin = 25
   TrigIndAbsCos = 26
+  MXScaleBlockSerial = 27
+  MXScaleSparseBlock = 28
+  MXScaleSparseBlockRandom = 29
 
 class ClientLogLevel(Enum):
   Error = 0
@@ -639,6 +642,8 @@ def writeClientConfigIni(forBenchmark, problemSizes, biasTypeArgs, factorDimArgs
         param("device-idx",               deviceId)
 
         param("init-seed",                globalParameters["DataInitSeed"])
+        param("mx-scale-block-i",         globalParameters["MXScaleBlockI"])
+        param("mx-scale-block-j",         globalParameters["MXScaleBlockJ"])
 
         for key,value in dataInitParams(problemType):
             param(key, value)

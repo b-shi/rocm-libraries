@@ -27,6 +27,8 @@
 #include "DataInitialization.hpp"
 #include "TensorDataManipulation.hpp"
 #include "Utility.hpp"
+
+#include <mxDataGenerator/PreSwizzle.hpp>
 // #include "DataInitializationTyped.hpp"
 
 #include <Tensile/Utils.hpp>
@@ -196,6 +198,12 @@ namespace TensileLite
                 return "TrigIndAbsSin";
             case InitMode::TrigIndAbsCos:
                 return "TrigIndAbsCos";
+            case InitMode::MXScaleBlockSerial:
+                return "MXScaleBlockSerial";
+            case InitMode::MXScaleSparseBlock:
+                return "MXScaleSparseBlock";
+            case InitMode::MXScaleSparseBlockRandom:
+                return "MXScaleSparseBlockRandom";
 
             case InitMode::Count:
                 break;
@@ -267,6 +275,12 @@ namespace TensileLite
                 mode = InitMode::TrigIndAbsSin;
             else if(strValue == ToString(InitMode::TrigIndAbsCos))
                 mode = InitMode::TrigIndAbsCos;
+            else if(strValue == ToString(InitMode::MXScaleBlockSerial))
+                mode = InitMode::MXScaleBlockSerial;
+            else if(strValue == ToString(InitMode::MXScaleSparseBlock))
+                mode = InitMode::MXScaleSparseBlock;
+            else if(strValue == ToString(InitMode::MXScaleSparseBlockRandom))
+                mode = InitMode::MXScaleSparseBlockRandom;
             else if(std::all_of(strValue.begin(), strValue.end(), isdigit))
             {
                 int value = atoi(strValue.c_str());
@@ -890,6 +904,15 @@ namespace TensileLite
             , m_mxScaleFormat(args["mx-scale-format"].as<int>())
 
         {
+            m_mxScaleBlockI = args["mx-scale-block-i"].as<int>();
+            m_mxScaleBlockJ = args["mx-scale-block-j"].as<int>();
+
+            // Allow env-var override: MXSCALE_BLOCK_I / MXSCALE_BLOCK_J
+            if(auto* envI = std::getenv("MXSCALE_BLOCK_I"))
+                m_mxScaleBlockI = std::atoi(envI);
+            if(auto* envJ = std::getenv("MXSCALE_BLOCK_J"))
+                m_mxScaleBlockJ = std::atoi(envJ);
+
             m_rotatingBuffer
                 = args["rotating-buffer-size"].as<int32_t>() * 1024 * 1024; // Change to bytes
             m_rotatingMode   = args["rotating-buffer-mode"].as<int32_t>();
@@ -1772,7 +1795,26 @@ namespace TensileLite
             }
         }
 
-        static std::string_view initModeToMXMethod(InitMode mode)
+        // Map TensileLite InitMode to mxDataGenerator scale init method string
+        static std::string_view InitModeToMXScaleInitMethod(InitMode mode)
+        {
+            switch(mode)
+            {
+            case InitMode::One:
+                return "MXScaleOnes";
+            case InitMode::MXScaleBlockSerial:
+                return "MXScaleBlockSerial";
+            case InitMode::MXScaleSparseBlock:
+                return "MXScaleSparseBlock";
+            case InitMode::MXScaleSparseBlockRandom:
+                return "MXScaleSparseBlockRandom";
+            default:
+                return "";
+            }
+        }
+
+        // Map TensileLite InitMode to mxDataGenerator init method string
+        static std::string_view InitModeToMXInitMethod(InitMode mode)
         {
             switch(mode)
             {
@@ -1861,7 +1903,10 @@ namespace TensileLite
                     scaleBatchStrideBytes = mxsaTensor.strides()[mxsaTensor.sizes().size() - 1];
                 }
 
-                auto initA = m_vdata[ContractionProblemGemm::TENSOR::A].init;
+                auto initMethodA = InitModeToMXInitMethod(
+                    m_vdata[ContractionProblemGemm::TENSOR::A].init);
+                auto mxsaInit = m_vdata[ContractionProblemGemm::TENSOR::MXSA].init;
+                auto scaleInitMethodA = InitModeToMXScaleInitMethod(mxsaInit);
 
                 // Zero the scale buffer; padding beyond the valid region stays 0x00
                 std::memset(pristineMXScaleA.cpuInput.valid.get(),
@@ -1886,10 +1931,15 @@ namespace TensileLite
                                     problem.mxBlockA(),
                                     1,
                                     true,
-                                    initModeToMXMethod(initA),
+                                    initMethodA,
                                     -1.0f,
-                                    1.0f);
+                                    1.0f,
+                                    scaleInitMethodA,
+                                    m_mxScaleBlockI,
+                                    m_mxScaleBlockJ);
                 }
+
+                // Scale init is handled entirely by generateMXInput above.
             }
 
             if(isMXFP4Tensor(problem.b(), problem.mxBlockB()))
@@ -1915,7 +1965,10 @@ namespace TensileLite
                     scaleBatchStrideBytes = mxsbTensor.strides()[mxsbTensor.sizes().size() - 1];
                 }
 
-                auto initB = m_vdata[ContractionProblemGemm::TENSOR::B].init;
+                auto initMethodB = InitModeToMXInitMethod(
+                    m_vdata[ContractionProblemGemm::TENSOR::B].init);
+                auto mxsbInit = m_vdata[ContractionProblemGemm::TENSOR::MXSB].init;
+                auto scaleInitMethodB = InitModeToMXScaleInitMethod(mxsbInit);
 
                 // Zero the scale buffer; padding beyond the valid region stays 0x00
                 std::memset(pristineMXScaleB.cpuInput.valid.get(),
@@ -1940,10 +1993,15 @@ namespace TensileLite
                                     problem.mxBlockB(),
                                     1,
                                     false,
-                                    initModeToMXMethod(initB),
+                                    initMethodB,
                                     -1.0f,
-                                    1.0f);
+                                    1.0f,
+                                    scaleInitMethodB,
+                                    m_mxScaleBlockI,
+                                    m_mxScaleBlockJ);
                 }
+
+                // Scale init is handled entirely by generateMXInput above.
             }
         }
 
