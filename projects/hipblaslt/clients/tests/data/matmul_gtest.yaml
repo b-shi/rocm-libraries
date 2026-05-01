@@ -2598,8 +2598,9 @@ Tests:
   requested_solution_num: 1
   gpu_arch: '950'
 
-# TODO: clamp activation fails for FP4 subtile — CPU reference bug in epilogue path
-# Needs activation_arg1/activation_arg2 which may not propagate correctly with MX scale
+# TODO: clamp activation not applied by GPU for FP4 subtile — hipblaslt dispatch
+# finds a solution but ignores HIPBLASLT_EPILOGUE_CLAMP_EXT. GPU output is unclamped
+# while CPU reference correctly clamps. Not a test bug — library dispatch issue.
 
 # Asymmetric M/N
 - name: matmul_subtile_fp4_asymmetric
