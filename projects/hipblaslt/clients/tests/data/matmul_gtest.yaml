@@ -2415,12 +2415,13 @@ Tests:
 # Build: ./install.sh -dck -a gfx950
 # Run: ./hipblaslt-test --gtest_filter="*subtile_fp4*"
 
-# Basic correctness — BF16 output
+# Basic correctness — BF16 + F16 output, batched
 - name: matmul_subtile_fp4_basic
   category: quick
   function:
     matmul:
     - { a_type: f4_r, b_type: f4_r, c_type: bf16_r, d_type: bf16_r, compute_type: c_f32_r, scaleA: 1001, scaleB: 1001, scale_type: f32_r}
+    - { a_type: f4_r, b_type: f4_r, c_type: f16_r, d_type: f16_r, compute_type: c_f32_r, scaleA: 1001, scaleB: 1001, scale_type: f32_r}
   M: [128, 256, 4096]
   N: [128, 256, 4096]
   K: [256, 512]
@@ -2428,44 +2429,58 @@ Tests:
   transB: N
   alpha: 1.0
   beta: 0.0
+  batch_count: [1, 2, 3]
   initialization: trig_float
   unit_check: 0
   norm_check: 1
   requested_solution_num: 1
   gpu_arch: '950'
 
-# Edge cases — non-multiple-of-64 and even non-multiple-of-16
+# Edge cases — k*64, non-multiple-of-32 (mult of 16)
 - name: matmul_subtile_fp4_edges
   category: pre_checkin
   function:
     matmul:
     - { a_type: f4_r, b_type: f4_r, c_type: bf16_r, d_type: bf16_r, compute_type: c_f32_r, scaleA: 1001, scaleB: 1001, scale_type: f32_r}
-  M: [64, 96, 128, 192, 320]
-  N: [64, 96, 128, 192, 320]
+    - { a_type: f4_r, b_type: f4_r, c_type: f16_r, d_type: f16_r, compute_type: c_f32_r, scaleA: 1001, scaleB: 1001, scale_type: f32_r}
+  M: [48, 64, 112, 192, 320, 448]
+  N: [48, 64, 112, 192, 320, 448]
   K: [256]
   transA: T
   transB: N
   alpha: 1.0
   beta: 0.0
+  batch_count: [1, 2]
   initialization: trig_float
   unit_check: 0
   norm_check: 1
   requested_solution_num: 1
   gpu_arch: '950'
 
-# Odd sizes
+# Odd and non-multiple-of-16 sizes
 - name: matmul_subtile_fp4_odd
   category: pre_checkin
   function:
     matmul:
     - { a_type: f4_r, b_type: f4_r, c_type: bf16_r, d_type: bf16_r, compute_type: c_f32_r, scaleA: 1001, scaleB: 1001, scale_type: f32_r}
-  M: [96, 160, 224, 288]
-  N: [96, 160, 224, 288]
-  K: [256]
+    - { a_type: f4_r, b_type: f4_r, c_type: f16_r, d_type: f16_r, compute_type: c_f32_r, scaleA: 1001, scaleB: 1001, scale_type: f32_r}
+  matrix_size:
+    - { M: 17,  N: 33,  K: 256 }
+    - { M: 63,  N: 63,  K: 256 }
+    - { M: 97,  N: 129, K: 256 }
+    - { M: 33,  N: 128, K: 256 }
+    - { M: 128, N: 33,  K: 256 }
+    - { M: 50,  N: 100, K: 256 }
+    - { M: 66,  N: 128, K: 256 }
+    - { M: 128, N: 66,  K: 256 }
+    - { M: 160, N: 160, K: 256 }
+    - { M: 288, N: 288, K: 256 }
+    - { M: 33,  N: 65,  K: 256 }
   transA: T
   transB: N
   alpha: 1.0
   beta: 0.0
+  batch_count: [1, 2]
   initialization: trig_float
   unit_check: 0
   norm_check: 1
@@ -2478,6 +2493,7 @@ Tests:
   function:
     matmul:
     - { a_type: f4_r, b_type: f4_r, c_type: bf16_r, d_type: bf16_r, compute_type: c_f32_r, scaleA: 1001, scaleB: 1001, scale_type: f32_r}
+    - { a_type: f4_r, b_type: f4_r, c_type: f16_r, d_type: f16_r, compute_type: c_f32_r, scaleA: 1001, scaleB: 1001, scale_type: f32_r}
   M: [128, 256, 192, 320]
   N: [128, 256, 192, 320]
   K: [512, 1024]
@@ -2485,33 +2501,102 @@ Tests:
   transB: N
   alpha: 1.0
   beta: 0.0
+  batch_count: [1, 2]
   initialization: trig_float
   unit_check: 0
   norm_check: 1
   requested_solution_num: 1
   gpu_arch: '950'
 
-# F32 output
+# F32 output — full tiles, edges, batched
 - name: matmul_subtile_fp4_f32_output
   category: pre_checkin
   function:
     matmul:
     - { a_type: f4_r, b_type: f4_r, c_type: f32_r, d_type: f32_r, compute_type: c_f32_r, scaleA: 1001, scaleB: 1001, scale_type: f32_r}
-  M: [128, 256, 192, 320]
-  N: [128, 256, 192, 320]
+  M: [48, 128, 192, 256, 320]
+  N: [48, 128, 192, 256, 320]
   K: [256, 512]
   transA: T
   transB: N
   alpha: 1.0
   beta: 0.0
+  batch_count: [1, 2, 3]
   initialization: trig_float
   unit_check: 0
   norm_check: 1
   requested_solution_num: 1
   gpu_arch: '950'
 
-# TODO: bias, scalealphavec, batched tests pending — Origami F4 library
-# doesn't have solutions for these with Block_32_UE8M0_32_8_EXT yet.
+# F32 output — odd/non-aligned sizes
+- name: matmul_subtile_fp4_f32_output_odd
+  category: pre_checkin
+  function:
+    matmul:
+    - { a_type: f4_r, b_type: f4_r, c_type: f32_r, d_type: f32_r, compute_type: c_f32_r, scaleA: 1001, scaleB: 1001, scale_type: f32_r}
+  matrix_size:
+    - { M: 17,  N: 33,  K: 256 }
+    - { M: 63,  N: 63,  K: 256 }
+    - { M: 50,  N: 100, K: 256 }
+    - { M: 66,  N: 66,  K: 256 }
+  transA: T
+  transB: N
+  alpha: 1.0
+  beta: 0.0
+  batch_count: [1, 2]
+  initialization: trig_float
+  unit_check: 0
+  norm_check: 1
+  requested_solution_num: 1
+  gpu_arch: '950'
+
+# Bias — BF16, F16, F32 output
+# TODO: activation_type [relu, gelu] fails with batch_count > 1 for some sizes — kernel bug
+- name: matmul_subtile_fp4_bias
+  category: nightly
+  function:
+    matmul:
+    - { a_type: f4_r, b_type: f4_r, c_type: bf16_r, d_type: bf16_r, compute_type: c_f32_r, scaleA: 1001, scaleB: 1001, scale_type: f32_r}
+    - { a_type: f4_r, b_type: f4_r, c_type: f16_r, d_type: f16_r, compute_type: c_f32_r, scaleA: 1001, scaleB: 1001, scale_type: f32_r}
+    - { a_type: f4_r, b_type: f4_r, c_type: f32_r, d_type: f32_r, compute_type: c_f32_r, scaleA: 1001, scaleB: 1001, scale_type: f32_r}
+  M: [128, 192]
+  N: [128, 192]
+  K: [256]
+  transA: T
+  transB: N
+  alpha: 1.0
+  beta: [0.0, 2.0]
+  bias_vector: 1
+  batch_count: [1, 2]
+  initialization: trig_float
+  unit_check: 0
+  norm_check: 1
+  requested_solution_num: 1
+  gpu_arch: '950'
+
+# ScaleAlphaVec + bias + activations
+- name: matmul_subtile_fp4_scaleAlphaVec
+  category: nightly
+  function:
+    matmul:
+    - { a_type: f4_r, b_type: f4_r, c_type: bf16_r, d_type: bf16_r, compute_type: c_f32_r, scaleA: 1001, scaleB: 1001, scale_type: f32_r}
+    - { a_type: f4_r, b_type: f4_r, c_type: f16_r, d_type: f16_r, compute_type: c_f32_r, scaleA: 1001, scaleB: 1001, scale_type: f32_r}
+    - { a_type: f4_r, b_type: f4_r, c_type: f32_r, d_type: f32_r, compute_type: c_f32_r, scaleA: 1001, scaleB: 1001, scale_type: f32_r}
+  M: [128, 192]
+  N: [128, 192]
+  K: [256]
+  transA: T
+  transB: N
+  alpha: 1.0
+  beta: [0.0, 2.0]
+  bias_vector: 1
+  scaleAlpha_vector: 1
+  activation_type: [none, relu, gelu, sigmoid, silu, clamp, dgelu, drelu]
+  initialization: trig_float
+  unit_check: 0
+  norm_check: 1
+  requested_solution_num: 1
+  gpu_arch: '950'
 
 # Asymmetric M/N
 - name: matmul_subtile_fp4_asymmetric
@@ -2519,9 +2604,14 @@ Tests:
   function:
     matmul:
     - { a_type: f4_r, b_type: f4_r, c_type: bf16_r, d_type: bf16_r, compute_type: c_f32_r, scaleA: 1001, scaleB: 1001, scale_type: f32_r}
-  M: [64, 128, 4096]
-  N: [4096, 128, 64]
-  K: [256]
+    - { a_type: f4_r, b_type: f4_r, c_type: f16_r, d_type: f16_r, compute_type: c_f32_r, scaleA: 1001, scaleB: 1001, scale_type: f32_r}
+  matrix_size:
+    - { M: 192,  N: 256,  K: 256 }
+    - { M: 256,  N: 192,  K: 256 }
+    - { M: 48,   N: 128,  K: 256 }
+    - { M: 128,  N: 48,   K: 256 }
+    - { M: 64,   N: 4096, K: 256 }
+    - { M: 4096, N: 64,   K: 256 }
   transA: T
   transB: N
   alpha: 1.0
@@ -2538,6 +2628,7 @@ Tests:
   function:
     matmul:
     - { a_type: f4_r, b_type: f4_r, c_type: bf16_r, d_type: bf16_r, compute_type: c_f32_r, scaleA: 1001, scaleB: 1001, scale_type: f32_r}
+    - { a_type: f4_r, b_type: f4_r, c_type: f16_r, d_type: f16_r, compute_type: c_f32_r, scaleA: 1001, scaleB: 1001, scale_type: f32_r}
     - { a_type: f4_r, b_type: f4_r, c_type: f32_r, d_type: f32_r, compute_type: c_f32_r, scaleA: 1001, scaleB: 1001, scale_type: f32_r}
   M: [3072, 4096]
   N: [3072, 4096]

@@ -3582,7 +3582,7 @@ void testing_matmul_with_bias(const Arguments& arg,
                         lda[gemmIdx],
                         isScaleBMXFormat
                             ? reinterpret_cast<char*>(refB[gemmIdx].data())
-                                  + stride_a[gemmIdx] * batchIdx * realDataTypeSize(HIP_R_32F)
+                                  + stride_b[gemmIdx] * batchIdx * realDataTypeSize(HIP_R_32F)
                             : hB[gemmIdx].as<char>()
                                   + stride_b[gemmIdx] * batchIdx * realDataTypeSize(TiB),
                         ldb[gemmIdx],
