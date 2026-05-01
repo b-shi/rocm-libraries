@@ -1019,7 +1019,8 @@ void check(hipStream_t                   stream,
             hipblaslt_error += norm_error;
             if(arg.norm_check_assert)
             {
-                CHECK_SUCCESS(norm_check(norm_error, To, arg.compute_type));
+                CHECK_SUCCESS(
+                    norm_check(norm_error, To, arg.compute_type, arg.a_type, arg.b_type));
             }
 
             if(arg.amaxD)
@@ -1052,7 +1053,8 @@ void check(hipStream_t                   stream,
                 hipblaslt_error += norm_error;
                 if(arg.norm_check_assert)
                 {
-                    CHECK_SUCCESS(norm_check(norm_error, Taux, arg.compute_type));
+                    CHECK_SUCCESS(
+                        norm_check(norm_error, Taux, arg.compute_type, arg.a_type, arg.b_type));
                 }
             }
             if(arg.gradient && arg.bias_vector)
